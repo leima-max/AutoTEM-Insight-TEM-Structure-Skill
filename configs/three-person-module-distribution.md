@@ -11,9 +11,17 @@
 
 | 模块组合 | 推荐负责人 | 核心目标 | 首要交付 |
 |---|---|---|---|
-| A. 平台架构、数据流与交付闭环 | 成员 A | 搭建项目骨架、统一数据模型、工作流、CLI/API、报告和验证体系 | 可运行工程骨架 + `TEMAnalysisSkill.run()` + 基础报告 |
-| B. 图像输入、标定、FFT、衍射与物相 | 成员 B | 从原始图像到 FFT、d-spacing、g-vector、hkl、物相候选和模拟匹配 | FFT/d-spacing/phase candidate 分析链 |
-| C. 原子结构、应变、缺陷与 AI 扩展 | 成员 C | 从原子柱检测到原子间距、GPA/局部应变、缺陷、Z 衬度和 AI 模型 | atom coordinates + strain map 分析链 |
+| A. 平台架构、数据流与交付闭环 | `leima-max` | 搭建项目骨架、统一数据模型、工作流、CLI/API、报告和验证体系 | 可运行工程骨架 + `TEMAnalysisSkill.run()` + 基础报告 |
+| B. 图像输入、标定、FFT、衍射与物相 | `wangzhe221` | 从原始图像到 FFT、d-spacing、g-vector、hkl、物相候选和模拟匹配 | FFT/d-spacing/phase candidate 分析链 |
+| C. 原子结构、应变、缺陷与 AI 扩展 | `yswgityes` | 从原子柱检测到原子间距、GPA/局部应变、缺陷、Z 衬度和 AI 模型 | atom coordinates + strain map 分析链 |
+
+## 当前 GitHub 成员映射
+
+| 成员角色 | GitHub 用户名 | 仓库权限 | 默认模块组合 |
+|---|---|---|---|
+| 成员 A | `leima-max` | owner / admin | A. 平台架构、数据流与交付闭环 |
+| 成员 B | `wangzhe221` | collaborator / write | B. 图像输入、标定、FFT、衍射与物相 |
+| 成员 C | `yswgityes` | collaborator / write | C. 原子结构、应变、缺陷与 AI 扩展 |
 
 ## A. 平台架构、数据流与交付闭环
 
@@ -656,19 +664,19 @@ C 可反向提供给 B：
 
 ### 第 1 轮：共同打通 P0 骨架
 
-成员 A：
+成员 A：`leima-max`
 
 1. A0 工程骨架
 2. A1 核心数据模型
 3. A2 workflow/API/CLI baseline
 
-成员 B：
+成员 B：`wangzhe221`
 
 1. B0 数据输入
 2. B1 标定与质量评估
 3. B2 FFT 基础
 
-成员 C：
+成员 C：`yswgityes`
 
 1. C0 原子柱检测
 2. C1 亚像素精修与原子间距
@@ -678,17 +686,17 @@ C 可反向提供给 B：
 
 ### 第 2 轮：形成 MVP 闭环
 
-成员 A：
+成员 A：`leima-max`
 
 1. A3 报告、可视化与导出
 2. A4 验证与 benchmark baseline
 
-成员 B：
+成员 B：`wangzhe221`
 
 1. B3 peak/g-vector/d-spacing
 2. B4 基础 hkl indexing
 
-成员 C：
+成员 C：`yswgityes`
 
 1. C3 原子位移与原子级应变
 2. C4 亚晶格分类初版
@@ -697,19 +705,19 @@ C 可反向提供给 B：
 
 ### 第 3 轮：增强核心竞争力
 
-成员 A：
+成员 A：`leima-max`
 
 1. 强化 CLI/YAML workflow
 2. 增强报告模板
 3. 完善 benchmark report
 
-成员 B：
+成员 B：`wangzhe221`
 
 1. B5 phase matching / simulation
 2. zone axis inference
 3. experimental/simulated overlay
 
-成员 C：
+成员 C：`yswgityes`
 
 1. 完整 GPA 增强
 2. atom strain 对比
@@ -719,17 +727,17 @@ C 可反向提供给 B：
 
 ### 第 4 轮：高级扩展
 
-成员 A：
+成员 A：`leima-max`
 
 1. Web/Jupyter UI 或 Agent tools
 2. 批量处理与项目报告
 
-成员 B：
+成员 B：`wangzhe221`
 
 1. B6 4D-STEM 扩展
 2. 更完整的 simulation/database integration
 
-成员 C：
+成员 C：`yswgityes`
 
 1. C5 晶粒/孪晶/缺陷/多相
 2. C6 Z 衬度/谱学
@@ -745,12 +753,15 @@ C 可反向提供给 B：
 建议按三个组合认领，减少交叉等待：
 
 1. A 组：平台架构、数据流与交付闭环
+   默认负责人：@leima-max
    负责：工程骨架、数据模型、API/CLI、YAML workflow、报告、测试、benchmark、项目同步
 
 2. B 组：图像输入、标定、FFT、衍射与物相
+   默认负责人：@wangzhe221
    负责：reader、metadata、calibration、FFT、peak detection、g-vector、d-spacing、hkl、phase matching、simulation、4D-STEM
 
 3. C 组：原子结构、应变、缺陷与 AI 扩展
+   默认负责人：@yswgityes
    负责：atom detection、Gaussian refinement、atom distance、GPA、atomic strain、sublattice、defects、Z-contrast、AI
 
 建议第一轮：
@@ -760,4 +771,3 @@ C 可反向提供给 B：
 
 请三位按 A/B/C 组合认领，或提出想交换的模块。
 ```
-

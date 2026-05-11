@@ -28,11 +28,21 @@ https://github.com/leima-max/AutoTEM-Insight-TEM-Structure-Skill
 
 ## Team Structure
 
-项目由三人协作开发。使用以下占位身份，创建 OpenClaw 项目后请替换为真实姓名、飞书账号和 GitHub 用户名。
+项目由三人协作开发。当前 GitHub 角色映射如下：
+
+| 成员角色 | GitHub 用户名 | 仓库权限 | 模块组合 |
+|---|---|---|---|
+| 成员 A | `leima-max` | owner / admin | 平台架构、数据流与交付闭环 |
+| 成员 B | `wangzhe221` | collaborator / write | 图像输入、标定、FFT、衍射与物相 |
+| 成员 C | `yswgityes` | collaborator / write | 原子结构、应变、缺陷与 AI 扩展 |
+
+飞书账号或群内 @ 名称未配置时，默认在文档和任务中使用 GitHub 用户名标识负责人。
 
 ### Person A: Project Lead / Architecture Owner
 
-默认负责人：`<姓名A>`
+默认负责人：`leima-max`
+
+GitHub 角色：仓库拥有者 / admin。
 
 职责：
 - 项目总体架构、模块边界和数据模型
@@ -50,7 +60,9 @@ https://github.com/leima-max/AutoTEM-Insight-TEM-Structure-Skill
 
 ### Person B: Diffraction / Phase / Simulation Owner
 
-默认负责人：`<姓名B>`
+默认负责人：`wangzhe221`
+
+GitHub 角色：协作者 / write。
 
 职责：
 - FFT、SAED、NBED、4D-STEM 衍射相关算法
@@ -66,7 +78,9 @@ https://github.com/leima-max/AutoTEM-Insight-TEM-Structure-Skill
 
 ### Person C: Atomic / Strain / AI Owner
 
-默认负责人：`<姓名C>`
+默认负责人：`yswgityes`
+
+GitHub 角色：协作者 / write。
 
 职责：
 - 原子柱检测、亚像素精修、亚晶格分类
@@ -327,9 +341,9 @@ PR 要求：
 我会协助跟进 AutoTEM-Insight / Auto TEM Skill 项目的协作开发，包括任务状态、GitHub PR/Issue、模块依赖、阻塞风险、里程碑进展和周报整理。
 
 当前建议三位负责人分工：
-1. 架构/API/工作流/报告：@<姓名A>
-2. FFT/衍射/物相/模拟：@<姓名B>
-3. 原子结构/GPA/AI/缺陷：@<姓名C>
+1. 架构/API/工作流/报告：@leima-max
+2. FFT/衍射/物相/模拟：@wangzhe221
+3. 原子结构/GPA/AI/缺陷：@yswgityes
 
 GitHub 仓库：
 https://github.com/leima-max/AutoTEM-Insight-TEM-Structure-Skill
