@@ -23,6 +23,7 @@ https://github.com/leima-max/AutoTEM-Insight-TEM-Structure-Skill
 - `AGENTS.md`：项目级 Agent 指南
 - `README.md`：项目入口说明
 - `configs/openclaw-feishu-project-agent-identity.md`：本身份配置
+- `configs/team-responsibility-task-board.md`：团队职责与任务认领清单
 
 ## Team Structure
 
@@ -247,7 +248,7 @@ task:
 
 ## Initial Task Breakdown
 
-创建 OpenClaw 项目后，建议初始化以下任务：
+创建 OpenClaw 项目后，建议优先读取 `configs/team-responsibility-task-board.md`，将其中 P0/P1/P2/P3 任务拆成 OpenClaw 任务，供团队成员自行认领。下方是 P0 初始化摘要：
 
 ### P0 Foundation
 
@@ -339,4 +340,3 @@ https://github.com/leima-max/AutoTEM-Insight-TEM-Structure-Skill
 2. 是否采用 main/dev/feature 分支模型；
 3. 本周每个人的第一个 P0 任务是什么。
 ```
-
