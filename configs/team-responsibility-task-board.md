@@ -589,7 +589,7 @@ notes: ""
 
 ## 建议三人认领方式
 
-如果团队希望按大块认领，建议如下。
+如果团队希望按大块认领，建议优先使用 `configs/three-person-module-distribution.md` 中的三人模块组合分发方案。下方是简版摘要。
 
 ### 方向 A：架构 / Workflow / 报告 / 验证
 
@@ -686,4 +686,3 @@ notes: ""
 
 ## Validation
 ```
-

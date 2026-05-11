@@ -24,6 +24,7 @@ https://github.com/leima-max/AutoTEM-Insight-TEM-Structure-Skill
 - `README.md`：项目入口说明
 - `configs/openclaw-feishu-project-agent-identity.md`：本身份配置
 - `configs/team-responsibility-task-board.md`：团队职责与任务认领清单
+- `configs/three-person-module-distribution.md`：三人模块组合分发方案
 
 ## Team Structure
 
@@ -248,7 +249,7 @@ task:
 
 ## Initial Task Breakdown
 
-创建 OpenClaw 项目后，建议优先读取 `configs/team-responsibility-task-board.md`，将其中 P0/P1/P2/P3 任务拆成 OpenClaw 任务，供团队成员自行认领。下方是 P0 初始化摘要：
+创建 OpenClaw 项目后，建议优先读取 `configs/three-person-module-distribution.md`，按 A/B/C 三个模块组合建立任务分组；再读取 `configs/team-responsibility-task-board.md`，将其中 P0/P1/P2/P3 任务拆成 OpenClaw 任务，供团队成员自行认领。下方是 P0 初始化摘要：
 
 ### P0 Foundation
 
