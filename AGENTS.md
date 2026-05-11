@@ -11,6 +11,44 @@ Treat this as a scientific software ecosystem, not a single script:
 - Expose modular Python APIs, CLI workflows, YAML recipes, notebook/Web interaction, and agent-callable tools.
 - Preserve provenance, parameters, uncertainty, confidence, intermediate outputs, and warnings for every analysis.
 
+## Current Codex Operating Context
+
+The current user is **Member A**:
+
+- GitHub: `leima-max`
+- Repository role: owner / admin
+- Project role: platform architecture, data flow, and delivery-loop owner
+- Default responsibility group: **A. 平台架构、数据流与交付闭环**
+
+When the user refers to "my role", "my tasks", "Member A", or asks what they should work on, treat it as the `leima-max` / Member A scope unless they explicitly say otherwise.
+
+Member A owns:
+
+- project skeleton and package structure
+- core data models and schemas
+- Python API, CLI, YAML workflow, and orchestration layer
+- report generation, export, visualization integration, and output directory conventions
+- tests, CI, benchmark framework, validation metrics, and release readiness
+- cross-module interface contracts and integration across Members B and C
+- GitHub workflow hygiene, PR templates, issue templates, branch strategy, and project documentation
+- OpenClaw/GitHub/Feishu coordination where it affects delivery and task tracking
+
+Member A should not deeply own the primary scientific algorithms for Member B or Member C, but must define the interfaces they implement against, integrate their results, and verify their outputs are reproducible and reportable.
+
+Current team mapping:
+
+| Member | GitHub | Repository Role | Responsibility |
+|---|---|---|---|
+| A | `leima-max` | owner / admin | Platform architecture, data flow, workflow/API/CLI, reporting, validation, delivery |
+| B | `wangzhe221` | collaborator / write | Input, calibration, FFT, diffraction, hkl, phase matching, simulation, 4D-STEM |
+| C | `yswgityes` | collaborator / write | Atomic structure, GPA/strain, defects, Z-contrast, spectroscopy, AI |
+
+Detailed planning references:
+
+- `configs/three-person-module-distribution.md` for A/B/C module grouping and sequential task chains.
+- `configs/team-responsibility-task-board.md` for the full task board and acceptance-oriented deliverables.
+- `configs/openclaw-feishu-project-agent-identity.md` for OpenClaw/Feishu project-assistant identity and communication rules.
+
 ## Core Scope
 
 The skill should support these analysis layers:
@@ -54,6 +92,19 @@ Implement in this order unless the user explicitly asks otherwise:
 7. Grain, twin, boundary, phase, and defect segmentation/statistics.
 8. Z-contrast, multislice/simulation correction, 4D-STEM, EDS, and EELS expansion.
 9. CLI, Python API, YAML workflows, Web/Jupyter UI, automatic reports, benchmarks, and packaging.
+
+For Member A specifically, prioritize this delivery order:
+
+1. A0 Engineering skeleton: package structure, `pyproject.toml`, branch/PR/Issue conventions, minimal CI.
+2. A1 Core data models: `TEMDataset`, `DiffractionResult`, `AtomLattice`, `StrainResult`, `AnalysisReport`, and `Measurement` schema.
+3. A2 Workflow/API/CLI baseline: `TEMAnalysisSkill`, pipeline orchestration, YAML workflow schema, command-line entrypoint.
+4. A3 Reporting/export/visualization integration: JSON, CSV, figures, overlays, HTML reports, provenance, confidence, warnings.
+5. A4 Validation and benchmark framework: metric interfaces, standard sample benchmark hooks, integration tests, reportable acceptance criteria.
+
+Member A must define stable contracts for Member B and C outputs before deep integration work:
+
+- Member B returns `TEMDataset` and `DiffractionResult`, plus FFT images, peak tables, g-vector/d-spacing tables, phase candidates, and diffraction overlays.
+- Member C returns `AtomLattice` and `StrainResult`, plus atom coordinate tables, atom overlays, strain maps, sublattice/defect/Z-contrast tables when available.
 
 For the MVP, prioritize a reliable closed loop for a single HRTEM or HAADF-STEM image:
 
@@ -245,4 +296,3 @@ When automation is uncertain, preserve an expert-in-the-loop path for calibratio
 - Add tests for numerical correctness, schema stability, edge cases, and benchmark workflows.
 - Preserve raw data and intermediate artifacts unless the user explicitly requests a lightweight run.
 - Keep documentation close to executable examples, but avoid bloating the core skill instructions.
-
