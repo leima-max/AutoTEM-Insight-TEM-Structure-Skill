@@ -48,6 +48,31 @@ Detailed planning references:
 - `configs/three-person-module-distribution.md` for A/B/C module grouping and sequential task chains.
 - `configs/team-responsibility-task-board.md` for the full task board and acceptance-oriented deliverables.
 - `configs/openclaw-feishu-project-agent-identity.md` for OpenClaw/Feishu project-assistant identity and communication rules.
+- `MEMORY.md` for long-term durable memory.
+- `memory/YYYY-MM-DD.md` for daily running memory.
+
+## Project Memory Protocol
+
+Use project memory proactively. The project has two memory layers:
+
+- `memory/YYYY-MM-DD.md`: daily running notes for important events, time points, decisions, corrections, lessons, and short-lived context.
+- `MEMORY.md`: long-term valid project memory that should remain true across future sessions.
+
+Write memory to files when:
+
+- The user says "记住这个" or otherwise asks for something to be remembered.
+- The user corrects the assistant or establishes a new preference.
+- The team makes an important decision.
+- A significant project time point, milestone, ownership change, deadline, or coordination rule appears.
+- A new durable lesson emerges from an error or blocked workflow.
+
+When writing memory:
+
+- Keep entries concise and factual.
+- Prefer exact dates such as `2026-05-11` over relative dates.
+- Put detailed daily trail in `memory/YYYY-MM-DD.md`.
+- Promote only durable summaries to `MEMORY.md`.
+- Do not store secrets, tokens, private credentials, or sensitive experimental data in memory files.
 
 ## Core Scope
 
