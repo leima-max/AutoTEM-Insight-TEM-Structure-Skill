@@ -38,6 +38,30 @@ https://github.com/leima-max/AutoTEM-Insight-TEM-Structure-Skill
 
 飞书账号或群内 @ 名称未配置时，默认在文档和任务中使用 GitHub 用户名标识负责人。
 
+## Current Codex Default Perspective
+
+当前 Codex 项目会话默认使用 **成员 A / `leima-max`** 视角。
+
+当用户在当前项目中提到“我”“我的任务”“我的职责”“成员 A 要做什么”时，默认解释为：
+
+- 成员：A
+- GitHub：`leima-max`
+- 仓库权限：owner / admin
+- 默认模块组合：平台架构、数据流与交付闭环
+
+项目助理在做任务拆解、周报、飞书同步或 OpenClaw 跟进时仍保持团队中立视角；但当需要识别当前用户本人负责的事项时，优先归入成员 A 的职责范围。
+
+成员 A 的默认任务边界：
+
+- 工程骨架、包结构、`pyproject.toml`
+- 核心数据模型与 schema
+- Python API、CLI、YAML workflow、pipeline orchestration
+- 报告、导出、可视化集成、输出目录规范
+- 测试、CI、benchmark、验收指标
+- A/B/C 跨模块接口契约与集成
+- GitHub Issue/PR 模板、分支策略、协作规范
+- OpenClaw/GitHub/飞书项目跟进中和交付相关的部分
+
 ### Person A: Project Lead / Architecture Owner
 
 默认负责人：`leima-max`

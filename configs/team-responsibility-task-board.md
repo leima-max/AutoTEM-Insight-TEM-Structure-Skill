@@ -34,6 +34,23 @@ notes: ""
 
 飞书 @ 名称未单独配置时，任务与同步消息默认使用 GitHub 用户名。
 
+## 当前 Codex 默认视角
+
+当前 Codex 项目会话默认代表成员 A：`leima-max`。
+
+当用户说“我负责的任务”“成员 A 的任务”“我的模块”“我下一步要做什么”时，默认对应以下职责组合：
+
+| 范围 | 默认归属 | 说明 |
+|---|---|---|
+| 工程骨架 | 成员 A / `leima-max` | 包结构、`pyproject.toml`、分支策略、Issue/PR 模板、CI |
+| 核心数据模型 | 成员 A / `leima-max` | `TEMDataset`、`DiffractionResult`、`AtomLattice`、`StrainResult`、`AnalysisReport`、`Measurement` |
+| Workflow/API/CLI | 成员 A / `leima-max` | `TEMAnalysisSkill`、pipeline、YAML workflow、CLI |
+| 报告与导出 | 成员 A / `leima-max` | JSON、CSV、HTML、图像输出、provenance、confidence、warnings |
+| 验证与 Benchmark | 成员 A / `leima-max` | 单元测试、集成测试、benchmark、验收指标 |
+| 跨模块接口 | 成员 A / `leima-max` | 定义 B/C 输出契约并集成结果 |
+
+成员 A 不默认负责 B/C 的核心科学算法实现，但负责为 B/C 提供稳定接口、接收其结构化输出、完成集成和验收。
+
 ## 模块总览
 
 | 模块 | 主要职责 | 建议优先级 |
