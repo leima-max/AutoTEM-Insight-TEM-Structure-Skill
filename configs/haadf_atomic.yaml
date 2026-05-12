@@ -1,0 +1,11 @@
+workflow:
+  name: haadf_atomic
+  description: HAADF-STEM atom coordinates, distance statistics, and strain baseline.
+  steps:
+    - load
+    - assess_quality
+    - calibrate
+    - preprocess
+    - detect_atoms
+    - run_gpa
+    - report
