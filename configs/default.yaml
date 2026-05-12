@@ -1,0 +1,17 @@
+workflow:
+  name: default
+  description: Baseline single-image AutoTEM analysis workflow.
+  steps:
+    - load
+    - assess_quality
+    - calibrate
+    - preprocess
+    - analyze
+    - report
+
+outputs:
+  formats:
+    - json
+    - csv
+    - html
+  save_intermediates: true

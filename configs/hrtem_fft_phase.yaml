@@ -1,0 +1,12 @@
+workflow:
+  name: hrtem_fft_phase
+  description: HRTEM FFT, d-spacing, indexing, and phase-candidate workflow.
+  steps:
+    - load
+    - assess_quality
+    - calibrate
+    - preprocess
+    - fft
+    - diffraction_peaks
+    - index_diffraction
+    - report
