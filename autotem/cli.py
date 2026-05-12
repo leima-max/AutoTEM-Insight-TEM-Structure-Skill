@@ -21,6 +21,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("outputs/run"),
         help="Output directory.",
     )
+    analyze.add_argument(
+        "--detect-atoms",
+        action="store_true",
+        help="Force-run detect_atoms step and return AtomLattice output.",
+    )
 
     return parser
 
@@ -35,8 +40,11 @@ def main(argv: list[str] | None = None) -> int:
             input_path=args.input,
             workflow_path=args.workflow,
             output_dir=args.output,
+            detect_atoms_step=True if args.detect_atoms else None,
         )
         print(result["status"])
+        if "atom_count" in result:
+            print(f"Detected atoms: {result['atom_count']}")
         return 0
 
     parser.print_help()
