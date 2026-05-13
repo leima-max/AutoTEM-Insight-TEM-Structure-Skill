@@ -8,5 +8,6 @@ def test_package_imports() -> None:
 
 def test_workflow_scaffold_run() -> None:
     result = TEMAnalysisSkill().run("sample.tif")
-    assert result["status"] == "AutoTEM workflow scaffold is ready."
+    assert result["status"] == "A2 baseline workflow completed."
     assert result["input_path"] == "sample.tif"
+    assert result["report_path"].endswith("analysis_report.json")

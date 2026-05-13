@@ -8,6 +8,19 @@ workflow:
     - preprocess
     - analyze
     - report
+  parameters:
+    calibration:
+      method: auto
+      voltage_kv: 200
+    preprocessing:
+      recipe: min_max
+      clip_percentile_low: 1.0
+      clip_percentile_high: 99.0
+    diffraction:
+      top_k_peaks: 24
+      min_peak_distance: 3.0
+      center_exclusion_radius: 3.0
+      phase_top_n: 3
 
 outputs:
   formats:

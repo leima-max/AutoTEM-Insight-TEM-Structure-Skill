@@ -1,0 +1,23 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.0
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: autotem-pytest
+        name: autotem-pytest
+        entry: python -m pytest
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: autotem-runtime-contract
+        name: autotem-runtime-contract
+        entry: python -m autotem.validation.runtime_contract
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

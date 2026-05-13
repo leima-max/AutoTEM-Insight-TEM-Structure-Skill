@@ -49,6 +49,7 @@ DefectType = Literal[
 SpectroscopyKind = Literal["EDS", "EELS", "HAADF-Z", "unknown"]
 SimulationKind = Literal["diffraction", "stem_image", "tem_image", "multislice", "other"]
 MetricDirection = Literal["higher_is_better", "lower_is_better", "target_range", "informational"]
+LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 Modality = Literal[
     "TEM",
     "HRTEM",
@@ -142,6 +143,45 @@ class WorkflowConfig(VersionedAutoTEMModel):
     output_formats: list[str] = Field(default_factory=lambda: ["json"])
     save_intermediates: bool = True
     provenance: JsonDict = Field(default_factory=dict)
+
+
+class RunLogEntry(AutoTEMModel):
+    """Structured runtime log entry for deterministic workflow logging."""
+
+    timestamp_utc: str
+    level: LogLevel
+    message: str
+    context: JsonDict = Field(default_factory=dict)
+
+
+class RunSummaryStep(AutoTEMModel):
+    """Compact per-step execution summary used in run summary output."""
+
+    name: WorkflowTask
+    status: StepStatus
+    warnings: list[str] = Field(default_factory=list)
+    warning_count: int = 0
+
+
+class RunSummary(VersionedAutoTEMModel):
+    """Top-level stable runtime summary for CI and benchmark ingestion."""
+
+    status: str
+    workflow_name: str
+    input_path: str
+    workflow_path: str = ""
+    output_dir: str
+    report_path: str
+    log_path: str
+    workflow_used_path: str
+    workflow_parameter_schema_version: str = ""
+    steps: list[RunSummaryStep] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    warning_count: int = 0
+    runtime: JsonDict = Field(default_factory=dict)
+    input_fingerprint: JsonDict = Field(default_factory=dict)
+    workflow_fingerprint: JsonDict = Field(default_factory=dict)
+    workflow_parameters_snapshot: JsonDict = Field(default_factory=dict)
 
 
 class TEMDataset(VersionedAutoTEMModel):

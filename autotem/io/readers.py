@@ -1,10 +1,11 @@
-"""Multi-format reader registry and baseline image readers."""
+﻿"""Multi-format reader registry and baseline image readers."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 from PIL import Image, TiffTags
@@ -56,15 +57,30 @@ def _tag_name(tag_id: int) -> str:
     return TiffTags.TAGS.get(tag_id, str(tag_id))
 
 
+def _to_jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def _read_standard_image(path: Path) -> ReadResult:
     with Image.open(path) as img:
-        metadata_raw: dict[str, Any] = dict(img.info)
+        metadata_raw: dict[str, Any] = _to_jsonable(dict(img.info))
         warnings: list[dict[str, Any]] = []
 
         if img.format == "TIFF" and hasattr(img, "tag_v2"):
             for tag_id, value in img.tag_v2.items():
-                metadata_raw[_tag_name(tag_id)] = value
-                metadata_raw[str(tag_id)] = value
+                metadata_raw[_tag_name(tag_id)] = _to_jsonable(value)
+                metadata_raw[str(tag_id)] = _to_jsonable(value)
 
         array = np.asarray(img)
         if array.ndim == 3:
@@ -96,6 +112,33 @@ def _read_standard_image(path: Path) -> ReadResult:
         )
 
 
+def _read_numpy_or_text(path: Path) -> ReadResult:
+    suffix = path.suffix.lower()
+    if suffix == ".npy":
+        array = np.load(path, allow_pickle=False)
+    elif suffix in {".txt", ".csv"}:
+        array = np.loadtxt(path)
+    else:
+        raise ValueError(f"Unsupported array text format: {suffix}")
+
+    if array.ndim != 2:
+        raise ValueError(f"Expected 2D array but got shape {array.shape} for {path.name}.")
+
+    metadata_raw: dict[str, Any] = {
+        "source": "numpy_or_text",
+        "shape": list(array.shape),
+        "dtype": str(array.dtype),
+    }
+    metadata_norm, warnings = normalize_metadata(metadata_raw)
+    return ReadResult(
+        array=np.asarray(array).astype(np.float32),
+        metadata_raw=metadata_raw,
+        metadata_norm=metadata_norm,
+        warnings=warnings,
+        provenance={"reader": "numpy", "format": suffix.lstrip("."), "path": str(path)},
+    )
+
+
 def _read_dm(path: Path) -> ReadResult:
     try:
         from ncempy.io import dm  # type: ignore
@@ -104,7 +147,7 @@ def _read_dm(path: Path) -> ReadResult:
 
     payload = dm.dmReader(str(path))
     array = np.asarray(payload.get("data"))
-    metadata_raw = dict(payload)
+    metadata_raw = _to_jsonable(dict(payload))
     metadata_raw.pop("data", None)
 
     metadata_norm, warnings = normalize_metadata(metadata_raw)
@@ -166,7 +209,7 @@ def _read_hdf5_emd(path: Path) -> ReadResult:
         array = _first_numeric_dataset(h5f)
         if array is None:
             raise ValueError(f"No numeric dataset found in {path.name}.")
-        metadata_raw = dict(h5f.attrs)
+        metadata_raw = _to_jsonable(dict(h5f.attrs))
 
     metadata_norm, warnings = normalize_metadata(metadata_raw)
     return ReadResult(
@@ -186,7 +229,7 @@ def _read_ser(path: Path) -> ReadResult:
 
     with ser.fileSER(str(path)) as handle:
         array, metadata = handle.getDataset(0)
-    metadata_raw = dict(metadata or {})
+    metadata_raw = _to_jsonable(dict(metadata or {}))
     metadata_norm, warnings = normalize_metadata(metadata_raw)
 
     return ReadResult(
@@ -201,6 +244,7 @@ def _read_ser(path: Path) -> ReadResult:
 def build_default_registry() -> ReaderRegistry:
     """Build default registry with baseline and optional adapters."""
     registry = ReaderRegistry()
+    registry.register([".npy", ".txt", ".csv"], _read_numpy_or_text)
     registry.register([".tif", ".tiff", ".png", ".jpg", ".jpeg"], _read_standard_image)
     registry.register([".dm3", ".dm4"], _read_dm)
     registry.register(".mrc", _read_mrc)

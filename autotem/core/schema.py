@@ -20,6 +20,7 @@ from autotem.core.models import (
     MicrostructureResult,
     PreprocessingResult,
     QualityAssessment,
+    RunSummary,
     SimulationResult,
     SpectroscopyResult,
     StrainResult,
@@ -48,6 +49,7 @@ CORE_MODELS: tuple[type[BaseModel], ...] = (
     AIInferenceResult,
     BenchmarkResult,
     AnalysisReport,
+    RunSummary,
 )
 
 

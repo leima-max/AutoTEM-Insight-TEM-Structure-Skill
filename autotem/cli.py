@@ -1,11 +1,18 @@
-"""Command-line entry points for AutoTEM-Insight."""
+﻿"""Command-line entry points for AutoTEM-Insight."""
 
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 from pathlib import Path
 
 from autotem.workflows.pipeline import TEMAnalysisSkill
+
+EXIT_OK = 0
+EXIT_CONFIG_ERROR = 2
+EXIT_FILE_ERROR = 3
+EXIT_RUNTIME_ERROR = 4
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument(
         "--detect-atoms",
         action="store_true",
-        help="Force-run detect_atoms step and return AtomLattice output.",
+        help="Force-run detect_atoms reserved step in the workflow.",
     )
 
     return parser
@@ -35,20 +42,32 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "analyze":
-        skill = TEMAnalysisSkill()
-        result = skill.run(
-            input_path=args.input,
-            workflow_path=args.workflow,
-            output_dir=args.output,
-            detect_atoms_step=True if args.detect_atoms else None,
-        )
+        try:
+            skill = TEMAnalysisSkill()
+            result = skill.run(
+                input_path=args.input,
+                workflow_path=args.workflow,
+                output_dir=args.output,
+                detect_atoms_step=True if args.detect_atoms else None,
+            )
+        except ValueError as exc:
+            print(f"AutoTEM analyze configuration error: {exc}", file=sys.stderr)
+            return EXIT_CONFIG_ERROR
+        except FileNotFoundError as exc:
+            print(f"AutoTEM analyze file error: {exc}", file=sys.stderr)
+            return EXIT_FILE_ERROR
+        except Exception as exc:  # noqa: BLE001 - CLI should report all runtime failures.
+            print(f"AutoTEM analyze runtime error: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+
         print(result["status"])
         if "atom_count" in result:
             print(f"Detected atoms: {result['atom_count']}")
-        return 0
+        print(json.dumps(result, indent=2))
+        return EXIT_OK
 
     parser.print_help()
-    return 0
+    return EXIT_OK
 
 
 if __name__ == "__main__":

@@ -25,6 +25,8 @@ from autotem.core import (
     OutputArtifact,
     PreprocessingResult,
     QualityAssessment,
+    RunSummary,
+    RunSummaryStep,
     SimulatedPattern,
     SimulationResult,
     SpectroscopyResult,
@@ -298,6 +300,7 @@ def test_schema_exports_core_models() -> None:
         "AIInferenceResult",
         "BenchmarkResult",
         "AnalysisReport",
+        "RunSummary",
     }
     assert schemas["Measurement"]["properties"]["confidence"]["anyOf"]
 
@@ -325,6 +328,7 @@ def test_schema_manifest_tracks_core_models() -> None:
             "AIInferenceResult",
             "BenchmarkResult",
             "AnalysisReport",
+            "RunSummary",
         ],
     }
 
@@ -381,8 +385,29 @@ def test_write_core_json_schemas(tmp_path: Path) -> None:
 
     assert (tmp_path / "manifest.json").exists()
     assert (tmp_path / "TEMDataset.schema.json").exists()
+    assert (tmp_path / "RunSummary.schema.json").exists()
     assert (tmp_path / "CalibrationResult.schema.json").exists()
     assert (tmp_path / "BenchmarkResult.schema.json").exists()
     assert '"schema_version": "0.1.0"' in (tmp_path / "manifest.json").read_text(
         encoding="utf-8"
     )
+
+
+def test_run_summary_model_round_trip() -> None:
+    summary = RunSummary(
+        status="A2 baseline workflow completed.",
+        workflow_name="default",
+        input_path="inputs/sample.npy",
+        workflow_path="configs/default.yaml",
+        output_dir="outputs/sample",
+        report_path="outputs/sample/analysis_report.json",
+        log_path="outputs/sample/run.log",
+        workflow_used_path="outputs/sample/workflow_used.yaml",
+        steps=[RunSummaryStep(name="load", status="done", warning_count=0)],
+        warning_count=0,
+    )
+
+    restored = from_json(RunSummary, to_json(summary))
+
+    assert restored.workflow_name == "default"
+    assert restored.steps[0].name == "load"

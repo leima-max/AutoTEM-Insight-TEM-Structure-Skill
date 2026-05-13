@@ -25,5 +25,8 @@ jobs:
       - name: Run tests
         run: python -m pytest
 
+      - name: Validate Runtime Output Contracts
+        run: python -m autotem.validation.runtime_contract
+
       - name: Run lint
         run: python -m ruff check .
