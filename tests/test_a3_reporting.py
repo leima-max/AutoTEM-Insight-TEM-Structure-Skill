@@ -198,7 +198,9 @@ def test_a3_manifest_includes_runtime_contract_artifacts(tmp_path: Path) -> None
         output_formats_override=["json", "html"],
     )
 
-    manifest = json.loads((output_dir / "json" / "output_manifest.json").read_text(encoding="utf-8"))
+    manifest = json.loads(
+        (output_dir / "json" / "output_manifest.json").read_text(encoding="utf-8")
+    )
     artifact_uris = [Path(item["uri"]).name for item in manifest["artifacts"]]
 
     assert "analysis_report.json" in artifact_uris
