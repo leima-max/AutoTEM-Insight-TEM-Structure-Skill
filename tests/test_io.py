@@ -191,7 +191,7 @@ def test_tiff_resolution_unit_parsing() -> None:
 def test_series_read_directory_and_dataset_conversion(tmp_path: Path) -> None:
     path_a = tmp_path / "a.png"
     path_b = tmp_path / "b.jpg"
-    path_txt = tmp_path / "ignore.txt"
+    path_txt = tmp_path / "ignore.md"
     _write_gray_image(path_a, "PNG")
     _write_gray_image(path_b, "JPEG")
     path_txt.write_text("ignore")

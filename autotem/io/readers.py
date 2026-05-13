@@ -109,7 +109,10 @@ class ReaderRegistry:
             supported = ", ".join(self.list_supported_formats(only_available=True))
             raise ValueError(f"Unsupported file extension: {suffix}. Supported: {supported}")
         if not registration.available or registration.reader is None:
-            required = ", ".join(registration.requires) if registration.requires else "optional dependency"
+            if registration.requires:
+                required = ", ".join(registration.requires)
+            else:
+                required = "optional dependency"
             reason = registration.unavailable_reason or "dependency unavailable"
             raise ValueError(
                 f"Reader for {suffix} is unavailable ({reason}). Install: {required}."
@@ -450,4 +453,3 @@ def read_series_as_temdataset(
         skip_errors=skip_errors,
     )
     return [to_temdataset(result, dataset_cls=dataset_cls) for result in results]
-
