@@ -17,6 +17,8 @@ from autotem.atomic.atom_detection import _load_image, _normalize_image, detect_
 from autotem.atomic.distance_statistics import compute_distance_statistics
 from autotem.atomic.gaussian_refinement import refine_atom_coordinates
 from autotem.atomic.lattice_constraint import apply_lattice_constraint
+from autotem.io import load_tem_dataset
+from autotem.io.metadata import normalize_metadata
 
 # Compatibility patch:
 # streamlit-drawable-canvas currently expects `streamlit.elements.image.image_to_url`
@@ -54,6 +56,57 @@ def _cached_load_image(
     warnings: list[str] = []
     arr, source_info = _load_image(path, warnings=warnings, slice_index=slice_index)
     return arr, source_info, warnings
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _cached_infer_pixel_size_nm(path: str, file_size: int) -> tuple[float | None, str, list[str]]:
+    # `file_size` is included so cache invalidates on changed uploads.
+    _ = file_size
+    suffix = Path(path).suffix.lower()
+    messages: list[str] = []
+
+    if suffix in {".dm", ".dm3", ".dm4"}:
+        try:
+            from ncempy.io import dm as dm_io
+
+            payload = dm_io.dmReader(str(path))
+            raw = dict(payload) if isinstance(payload, dict) else {"payload": payload}
+            raw.pop("data", None)
+            normalized, warnings = normalize_metadata(raw, source_format=suffix)
+            pixel_size_nm = normalized.get("pixel_size_nm")
+            if pixel_size_nm is not None:
+                return float(pixel_size_nm), "DM metadata (ncempy + normalize_metadata)", messages
+            for w in warnings:
+                if w.get("code") in {"META_MISSING_PIXEL_SIZE", "META_INVALID_PIXEL_SIZE"}:
+                    messages.append(f"{w.get('code')}: {w.get('message')}")
+        except Exception as exc:
+            messages.append(f"DM metadata read failed: {exc}")
+
+    try:
+        dataset = load_tem_dataset(path)
+        if dataset.pixel_size is not None and dataset.pixel_size.value is not None:
+            unit = str(dataset.pixel_size.unit or "").lower()
+            value = float(dataset.pixel_size.value)
+            if unit.startswith("nm"):
+                return value, "TEMDataset pixel_size", messages
+            if unit.startswith("pm"):
+                return value * 0.001, "TEMDataset pixel_size (pm->nm)", messages
+            if "angstrom" in unit or unit in {"a", "a/pixel"}:
+                return value * 0.1, "TEMDataset pixel_size (A->nm)", messages
+            messages.append(f"Unsupported pixel_size unit from dataset: {dataset.pixel_size.unit}")
+
+        normalized = (
+            dataset.metadata.get("normalized", {})
+            if isinstance(dataset.metadata, dict)
+            else {}
+        )
+        norm_val = normalized.get("pixel_size_nm")
+        if norm_val is not None:
+            return float(norm_val), "TEMDataset normalized metadata", messages
+    except Exception as exc:
+        messages.append(f"Generic metadata read failed: {exc}")
+
+    return None, "unavailable", messages
 
 
 def _save_upload_to_temp(uploaded_file) -> str:
@@ -249,6 +302,11 @@ for key, default in [
     ("refinement_info", None),
     ("lattice_info", None),
     ("last_run_summary", None),
+    ("distance_pixel_size", 0.02),
+    ("distance_unit", "nm"),
+    ("pixel_size_auto_nm", None),
+    ("pixel_size_auto_source", None),
+    ("pixel_size_auto_messages", []),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -343,7 +401,7 @@ with st.sidebar:
     pixel_size = st.number_input(
         "Pixel size",
         min_value=1e-6,
-        value=0.02,
+        key="distance_pixel_size",
         step=0.001,
         format="%.6f",
         disabled=not use_physical_unit,
@@ -351,9 +409,21 @@ with st.sidebar:
     distance_unit = st.selectbox(
         "Distance unit",
         ["nm", "angstrom", "pm", "um"],
+        key="distance_unit",
         index=0,
         disabled=not use_physical_unit,
     )
+    if st.session_state.pixel_size_auto_nm is not None:
+        st.caption(
+            "Auto pixel size: "
+            f"{float(st.session_state.pixel_size_auto_nm):.6f} nm/px "
+            f"({st.session_state.pixel_size_auto_source})"
+        )
+    else:
+        st.caption("Auto pixel size unavailable. Please input manually or calibrate by scale bar.")
+        if st.session_state.pixel_size_auto_messages:
+            with st.expander("Auto-read details"):
+                st.code("\n".join(st.session_state.pixel_size_auto_messages), language="text")
 
 uploaded = st.file_uploader("Upload TEM image", type=["dm", "dm3", "dm4", "tif", "tiff"])
 manual_run = st.button("Run Detection", type="primary", disabled=uploaded is None)
@@ -378,6 +448,15 @@ if st.session_state.uploaded_sig != current_file_sig:
     st.session_state.canvas_nonce = 0
     st.session_state.refinement_info = None
     st.session_state.lattice_info = None
+    auto_nm, auto_source, auto_messages = _cached_infer_pixel_size_nm(
+        st.session_state.uploaded_temp_path,
+        file_size=uploaded.size,
+    )
+    st.session_state.pixel_size_auto_nm = auto_nm
+    st.session_state.pixel_size_auto_source = auto_source
+    st.session_state.pixel_size_auto_messages = auto_messages
+    if auto_nm is not None:
+        st.session_state.distance_pixel_size = float(auto_nm)
 
 params = {
     "mode": mode,
