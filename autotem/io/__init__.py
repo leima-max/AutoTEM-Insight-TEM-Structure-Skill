@@ -1,14 +1,26 @@
-﻿"""Input readers and metadata normalization."""
+"""Input readers and metadata normalization."""
 
 from pathlib import Path
 
 from autotem.core import ArrayReference, TEMDataset
 from autotem.io.converters import to_temdataset
-from autotem.io.metadata import normalize_metadata
-from autotem.io.readers import ReaderRegistry, ReadResult, build_default_registry, read_image
+from autotem.io.metadata import (
+    FORMAT_METADATA_MAPPINGS,
+    METADATA_WARNING_CATALOG,
+    normalize_metadata,
+)
+from autotem.io.readers import (
+    ReaderRegistration,
+    ReaderRegistry,
+    ReadResult,
+    build_default_registry,
+    read_image,
+    read_series,
+    read_series_as_temdataset,
+)
 
 
-def load_tem_dataset(input_path: str | Path):
+def load_tem_dataset(input_path: str | Path) -> TEMDataset:
     """Load microscopy input and convert it to the shared TEMDataset model."""
     path = Path(input_path)
     if not path.exists():
@@ -27,10 +39,16 @@ def load_tem_dataset(input_path: str | Path):
 
 __all__ = [
     "ReadResult",
+    "ReaderRegistration",
     "ReaderRegistry",
+    "FORMAT_METADATA_MAPPINGS",
+    "METADATA_WARNING_CATALOG",
     "build_default_registry",
     "load_tem_dataset",
     "normalize_metadata",
     "read_image",
+    "read_series",
+    "read_series_as_temdataset",
     "to_temdataset",
 ]
+

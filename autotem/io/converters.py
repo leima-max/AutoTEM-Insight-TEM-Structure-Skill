@@ -13,10 +13,17 @@ from .readers import ReadResult
 
 def _warning_to_text(warning: dict[str, Any]) -> str:
     code = warning.get("code", "WARNING")
+    severity = warning.get("severity", "warning")
     message = warning.get("message", "")
     field = warning.get("field")
-    suffix = f" [field={field}]" if field else ""
-    return f"{code}: {message}{suffix}".strip()
+    source = warning.get("source")
+    pieces = [f"[{severity}]", code + ":"]
+    if source:
+        pieces.append(f"({source})")
+    pieces.append(message)
+    if field:
+        pieces.append(f"[field={field}]")
+    return " ".join(pieces).strip()
 
 
 def _to_array_reference(result: ReadResult) -> ArrayReference:
@@ -43,6 +50,29 @@ def _to_pixel_measurement(result: ReadResult) -> Measurement | None:
     )
 
 
+def _infer_modality(result: ReadResult) -> str:
+    path = str(result.provenance.get("path", "")).lower()
+    metadata_blob = str(result.metadata_raw).lower()
+
+    if path.endswith((".ser", ".emi")):
+        if any(token in metadata_blob for token in ["scan", "datacube", "4d"]):
+            return "4D-STEM"
+        return "STEM"
+    if any(token in metadata_blob for token in ["haadf", "high angle annular"]):
+        return "HAADF-STEM"
+    if any(token in metadata_blob for token in ["annular bright", "abf"]):
+        return "ABF-STEM"
+    if any(token in metadata_blob for token in ["sted", "scanmode", "probe"]):
+        return "STEM"
+    if any(token in metadata_blob for token in ["saed", "selected area diffraction"]):
+        return "SAED"
+    if any(token in metadata_blob for token in ["nbed", "nanobeam"]):
+        return "NBED"
+    if path.endswith((".dm3", ".dm4", ".mrc", ".tif", ".tiff", ".png", ".jpg", ".jpeg")):
+        return "TEM"
+    return "unknown"
+
+
 def to_temdataset(result: ReadResult, dataset_cls: Callable[..., Any] | None = None) -> Any:
     """Convert `ReadResult` into `TEMDataset` or a compatible override class."""
     warning_texts = [_warning_to_text(w) for w in result.warnings]
@@ -51,7 +81,7 @@ def to_temdataset(result: ReadResult, dataset_cls: Callable[..., Any] | None = N
         "data": _to_array_reference(result),
         "dataset_id": Path(source_path).stem if source_path else "",
         "source_path": source_path,
-        "modality": "unknown",
+        "modality": _infer_modality(result),
         "pixel_size": _to_pixel_measurement(result),
         "pixel_unit": "nm" if result.metadata_norm.get("pixel_size_nm") is not None else "unknown",
         "metadata": {

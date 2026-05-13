@@ -1,9 +1,10 @@
-﻿"""Multi-format reader registry and baseline image readers."""
+"""Multi-format reader registry and baseline image readers."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,23 @@ from PIL import Image, TiffTags
 from .metadata import normalize_metadata
 
 ReaderFn = Callable[[Path], "ReadResult"]
+
+
+def _mk_warning(
+    code: str,
+    message: str,
+    field: str | None = None,
+    severity: str = "warning",
+) -> dict[str, Any]:
+    warning: dict[str, Any] = {
+        "code": code,
+        "message": message,
+        "severity": severity,
+        "source": "reader",
+    }
+    if field:
+        warning["field"] = field
+    return warning
 
 
 @dataclass
@@ -26,31 +44,110 @@ class ReadResult:
     provenance: dict[str, Any]
 
 
+@dataclass
+class ReaderRegistration:
+    """Metadata for one reader registration."""
+
+    reader: ReaderFn | None
+    requires: tuple[str, ...]
+    description: str
+    available: bool
+    unavailable_reason: str | None = None
+
+
 class ReaderRegistry:
     """Registry dispatching file readers by extension."""
 
     def __init__(self) -> None:
-        self._readers: dict[str, ReaderFn] = {}
+        self._entries: dict[str, ReaderRegistration] = {}
 
-    def register(self, extensions: str | list[str] | tuple[str, ...], reader: ReaderFn) -> None:
+    def register(
+        self,
+        extensions: str | list[str] | tuple[str, ...],
+        reader: ReaderFn,
+        requires: tuple[str, ...] = (),
+        description: str = "",
+    ) -> None:
         if isinstance(extensions, str):
             extensions = [extensions]
         for ext in extensions:
             normalized = ext.lower().strip()
             if not normalized.startswith("."):
                 normalized = "." + normalized
-            self._readers[normalized] = reader
+            self._entries[normalized] = ReaderRegistration(
+                reader=reader,
+                requires=requires,
+                description=description,
+                available=True,
+            )
+
+    def register_unavailable(
+        self,
+        extensions: str | list[str] | tuple[str, ...],
+        requires: tuple[str, ...],
+        description: str,
+        unavailable_reason: str,
+    ) -> None:
+        if isinstance(extensions, str):
+            extensions = [extensions]
+        for ext in extensions:
+            normalized = ext.lower().strip()
+            if not normalized.startswith("."):
+                normalized = "." + normalized
+            self._entries[normalized] = ReaderRegistration(
+                reader=None,
+                requires=requires,
+                description=description,
+                available=False,
+                unavailable_reason=unavailable_reason,
+            )
 
     def get_reader(self, path: str | Path) -> ReaderFn:
         suffix = Path(path).suffix.lower()
-        if suffix not in self._readers:
-            supported = ", ".join(sorted(self._readers))
+        registration = self._entries.get(suffix)
+        if registration is None:
+            supported = ", ".join(self.list_supported_formats(only_available=True))
             raise ValueError(f"Unsupported file extension: {suffix}. Supported: {supported}")
-        return self._readers[suffix]
+        if not registration.available or registration.reader is None:
+            required = ", ".join(registration.requires) if registration.requires else "optional dependency"
+            reason = registration.unavailable_reason or "dependency unavailable"
+            raise ValueError(
+                f"Reader for {suffix} is unavailable ({reason}). Install: {required}."
+            )
+        return registration.reader
 
     def read(self, path: str | Path) -> ReadResult:
         reader = self.get_reader(path)
         return reader(Path(path))
+
+    def list_supported_formats(self, only_available: bool = False) -> list[str]:
+        formats: list[str] = []
+        for ext, registration in sorted(self._entries.items()):
+            if only_available and not registration.available:
+                continue
+            formats.append(ext)
+        return formats
+
+    def describe_formats(self) -> dict[str, dict[str, Any]]:
+        description: dict[str, dict[str, Any]] = {}
+        for ext, registration in sorted(self._entries.items()):
+            description[ext] = {
+                "available": registration.available,
+                "requires": list(registration.requires),
+                "description": registration.description,
+                "unavailable_reason": registration.unavailable_reason,
+            }
+        return description
+
+
+def _dependencies_available(requires: tuple[str, ...]) -> tuple[bool, str | None]:
+    missing: list[str] = []
+    for package in requires:
+        if find_spec(package) is None:
+            missing.append(package)
+    if missing:
+        return False, f"missing dependencies: {', '.join(missing)}"
+    return True, None
 
 
 def _tag_name(tag_id: int) -> str:
@@ -82,20 +179,32 @@ def _read_standard_image(path: Path) -> ReadResult:
                 metadata_raw[_tag_name(tag_id)] = _to_jsonable(value)
                 metadata_raw[str(tag_id)] = _to_jsonable(value)
 
+        if getattr(img, "n_frames", 1) > 1:
+            warnings.append(
+                _mk_warning(
+                    "IMAGE_MULTIFRAME_TIFF",
+                    "Multi-frame TIFF detected. Only the first frame is read.",
+                    field="array",
+                )
+            )
+
         array = np.asarray(img)
         if array.ndim == 3:
             warnings.append(
-                {
-                    "code": "IMAGE_RGB_TO_GRAYSCALE",
-                    "message": "Input image has RGB channels; converted to grayscale average.",
-                    "field": "array",
-                }
+                _mk_warning(
+                    "IMAGE_RGB_TO_GRAYSCALE",
+                    "Input image has RGB channels; converted to grayscale average.",
+                    field="array",
+                )
             )
             array = array.mean(axis=2)
         if array.ndim != 2:
             raise ValueError(f"Expected 2D image but got shape {array.shape} for {path.name}.")
 
-        metadata_norm, metadata_warnings = normalize_metadata(metadata_raw)
+        metadata_norm, metadata_warnings = normalize_metadata(
+            metadata_raw,
+            source_format=path.suffix,
+        )
         warnings.extend(metadata_warnings)
 
         return ReadResult(
@@ -129,7 +238,7 @@ def _read_numpy_or_text(path: Path) -> ReadResult:
         "shape": list(array.shape),
         "dtype": str(array.dtype),
     }
-    metadata_norm, warnings = normalize_metadata(metadata_raw)
+    metadata_norm, warnings = normalize_metadata(metadata_raw, source_format=suffix)
     return ReadResult(
         array=np.asarray(array).astype(np.float32),
         metadata_raw=metadata_raw,
@@ -150,7 +259,7 @@ def _read_dm(path: Path) -> ReadResult:
     metadata_raw = _to_jsonable(dict(payload))
     metadata_raw.pop("data", None)
 
-    metadata_norm, warnings = normalize_metadata(metadata_raw)
+    metadata_norm, warnings = normalize_metadata(metadata_raw, source_format=path.suffix)
     return ReadResult(
         array=array.astype(np.float32),
         metadata_raw=metadata_raw,
@@ -177,7 +286,7 @@ def _read_mrc(path: Path) -> ReadResult:
         if metadata_raw["pixel_size_x_angstrom"]:
             metadata_raw["pixel_size"] = f"{metadata_raw['pixel_size_x_angstrom']} angstrom"
 
-    metadata_norm, warnings = normalize_metadata(metadata_raw)
+    metadata_norm, warnings = normalize_metadata(metadata_raw, source_format=path.suffix)
     return ReadResult(
         array=array.astype(np.float32),
         metadata_raw=metadata_raw,
@@ -211,7 +320,7 @@ def _read_hdf5_emd(path: Path) -> ReadResult:
             raise ValueError(f"No numeric dataset found in {path.name}.")
         metadata_raw = _to_jsonable(dict(h5f.attrs))
 
-    metadata_norm, warnings = normalize_metadata(metadata_raw)
+    metadata_norm, warnings = normalize_metadata(metadata_raw, source_format=path.suffix)
     return ReadResult(
         array=np.asarray(array).astype(np.float32),
         metadata_raw=metadata_raw,
@@ -230,7 +339,7 @@ def _read_ser(path: Path) -> ReadResult:
     with ser.fileSER(str(path)) as handle:
         array, metadata = handle.getDataset(0)
     metadata_raw = _to_jsonable(dict(metadata or {}))
-    metadata_norm, warnings = normalize_metadata(metadata_raw)
+    metadata_norm, warnings = normalize_metadata(metadata_raw, source_format=path.suffix)
 
     return ReadResult(
         array=np.asarray(array).astype(np.float32),
@@ -244,12 +353,37 @@ def _read_ser(path: Path) -> ReadResult:
 def build_default_registry() -> ReaderRegistry:
     """Build default registry with baseline and optional adapters."""
     registry = ReaderRegistry()
-    registry.register([".npy", ".txt", ".csv"], _read_numpy_or_text)
-    registry.register([".tif", ".tiff", ".png", ".jpg", ".jpeg"], _read_standard_image)
-    registry.register([".dm3", ".dm4"], _read_dm)
-    registry.register(".mrc", _read_mrc)
-    registry.register([".h5", ".hdf5", ".emd"], _read_hdf5_emd)
-    registry.register([".ser", ".emi"], _read_ser)
+
+    registry.register(
+        [".npy", ".txt", ".csv"],
+        _read_numpy_or_text,
+        description="NumPy/text array reader.",
+    )
+    registry.register(
+        [".tif", ".tiff", ".png", ".jpg", ".jpeg"],
+        _read_standard_image,
+        description="Baseline PIL image reader for common image formats.",
+    )
+
+    optional_specs = [
+        ([".dm3", ".dm4"], _read_dm, ("ncempy",), "DigitalMicrograph DM format reader."),
+        ([".mrc"], _read_mrc, ("mrcfile",), "MRC format reader."),
+        ([".h5", ".hdf5", ".emd"], _read_hdf5_emd, ("h5py",), "HDF5/EMD format reader."),
+        ([".ser", ".emi"], _read_ser, ("ncempy",), "SER format reader."),
+    ]
+
+    for extensions, reader, requires, description in optional_specs:
+        available, reason = _dependencies_available(requires)
+        if available:
+            registry.register(extensions, reader, requires=requires, description=description)
+        else:
+            registry.register_unavailable(
+                extensions,
+                requires=requires,
+                description=description,
+                unavailable_reason=reason or "dependency unavailable",
+            )
+
     return registry
 
 
@@ -257,4 +391,63 @@ def read_image(path: str | Path, registry: ReaderRegistry | None = None) -> Read
     """Read an image file using the supplied/default registry."""
     registry = registry or build_default_registry()
     return registry.read(path)
+
+
+def _collect_series_paths(
+    source: str | Path | Sequence[str | Path],
+    registry: ReaderRegistry,
+    recursive: bool,
+) -> list[Path]:
+    if isinstance(source, (str, Path)):
+        source_path = Path(source)
+        if source_path.is_dir():
+            pattern = "**/*" if recursive else "*"
+            supported = set(registry.list_supported_formats(only_available=True))
+            return sorted(
+                path
+                for path in source_path.glob(pattern)
+                if path.is_file() and path.suffix.lower() in supported
+            )
+        return [source_path]
+
+    return sorted(Path(item) for item in source)
+
+
+def read_series(
+    source: str | Path | Sequence[str | Path],
+    registry: ReaderRegistry | None = None,
+    recursive: bool = False,
+    skip_errors: bool = False,
+) -> list[ReadResult]:
+    """Read a directory or path sequence into a list of `ReadResult`."""
+    registry = registry or build_default_registry()
+    results: list[ReadResult] = []
+    paths = _collect_series_paths(source, registry, recursive=recursive)
+
+    for path in paths:
+        try:
+            results.append(registry.read(path))
+        except Exception:
+            if not skip_errors:
+                raise
+    return results
+
+
+def read_series_as_temdataset(
+    source: str | Path | Sequence[str | Path],
+    registry: ReaderRegistry | None = None,
+    recursive: bool = False,
+    skip_errors: bool = False,
+    dataset_cls: Callable[..., Any] | None = None,
+) -> list[Any]:
+    """Read a series and convert each item to `TEMDataset`."""
+    from .converters import to_temdataset
+
+    results = read_series(
+        source,
+        registry=registry,
+        recursive=recursive,
+        skip_errors=skip_errors,
+    )
+    return [to_temdataset(result, dataset_cls=dataset_cls) for result in results]
 

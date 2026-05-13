@@ -109,3 +109,15 @@ atom_lattice = result.to_atom_lattice(coordinate_unit="pixel")
   - `python -m pip install -e ".[dev]"`
 - UI install (Streamlit tooling):
   - `python -m pip install -e ".[dev,ui]"`
+
+## Test Quickstart
+
+- Run tests via project virtual environment (recommended on Windows):
+  - `.\run-tests.cmd`
+- PowerShell variant:
+  - `.\run-tests.ps1`
+- Run a single test file:
+  - `.\run-tests.cmd tests\test_io.py`
+- If `.venv` is missing:
+  - `python -m venv .venv`
+  - `.\.venv\Scripts\python.exe -m pip install -e ".[dev,io]"`
