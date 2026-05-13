@@ -1,0 +1,52 @@
+suite:
+  schema_version: 2026-05-13.a4.case-schema.v1
+  suite_id: smoke_suite
+  description: Minimal multi-case benchmark suite example.
+  default_output_dir: outputs/benchmark-suite
+  regression_weights:
+    status_flip_pass_to_fail: 5
+    acceptance_failed_increase: 2
+    warning_count_increase: 1
+    acceptance_pass_rate_drop: 2
+  regression_weight_templates:
+    - modality: HRTEM
+      weights:
+        status_flip_pass_to_fail: 8
+        acceptance_failed_increase: 3
+    - modality: HAADF-STEM
+      weights:
+        warning_count_increase: 0
+
+cases:
+  - case_id: hrtem_case_existing_report
+    description: Re-benchmark an existing report output.
+    report_path: outputs/sample_hrtem/analysis_report.json
+    tags: [hrtem, smoke]
+    reference:
+      d_spacings_nm: [0.235, 0.204]
+      hkl_truth:
+        - [1, 1, 1]
+      phase_truth: [Gold]
+    acceptance_criteria:
+      - metric: workflow_no_failed_steps
+        op: ">="
+        threshold: 1
+      - metric: d_spacing_mean_relative_error
+        op: "<="
+        threshold: 0.05
+
+  - case_id: haadf_case_run_pipeline
+    description: Run pipeline from input then benchmark.
+    input_path: examples/sample.npy
+    workflow_path: configs/a4_validation_benchmark.yaml
+    output_subdir: haadf_case_run_pipeline
+    regression_weights:
+      status_flip_pass_to_fail: 6
+      warning_count_increase: 0
+    tags: [haadf, smoke]
+    reference:
+      phase_truth: [Gold]
+    acceptance_criteria:
+      - metric: workflow_no_failed_steps
+        op: ">="
+        threshold: 1

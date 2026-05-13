@@ -2,79 +2,30 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from autotem.core import (
     ArrayReference,
-    Measurement,
     PreprocessingResult,
     QualityAssessment,
     TEMDataset,
 )
+from autotem.preprocessing.quality import assess_image_quality, load_dataset_array
 
 
 def _load_array(dataset: TEMDataset) -> np.ndarray | None:
-    uri = dataset.data.uri
-    if uri is None:
-        return None
-    path = Path(uri)
-    if not path.exists():
-        return None
-    if path.suffix.lower() == ".npy":
-        return np.load(path, allow_pickle=False).astype(np.float32)
-    if path.suffix.lower() in {".txt", ".csv"}:
-        return np.loadtxt(path).astype(np.float32)
-    return None
+    return load_dataset_array(dataset)
 
 
-def assess_quality(dataset: TEMDataset) -> QualityAssessment:
-    """Return simple but deterministic image-quality metrics for A2 workflows."""
-    image = _load_array(dataset)
-    warnings = list(dataset.warnings)
-    if image is None or image.size == 0:
-        warnings.append("Quality metrics are approximate because pixel data was not loaded.")
-        return QualityAssessment(
-            overall_score=0.3,
-            metadata_completeness=0.4 if dataset.metadata else 0.2,
-            confidence=0.35,
-            warnings=warnings,
-            provenance={"method": "a2_baseline_no_pixels"},
-        )
-
-    finite = np.isfinite(image)
-    valid = image[finite]
-    if valid.size == 0:
-        warnings.append("Image contains no finite values.")
-        return QualityAssessment(
-            overall_score=0.1,
-            confidence=0.1,
-            warnings=warnings,
-            provenance={"method": "a2_baseline_invalid_pixels"},
-        )
-
-    std = float(np.std(valid))
-    mean = float(np.mean(valid))
-    snr_value = abs(mean) / (std + 1e-8)
-    grad_y, grad_x = np.gradient(valid.reshape(image.shape))
-    blur_value = float(np.var(grad_x) + np.var(grad_y))
-    metadata_completeness = 0.7 if dataset.metadata else 0.3
-    quality_score = max(
-        0.0,
-        min(1.0, 0.3 * np.tanh(snr_value / 3.0) + 0.5 + 0.2 * np.tanh(blur_value)),
-    )
-
-    return QualityAssessment(
-        overall_score=quality_score,
-        snr=Measurement(value=snr_value, unit="a.u.", method="mean_over_std"),
-        blur=Measurement(value=blur_value, unit="a.u.", method="gradient_variance"),
-        metadata_completeness=metadata_completeness,
-        confidence=0.6,
-        warnings=warnings,
-        provenance={"method": "a2_baseline"},
-    )
+def assess_quality(
+    dataset: TEMDataset,
+    *,
+    parameters: dict[str, Any] | None = None,
+) -> QualityAssessment:
+    """Return deterministic B1 quality metrics with optional threshold overrides."""
+    return assess_image_quality(dataset, parameters=parameters)
 
 
 def preprocess_dataset(

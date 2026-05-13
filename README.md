@@ -81,9 +81,17 @@ workflow:
   steps: [load, assess_quality, calibrate, preprocess, analyze, report]
   parameters:
     calibration:
-      method: auto
+      method: reference
+      diffraction_calibration_engine: internal  # internal | py4dstem | pyxem | auto
       pixel_size_nm: 0.05
+      pixel_size_uncertainty_nm: 0.001
       voltage_kv: 300
+      known_d_spacing: 0.213
+      known_d_spacing_unit: nm
+      known_d_uncertainty_nm: 0.002
+      measured_radius_px: 46.5
+      measured_radius_uncertainty_px: 0.25
+      detector_pixel_size_um: 15.0
     preprocessing:
       recipe: min_max
       clip_percentile_low: 1.0
@@ -100,6 +108,39 @@ outputs:
 ```
 
 Validation is enforced during workflow loading; invalid ranges or unsupported formats fail fast with clear `ValueError` messages.
+
+### B1 Minimal Reproducible Calibration
+
+```bash
+autotem analyze examples/sample.npy --workflow configs/hrtem_fft_phase.yaml --output outputs/hrtem_b1
+```
+
+When `known_d_spacing + measured_radius_px` are provided, the calibration step now propagates
+uncertainty to:
+
+- `calibration.diffraction_scale.uncertainty`
+- downstream `diffraction.g_vectors[].magnitude.uncertainty`
+- downstream `diffraction.d_spacings[].uncertainty`
+
+Optional adapter switch:
+
+- `diffraction_calibration_engine: internal` (default, no extra dependency)
+- `diffraction_calibration_engine: py4dstem`
+- `diffraction_calibration_engine: pyxem`
+- `diffraction_calibration_engine: auto` (try py4dstem, then fallback)
+
+If an optional adapter is unavailable, the workflow degrades gracefully to internal calibration and records a warning.
+
+### A4 Uncertainty Metrics
+
+A4 validation/benchmark reports now include d-spacing uncertainty quality metrics:
+
+- `d_spacing_uncertainty_coverage`
+- `d_spacing_uncertainty_mean_relative`
+- `d_spacing_uncertainty_plausible_fraction`
+- `d_spacing_uncertainty_outlier_count`
+
+These are emitted automatically when diffraction d-spacing values are present.
 
 ## A4 Validation & Benchmark
 
@@ -129,6 +170,42 @@ A4 outputs (when enabled):
 - `json/validation_summary.json`
 - `json/benchmark_report.json`
 - `analysis_report.json -> benchmark` snapshot
+
+Multi-case A4 suite example:
+
+- `configs/benchmarks/suite_smoke.yaml`
+- `benchmarks/suite_public_minimal.yaml` (public minimal runnable package)
+- programmatic runner:
+  - `from autotem.validation import run_benchmark_suite_from_file`
+- CLI:
+  - `autotem benchmark --suite configs/benchmarks/suite_smoke.yaml --fail-on-failed`
+  - `autotem benchmark --suite benchmarks/suite_public_minimal.yaml --output outputs/benchmark-public-minimal`
+- Trend artifacts (auto-generated per suite output dir):
+  - `benchmark_suite_history.jsonl`
+  - `benchmark_suite_trend.json`
+  - `benchmark_suite_trend.html`
+  - includes case-level `regression_alerts` leaderboard for degraded cases
+  - severity is configurable by suite `regression_weights`
+  - modality-level defaults are configurable via `suite.regression_weight_templates[]`
+  - each case can override weights via `cases[].regression_weights`
+  - effective precedence is `suite default -> modality template -> case override`
+- package doc:
+  - `benchmarks/README.md`
+
+Nightly CI benchmark:
+
+- workflow: `.github/workflows/nightly-benchmark.yml`
+- schedule: daily at `02:00 UTC` (manual trigger also supported)
+- uploads artifacts:
+  - `benchmark_suite_report.json/html`
+  - `benchmark_suite_history.jsonl`
+  - `benchmark_suite_trend.json/html`
+  - `cases/**/benchmark_report.json`
+- notification behavior:
+  - always publishes `Top Regressions` to GitHub Job Summary
+  - when regressions are detected, auto creates/updates issue:
+    - title: `[Nightly Benchmark] Regressions detected (<suite_id>)`
+  - when regressions drop to zero, the workflow auto closes that issue
 
 ## Local UI (Atom Detection C0)
 
@@ -167,6 +244,8 @@ atom_lattice = result.to_atom_lattice(coordinate_unit="pixel")
   - `python -m pip install -e ".[dev]"`
 - UI install (Streamlit tooling):
   - `python -m pip install -e ".[dev,ui]"`
+- Optional GPL adapter install (py4DSTEM/pyxem calibration hooks):
+  - `python -m pip install -e ".[gpl_adapters]"`
 
 ## Test Quickstart
 

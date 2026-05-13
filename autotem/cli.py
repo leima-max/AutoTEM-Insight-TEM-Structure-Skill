@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+from autotem.validation import run_benchmark_suite_from_file
 from autotem.workflows.pipeline import TEMAnalysisSkill
 
 EXIT_OK = 0
@@ -81,6 +82,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Repeatable cover key=value entry for PDF cover page.",
     )
 
+    benchmark = subparsers.add_parser(
+        "benchmark",
+        help="Run A4 benchmark suite from YAML config.",
+    )
+    benchmark.add_argument(
+        "--suite",
+        type=Path,
+        required=True,
+        help="Path to benchmark suite YAML.",
+    )
+    benchmark.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional benchmark suite output directory override.",
+    )
+    benchmark.add_argument(
+        "--fail-on-failed",
+        action="store_true",
+        help="Return non-zero exit code when any benchmark case/criteria fail.",
+    )
+
     return parser
 
 
@@ -153,6 +176,35 @@ def main(argv: list[str] | None = None) -> int:
         if "atom_count" in result:
             print(f"Detected atoms: {result['atom_count']}")
         print(json.dumps(result, indent=2))
+        return EXIT_OK
+
+    if args.command == "benchmark":
+        try:
+            summary = run_benchmark_suite_from_file(
+                suite_path=args.suite,
+                output_dir=args.output,
+            )
+        except ValueError as exc:
+            print(f"AutoTEM benchmark configuration error: {exc}", file=sys.stderr)
+            return EXIT_CONFIG_ERROR
+        except FileNotFoundError as exc:
+            print(f"AutoTEM benchmark file error: {exc}", file=sys.stderr)
+            return EXIT_FILE_ERROR
+        except Exception as exc:  # noqa: BLE001
+            print(f"AutoTEM benchmark runtime error: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+
+        acceptance = summary.get("acceptance", {})
+        all_passed = (
+            bool(acceptance.get("all_passed", False))
+            if isinstance(acceptance, dict)
+            else False
+        )
+        status = "A4 benchmark suite completed."
+        print(status)
+        print(json.dumps(summary, indent=2))
+        if args.fail_on_failed and not all_passed:
+            return EXIT_RUNTIME_ERROR
         return EXIT_OK
 
     parser.print_help()

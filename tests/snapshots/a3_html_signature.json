@@ -7,53 +7,43 @@
   "step_rows": [
     [
       "load",
-      "warning",
-      "5"
+      "warning"
     ],
     [
       "assess_quality",
-      "warning",
-      "5"
+      "warning"
     ],
     [
       "calibrate",
-      "warning",
-      "6"
+      "warning"
     ],
     [
       "preprocess",
-      "warning",
-      "5"
+      "warning"
     ],
     [
       "fft",
-      "warning",
-      "11"
+      "warning"
     ],
     [
       "diffraction_peaks",
-      "warning",
-      "11"
+      "warning"
     ],
     [
       "index_diffraction",
-      "warning",
-      "11"
+      "warning"
     ],
     [
       "phase_match",
-      "warning",
-      "11"
+      "warning"
     ],
     [
       "simulate",
-      "warning",
-      "11"
+      "warning"
     ],
     [
       "report",
-      "done",
-      "0"
+      "done"
     ]
   ],
   "interface_rows": [

@@ -100,6 +100,84 @@ def collect_validation_metrics(report: AnalysisReport) -> tuple[list[ValidationM
             direction="higher_is_better",
         )
     )
+    if d_spacing_count > 0 and diffraction is not None:
+        rel_uncertainties: list[float] = []
+        uncertainty_present_count = 0
+        outlier_count = 0
+        for item in diffraction.d_spacings:
+            if item.uncertainty is None:
+                continue
+            try:
+                value = float(item.value)
+                uncertainty = float(item.uncertainty)
+            except (TypeError, ValueError):
+                continue
+            if value == 0:
+                continue
+            if uncertainty < 0:
+                continue
+            uncertainty_present_count += 1
+            rel_unc = abs(uncertainty / value)
+            rel_uncertainties.append(rel_unc)
+            if rel_unc > 0.5:
+                outlier_count += 1
+
+        coverage = uncertainty_present_count / d_spacing_count
+        if rel_uncertainties:
+            mean_rel_unc = float(sum(rel_uncertainties) / len(rel_uncertainties))
+            plausible_fraction = float(
+                sum(1 for rel in rel_uncertainties if rel <= 0.5) / len(rel_uncertainties)
+            )
+        else:
+            mean_rel_unc = 0.0
+            plausible_fraction = 0.0
+
+        metrics.append(
+            _metric(
+                name="d_spacing_uncertainty_coverage",
+                value=coverage,
+                unit="fraction",
+                method="diffraction_result_uncertainty_scan",
+                direction="higher_is_better",
+                details={
+                    "with_uncertainty": uncertainty_present_count,
+                    "total_d_spacings": d_spacing_count,
+                },
+            )
+        )
+        metrics.append(
+            _metric(
+                name="d_spacing_uncertainty_mean_relative",
+                value=mean_rel_unc,
+                unit="fraction",
+                method="diffraction_result_uncertainty_scan",
+                direction="lower_is_better",
+                details={"sample_count": len(rel_uncertainties)},
+            )
+        )
+        metrics.append(
+            _metric(
+                name="d_spacing_uncertainty_plausible_fraction",
+                value=plausible_fraction,
+                unit="fraction",
+                method="diffraction_result_uncertainty_scan",
+                direction="higher_is_better",
+                details={
+                    "criterion": "relative_uncertainty <= 0.5",
+                    "sample_count": len(rel_uncertainties),
+                },
+            )
+        )
+        metrics.append(
+            _metric(
+                name="d_spacing_uncertainty_outlier_count",
+                value=outlier_count,
+                unit="count",
+                method="diffraction_result_uncertainty_scan",
+                direction="lower_is_better",
+                details={"criterion": "relative_uncertainty > 0.5"},
+            )
+        )
     metrics.append(
         _metric(
             name="phase_candidate_count",

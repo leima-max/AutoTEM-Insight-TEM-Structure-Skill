@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import operator
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
+import numpy as np
+
+from autotem.atomic.distance_statistics import compute_distance_statistics_from_lattice
 from autotem.core import (
     AnalysisReport,
+    ArrayReference,
     BenchmarkCase,
     BenchmarkResult,
+    IndexedSpot,
     Measurement,
+    PhaseCandidate,
     ValidationMetric,
 )
 from autotem.validation.metrics import collect_validation_metrics
@@ -23,6 +30,101 @@ _OPS: dict[str, Callable[[float, float], bool]] = {
     "<": operator.lt,
     "==": operator.eq,
 }
+
+
+def _as_int(value: Any, *, default: int) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return default
+
+
+def _normalize_hkl(value: Any) -> tuple[int, int, int] | None:
+    if isinstance(value, str):
+        parts = value.replace(",", " ").split()
+        if len(parts) != 3:
+            return None
+        try:
+            return int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            return None
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        h, k, ell = value[0], value[1], value[2]
+        if isinstance(h, (int, float)) and isinstance(k, (int, float)) and isinstance(
+            ell, (int, float)
+        ):
+            return int(h), int(k), int(ell)
+    return None
+
+
+def _indexed_hkl_topk(indexed_spots: list[IndexedSpot], *, top_k: int) -> set[tuple[int, int, int]]:
+    if top_k <= 0:
+        return set()
+    result: set[tuple[int, int, int]] = set()
+    for spot in indexed_spots:
+        result.add((int(spot.h), int(spot.k), int(spot.l)))
+        if len(result) >= top_k:
+            break
+    return result
+
+
+def _phase_names_topk(candidates: list[PhaseCandidate], *, top_k: int) -> set[str]:
+    if top_k <= 0:
+        return set()
+    return {str(item.name).strip().lower() for item in candidates[:top_k] if str(item.name).strip()}
+
+
+def _array_from_reference(
+    array_ref: ArrayReference | None,
+    *,
+    report_base_dir: Path | None = None,
+) -> np.ndarray | None:
+    if array_ref is None:
+        return None
+    if array_ref.inline is not None:
+        return np.asarray(array_ref.inline, dtype=np.float64)
+    if array_ref.uri is None or not array_ref.uri:
+        return None
+
+    raw_path = Path(array_ref.uri)
+    if not raw_path.is_absolute():
+        if report_base_dir is None:
+            return None
+        raw_path = report_base_dir / raw_path
+    if not raw_path.exists():
+        return None
+    if raw_path.suffix.lower() != ".npy":
+        return None
+    loaded = np.load(raw_path, allow_pickle=False)
+    return np.asarray(loaded, dtype=np.float64)
+
+
+def _masked_mae_rmse(
+    observed: np.ndarray,
+    reference: np.ndarray,
+    *,
+    mask: np.ndarray | None = None,
+) -> tuple[float, float, int]:
+    if observed.shape != reference.shape:
+        raise ValueError("Observed and reference arrays must have identical shape.")
+    if mask is None:
+        valid = np.ones(observed.shape, dtype=bool)
+    else:
+        if mask.shape != observed.shape:
+            raise ValueError("Mask shape must match observed/reference shape.")
+        valid = mask.astype(bool)
+    diffs = observed - reference
+    finite = np.isfinite(diffs)
+    valid = valid & finite
+    values = diffs[valid]
+    if values.size == 0:
+        raise ValueError("No valid values available after mask/finite filtering.")
+    mae = float(np.mean(np.abs(values)))
+    rmse = float(np.sqrt(np.mean(np.square(values))))
+    return mae, rmse, int(values.size)
 
 
 def _to_float(value: Any) -> float:
@@ -115,6 +217,8 @@ def _append_reference_metrics(
     report: AnalysisReport,
     metrics: list[ValidationMetric],
     benchmark_parameters: dict[str, Any],
+    *,
+    report_base_dir: Path | None = None,
 ) -> list[str]:
     warnings: list[str] = []
     reference = benchmark_parameters.get("reference")
@@ -144,6 +248,68 @@ def _append_reference_metrics(
             warnings.append(
                 "Benchmark reference hook skipped d-spacing metric: "
                 "no overlapping observed/reference values."
+            )
+
+    hkl_truth_raw = reference.get("hkl_truth")
+    if isinstance(hkl_truth_raw, list):
+        truth = [
+            item for item in (_normalize_hkl(row) for row in hkl_truth_raw) if item is not None
+        ]
+        top_k = _as_int(reference.get("hkl_top_k"), default=3)
+        predicted = (
+            _indexed_hkl_topk(report.diffraction.indexed_spots, top_k=top_k)
+            if report.diffraction is not None
+            else set()
+        )
+        if truth:
+            matched = sum(1 for row in truth if row in predicted)
+            accuracy = matched / len(truth)
+            metrics.append(
+                ValidationMetric(
+                    name="hkl_topk_accuracy",
+                    value=Measurement(value=accuracy, unit="fraction", method="reference_compare"),
+                    direction="higher_is_better",
+                    details={
+                        "truth_count": len(truth),
+                        "matched_count": matched,
+                        "top_k": top_k,
+                    },
+                )
+            )
+        else:
+            warnings.append("Benchmark reference hook skipped hkl metric: no valid `hkl_truth`.")
+
+    phase_truth_raw = reference.get("phase_truth")
+    if isinstance(phase_truth_raw, list):
+        truth_phase = {str(item).strip().lower() for item in phase_truth_raw if str(item).strip()}
+        phase_top_k = _as_int(reference.get("phase_top_k"), default=3)
+        predicted_phase = (
+            _phase_names_topk(report.diffraction.phase_candidates, top_k=phase_top_k)
+            if report.diffraction is not None
+            else set()
+        )
+        if truth_phase:
+            matched_phase = len(truth_phase.intersection(predicted_phase))
+            phase_accuracy = matched_phase / len(truth_phase)
+            metrics.append(
+                ValidationMetric(
+                    name="phase_topk_accuracy",
+                    value=Measurement(
+                        value=phase_accuracy,
+                        unit="fraction",
+                        method="reference_compare",
+                    ),
+                    direction="higher_is_better",
+                    details={
+                        "truth_count": len(truth_phase),
+                        "matched_count": matched_phase,
+                        "top_k": phase_top_k,
+                    },
+                )
+            )
+        else:
+            warnings.append(
+                "Benchmark reference hook skipped phase metric: no valid `phase_truth`."
             )
 
     atom_ref = reference.get("atom_coordinates")
@@ -178,6 +344,118 @@ def _append_reference_metrics(
                 "observed/reference coordinates unavailable."
             )
 
+    atom_distance_ref = reference.get("atom_nearest_distances")
+    if isinstance(atom_distance_ref, list):
+        if report.atom_lattice is None or not report.atom_lattice.atoms:
+            warnings.append(
+                "Benchmark reference hook skipped atom distance metric: AtomLattice missing."
+            )
+        else:
+            stats = compute_distance_statistics_from_lattice(report.atom_lattice)
+            observed_nn = [float(value) for value in stats.nearest_distances if np.isfinite(value)]
+            reference_nn = [
+                float(item)
+                for item in atom_distance_ref
+                if isinstance(item, (int, float))
+            ]
+            pair_count = min(len(observed_nn), len(reference_nn))
+            if pair_count > 0:
+                distance_rel_err = mean_relative_error(
+                    observed_nn[:pair_count],
+                    reference_nn[:pair_count],
+                )
+                metrics.append(
+                    ValidationMetric(
+                        name="atom_nearest_distance_mean_relative_error",
+                        value=Measurement(
+                            value=distance_rel_err,
+                            unit="fraction",
+                            method="reference_compare",
+                        ),
+                        direction="lower_is_better",
+                        details={"pair_count": pair_count},
+                    )
+                )
+            else:
+                warnings.append(
+                    "Benchmark reference hook skipped atom distance metric: "
+                    "no overlapping observed/reference nearest distances."
+                )
+
+    strain_map_refs: dict[str, Any] = {}
+    if isinstance(reference.get("strain_maps"), dict):
+        strain_map_refs = dict(reference.get("strain_maps", {}))
+    else:
+        for component in ("strain_xx", "strain_yy", "strain_xy", "rotation_xy"):
+            if component in reference:
+                strain_map_refs[component] = {
+                    "values": reference[component],
+                    "mask": reference.get(f"{component}_mask"),
+                }
+
+    if strain_map_refs:
+        if report.strain is None:
+            warnings.append(
+                "Benchmark reference hook skipped strain metrics: StrainResult missing."
+            )
+        else:
+            for component, payload in strain_map_refs.items():
+                if not isinstance(payload, dict):
+                    continue
+                values_raw = payload.get("values")
+                if not isinstance(values_raw, list):
+                    continue
+                reference_values = np.asarray(values_raw, dtype=np.float64)
+                mask_raw = payload.get("mask")
+                mask_values = None
+                if isinstance(mask_raw, list):
+                    mask_values = np.asarray(mask_raw, dtype=bool)
+
+                observed_ref = getattr(report.strain, component, None)
+                if not isinstance(observed_ref, ArrayReference):
+                    warnings.append(
+                        f"Benchmark strain metric skipped for '{component}': "
+                        "component not available in StrainResult."
+                    )
+                    continue
+                observed_values = _array_from_reference(
+                    observed_ref,
+                    report_base_dir=report_base_dir,
+                )
+                if observed_values is None:
+                    warnings.append(
+                        f"Benchmark strain metric skipped for '{component}': "
+                        "unable to load observed array (inline or .npy URI required)."
+                    )
+                    continue
+                try:
+                    mae, rmse, valid_count = _masked_mae_rmse(
+                        observed_values,
+                        reference_values,
+                        mask=mask_values,
+                    )
+                except ValueError as exc:
+                    warnings.append(
+                        f"Benchmark strain metric skipped for '{component}': {exc}"
+                    )
+                    continue
+                metrics.append(
+                    ValidationMetric(
+                        name=f"{component}_mae",
+                        value=Measurement(value=mae, unit="strain", method="reference_compare"),
+                        direction="lower_is_better",
+                        details={"valid_count": valid_count},
+                    )
+                )
+                metrics.append(
+                    ValidationMetric(
+                        name=f"{component}_rmse",
+                        value=Measurement(value=rmse, unit="strain", method="reference_compare"),
+                        direction="lower_is_better",
+                        details={"valid_count": valid_count},
+                    )
+                )
+
     return warnings
 
 
@@ -210,6 +488,7 @@ def run_benchmark_summary(
     benchmark_parameters: dict[str, Any] | None = None,
     *,
     baseline_metrics: list[ValidationMetric] | None = None,
+    report_base_dir: Path | None = None,
 ) -> tuple[BenchmarkResult, dict[str, object], list[str]]:
     """Build A4 benchmark summary from report outputs plus optional references/criteria."""
     parameters = dict(benchmark_parameters or {})
@@ -219,7 +498,14 @@ def run_benchmark_summary(
         metrics = list(baseline_metrics)
     else:
         metrics = collect_validation_metrics(report)[0]
-    warnings.extend(_append_reference_metrics(report, metrics, parameters))
+    warnings.extend(
+        _append_reference_metrics(
+            report,
+            metrics,
+            parameters,
+            report_base_dir=report_base_dir,
+        )
+    )
 
     criteria_raw = parameters.get("acceptance_criteria")
     if isinstance(criteria_raw, list):

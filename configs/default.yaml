@@ -12,6 +12,31 @@ workflow:
     calibration:
       method: auto
       voltage_kv: 200
+      # B1 calibration example (uncomment and adjust for your sample):
+      # method: reference
+      # diffraction_calibration_engine: internal  # internal | py4dstem | pyxem | auto
+      # pixel_size_nm: 0.02
+      # pixel_size_uncertainty_nm: 0.001
+      # known_d_spacing: 0.213
+      # known_d_spacing_unit: nm
+      # known_d_uncertainty_nm: 0.002
+      # measured_radius_px: 46.5
+      # measured_radius_uncertainty_px: 0.25
+      # detector_pixel_size_um: 15.0
+      # reference:
+      #   material: Si
+      #   reflection: "220"
+      #   note: Replace known_d_spacing and measured_radius_px with your calibration reference.
+    # Optional B1 quality thresholds (uncomment to enforce warning gates):
+    # quality:
+    #   thresholds:
+    #     snr_min: 3.0
+    #     blur_risk_max: 0.8
+    #     drift_px_max: 2.0
+    #     contamination_risk_max: 0.6
+    #     astigmatism_risk_max: 0.6
+    #     undersampling_risk_max: 0.7
+    #     overall_score_min: 0.45
     preprocessing:
       recipe: min_max
       clip_percentile_low: 1.0

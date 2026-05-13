@@ -308,6 +308,222 @@ def test_workflow_recipe_rejects_invalid_parameters(tmp_path: Path) -> None:
         load_workflow_recipe(workflow_path)
 
 
+def test_workflow_recipe_accepts_b1_calibration_parameters(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "b1_calibration_params.yaml"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: b1_calibration_params",
+                "  steps: [load, assess_quality, calibrate, preprocess, fft, report]",
+                "  parameters:",
+                "    calibration:",
+                "      method: reference",
+                "      voltage_kv: 200",
+                "      known_d_spacing: 0.213",
+                "      known_d_spacing_unit: nm",
+                "      measured_radius_px: 46.5",
+                "      detector_pixel_size_um: 15.0",
+                "outputs:",
+                "  formats: [json]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    recipe = load_workflow_recipe(workflow_path)
+    calibration = recipe.workflow.parameters.get("calibration")
+    assert isinstance(calibration, dict)
+    assert calibration["known_d_spacing"] == 0.213
+    assert calibration["measured_radius_px"] == 46.5
+
+
+def test_workflow_recipe_rejects_invalid_b1_calibration_radius(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "invalid_b1_radius.yaml"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: invalid_b1_radius",
+                "  parameters:",
+                "    calibration:",
+                "      known_d_spacing: 0.213",
+                "      measured_radius_px: 0",
+                "outputs:",
+                "  formats: [json]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_workflow_recipe(workflow_path)
+
+
+def test_workflow_recipe_accepts_quality_threshold_parameters(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "quality_thresholds.yaml"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: quality_thresholds",
+                "  steps: [load, assess_quality, calibrate, preprocess, analyze, report]",
+                "  parameters:",
+                "    quality:",
+                "      thresholds:",
+                "        snr_min: 3.5",
+                "        blur_risk_max: 0.7",
+                "        overall_score_min: 0.45",
+                "outputs:",
+                "  formats: [json]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    recipe = load_workflow_recipe(workflow_path)
+    quality = recipe.workflow.parameters.get("quality")
+    assert isinstance(quality, dict)
+    thresholds = quality.get("thresholds")
+    assert isinstance(thresholds, dict)
+    assert thresholds["snr_min"] == 3.5
+
+
+def test_workflow_recipe_rejects_invalid_quality_threshold_value(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "invalid_quality_threshold.yaml"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: invalid_quality_threshold",
+                "  parameters:",
+                "    quality:",
+                "      thresholds:",
+                "        blur_risk_max: 1.2",
+                "outputs:",
+                "  formats: [json]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_workflow_recipe(workflow_path)
+
+
+def test_workflow_recipe_accepts_optional_calibration_adapter_engine(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "adapter_engine.yaml"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: adapter_engine",
+                "  parameters:",
+                "    calibration:",
+                "      known_d_spacing: 0.213",
+                "      measured_radius_px: 46.5",
+                "      diffraction_calibration_engine: py4dstem",
+                "outputs:",
+                "  formats: [json]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    recipe = load_workflow_recipe(workflow_path)
+    calibration = recipe.workflow.parameters.get("calibration")
+    assert isinstance(calibration, dict)
+    assert calibration["diffraction_calibration_engine"] == "py4dstem"
+
+
+def test_workflow_recipe_rejects_invalid_calibration_adapter_engine(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "bad_adapter_engine.yaml"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: bad_adapter_engine",
+                "  parameters:",
+                "    calibration:",
+                "      known_d_spacing: 0.213",
+                "      measured_radius_px: 46.5",
+                "      diffraction_calibration_engine: invalid_engine",
+                "outputs:",
+                "  formats: [json]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_workflow_recipe(workflow_path)
+
+
+def test_workflow_recipe_rejects_negative_calibration_uncertainty(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "bad_calibration_uncertainty.yaml"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: bad_calibration_uncertainty",
+                "  parameters:",
+                "    calibration:",
+                "      known_d_spacing: 0.213",
+                "      measured_radius_px: 46.5",
+                "      known_d_uncertainty_nm: -0.001",
+                "outputs:",
+                "  formats: [json]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_workflow_recipe(workflow_path)
+
+
+def test_a2_workflow_applies_quality_threshold_warnings(tmp_path: Path) -> None:
+    image = np.zeros((64, 64), dtype=np.float32)
+    image[32, 32] = 1.0
+    input_path = tmp_path / "quality_threshold_input.npy"
+    np.save(input_path, image)
+
+    workflow_path = tmp_path / "quality_threshold_workflow.yaml"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: quality_threshold_apply",
+                "  steps:",
+                "    - load",
+                "    - assess_quality",
+                "    - calibrate",
+                "    - preprocess",
+                "    - analyze",
+                "    - report",
+                "  parameters:",
+                "    quality:",
+                "      thresholds:",
+                "        snr_min: 5.0",
+                "        overall_score_min: 0.8",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = TEMAnalysisSkill().run(
+        input_path=input_path,
+        workflow_path=workflow_path,
+        output_dir=tmp_path / "outputs",
+    )
+    report = read_json(Path(result["report_path"]), AnalysisReport)
+    assert report.workflow is not None
+    quality_step = next(step for step in report.workflow.steps if step.name == "assess_quality")
+    assert quality_step.status == "warning"
+    assert any("Quality threshold not met:" in warning for warning in quality_step.warnings)
+    assert report.quality is not None
+    assert report.quality.provenance.get("thresholds")
+
+
 def test_workflow_recipe_rejects_unsupported_output_format(tmp_path: Path) -> None:
     workflow_path = tmp_path / "invalid_format.yaml"
     workflow_path.write_text(

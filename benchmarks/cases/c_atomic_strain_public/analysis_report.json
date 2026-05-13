@@ -1,0 +1,225 @@
+{
+  "schema_version": "0.1.0",
+  "summary": "Public minimal C-case report fixture (atom/strain metrics).",
+  "workflow": {
+    "schema_version": "0.1.0",
+    "name": "benchmark_public_minimal",
+    "description": "",
+    "steps": [
+      {
+        "name": "load",
+        "status": "done",
+        "parameters": {},
+        "inputs": [],
+        "outputs": [],
+        "warnings": []
+      },
+      {
+        "name": "assess_quality",
+        "status": "done",
+        "parameters": {},
+        "inputs": [],
+        "outputs": [],
+        "warnings": []
+      },
+      {
+        "name": "calibrate",
+        "status": "done",
+        "parameters": {},
+        "inputs": [],
+        "outputs": [],
+        "warnings": []
+      },
+      {
+        "name": "preprocess",
+        "status": "done",
+        "parameters": {},
+        "inputs": [],
+        "outputs": [],
+        "warnings": []
+      },
+      {
+        "name": "fft",
+        "status": "done",
+        "parameters": {},
+        "inputs": [],
+        "outputs": [],
+        "warnings": []
+      },
+      {
+        "name": "benchmark",
+        "status": "done",
+        "parameters": {},
+        "inputs": [],
+        "outputs": [],
+        "warnings": []
+      }
+    ],
+    "parameters": {},
+    "output_formats": [
+      "json"
+    ],
+    "save_intermediates": true,
+    "provenance": {}
+  },
+  "dataset": {
+    "schema_version": "0.1.0",
+    "data": {
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "float32",
+      "uri": "input.npy",
+      "inline": null,
+      "description": ""
+    },
+    "dataset_id": "",
+    "source_path": "",
+    "modality": "HAADF-STEM",
+    "pixel_size": null,
+    "pixel_unit": "unknown",
+    "metadata": {},
+    "provenance": {},
+    "warnings": []
+  },
+  "quality": null,
+  "calibration": null,
+  "preprocessing": null,
+  "diffraction": {
+    "schema_version": "0.1.0",
+    "peaks": [],
+    "center": null,
+    "g_vectors": [],
+    "d_spacings": [
+      {
+        "value": 0.25,
+        "unit": "nm",
+        "uncertainty": null,
+        "method": "",
+        "parameters": {},
+        "confidence": null,
+        "provenance": {},
+        "warnings": []
+      }
+    ],
+    "indexed_spots": [
+      {
+        "peak_index": 0,
+        "h": 1,
+        "k": 0,
+        "l": 0,
+        "d_spacing": null,
+        "error": null,
+        "confidence": null
+      }
+    ],
+    "phase_candidates": [
+      {
+        "name": "TiO2",
+        "formula": null,
+        "source": null,
+        "identifier": null,
+        "score": 0.88,
+        "matched_spot_count": null,
+        "mean_d_error": null,
+        "mean_angle_error": null,
+        "zone_axis": null,
+        "warnings": []
+      }
+    ],
+    "fft_image": null,
+    "confidence": null,
+    "provenance": {},
+    "warnings": []
+  },
+  "atom_lattice": {
+    "schema_version": "0.1.0",
+    "atoms": [
+      {
+        "x": 10.0,
+        "y": 10.0,
+        "z": null,
+        "intensity": null,
+        "sublattice_label": null,
+        "confidence": null,
+        "warnings": []
+      },
+      {
+        "x": 14.0,
+        "y": 10.0,
+        "z": null,
+        "intensity": null,
+        "sublattice_label": null,
+        "confidence": null,
+        "warnings": []
+      },
+      {
+        "x": 12.0,
+        "y": 13.464,
+        "z": null,
+        "intensity": null,
+        "sublattice_label": null,
+        "confidence": null,
+        "warnings": []
+      }
+    ],
+    "lattice_vectors": [],
+    "zone_axis": null,
+    "coordinate_unit": "unknown",
+    "overlay": null,
+    "confidence": null,
+    "provenance": {},
+    "warnings": []
+  },
+  "strain": {
+    "schema_version": "0.1.0",
+    "displacement_x": null,
+    "displacement_y": null,
+    "strain_xx": {
+      "shape": [
+        2,
+        2
+      ],
+      "dtype": "float64",
+      "uri": null,
+      "inline": [
+        [
+          0.1,
+          0.2
+        ],
+        [
+          0.3,
+          0.4
+        ]
+      ],
+      "description": ""
+    },
+    "strain_yy": null,
+    "strain_xy": null,
+    "rotation_xy": null,
+    "uncertainty": null,
+    "reference_region": null,
+    "g_vectors": [],
+    "confidence": null,
+    "provenance": {},
+    "warnings": []
+  },
+  "microstructure": null,
+  "z_contrast": null,
+  "spectroscopy": null,
+  "fourdstem": null,
+  "simulation": null,
+  "ai_inference": null,
+  "benchmark": null,
+  "figures": [],
+  "tables": [],
+  "artifacts": [],
+  "warnings": [],
+  "provenance": {
+    "quality_gates": {
+      "passed": true,
+      "blocking_warning_count": 0
+    }
+  }
+}

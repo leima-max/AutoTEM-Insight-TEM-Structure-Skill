@@ -22,7 +22,7 @@ def _normalize_html_signature(html_text: str) -> dict[str, object]:
     return {
         "title_present": "AutoTEM A3 Analysis Report" in html_text,
         "section_titles": section_titles,
-        "step_rows": [list(item) for item in step_rows],
+        "step_rows": [[item[0], item[1]] for item in step_rows],
         "interface_rows": [list(item) for item in interface_rows],
         "contains_step_detail_class": "class=\"step-detail\"" in html_text,
     }

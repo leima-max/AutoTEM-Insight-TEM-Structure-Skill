@@ -38,6 +38,10 @@ io = [
   "mrcfile>=1.4",
   "ncempy>=1.12"
 ]
+gpl_adapters = [
+  "py4DSTEM>=0.14.14",
+  "pyxem>=0.21.0"
+]
 
 [project.scripts]
 autotem = "autotem.cli:main"

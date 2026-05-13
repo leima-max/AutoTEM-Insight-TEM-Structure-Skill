@@ -130,6 +130,7 @@ _RESERVED_STEP_CONTRACTS: dict[str, dict[str, object]] = {
 }
 
 _STEP_TO_PARAM_KEYS: dict[str, tuple[str, ...]] = {
+    "assess_quality": ("quality", "assess_quality"),
     "calibrate": ("calibrate", "calibration"),
     "preprocess": ("preprocess", "preprocessing"),
     "fft": ("diffraction", "fft", "analyze"),
@@ -441,8 +442,13 @@ class TEMAnalysisSkill:
             dataset.metadata = merged_metadata
         return dataset
 
-    def assess_quality(self, dataset: TEMDataset) -> QualityAssessment:
-        return assess_quality(dataset)
+    def assess_quality(
+        self,
+        dataset: TEMDataset,
+        *,
+        parameters: dict[str, Any] | None = None,
+    ) -> QualityAssessment:
+        return assess_quality(dataset, parameters=parameters)
 
     def calibrate(
         self,
@@ -569,7 +575,15 @@ class TEMAnalysisSkill:
                             "Dataset is required before quality assessment."
                         )
                     else:
-                        quality = self.assess_quality(dataset)
+                        stage_parameters = _extract_stage_parameters(
+                            workflow_parameters,
+                            _STEP_TO_PARAM_KEYS.get("assess_quality", ("quality",)),
+                        )
+                        step_record.parameters = stage_parameters
+                        quality = self.assess_quality(
+                            dataset,
+                            parameters=stage_parameters,
+                        )
                         step_record.status = "warning" if quality.warnings else "done"
                         step_record.warnings.extend(quality.warnings)
                 elif step_record.name == "calibrate":

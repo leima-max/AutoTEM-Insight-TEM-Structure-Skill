@@ -136,3 +136,6 @@ def test_a4_benchmark_reference_hook_metrics() -> None:
     metric_names = {item.name for item in benchmark.metrics}
     assert "d_spacing_mean_relative_error" in metric_names
     assert "atom_coordinate_rmse" in metric_names
+    assert "d_spacing_uncertainty_coverage" in metric_names
+    assert "d_spacing_uncertainty_mean_relative" in metric_names
+    assert "d_spacing_uncertainty_plausible_fraction" in metric_names

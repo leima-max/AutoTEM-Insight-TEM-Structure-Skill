@@ -1,0 +1,7 @@
+{
+  "d_spacings_nm": [0.235, 0.204],
+  "hkl_truth": [[1, 1, 1], [2, 0, 0]],
+  "hkl_top_k": 2,
+  "phase_truth": ["Gold", "Silicon"],
+  "phase_top_k": 2
+}

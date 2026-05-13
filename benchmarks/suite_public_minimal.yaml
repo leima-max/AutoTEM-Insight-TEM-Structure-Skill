@@ -1,0 +1,75 @@
+suite:
+  schema_version: 2026-05-13.a4.case-schema.v1
+  suite_id: public_minimal_suite
+  description: Public minimal benchmark package with B/C contract metrics.
+  default_output_dir: outputs/benchmark-public-minimal
+  regression_weights:
+    status_flip_pass_to_fail: 5
+    acceptance_failed_increase: 2
+    warning_count_increase: 1
+    acceptance_pass_rate_drop: 2
+  regression_weight_templates:
+    - modality: HRTEM
+      weights:
+        status_flip_pass_to_fail: 8
+    - modality: HAADF-STEM
+      weights:
+        warning_count_increase: 0
+
+cases:
+  - case_id: b_diffraction_public
+    description: Public B-side fixture for d-spacing/hkl/phase benchmark metrics.
+    modality: HRTEM
+    report_path: cases/b_diffraction_public/analysis_report.json
+    tags: [public, minimal, b, diffraction]
+    reference:
+      d_spacings_nm: [0.235, 0.204]
+      hkl_truth:
+        - [1, 1, 1]
+        - [2, 0, 0]
+      hkl_top_k: 2
+      phase_truth: [Gold, Silicon]
+      phase_top_k: 2
+    acceptance_criteria:
+      - metric: workflow_no_failed_steps
+        op: ">="
+        threshold: 1
+      - metric: d_spacing_mean_relative_error
+        op: "<="
+        threshold: 0.05
+      - metric: hkl_topk_accuracy
+        op: ">="
+        threshold: 0.5
+      - metric: phase_topk_accuracy
+        op: ">="
+        threshold: 0.5
+
+  - case_id: c_atomic_strain_public
+    description: Public C-side fixture for atom-coordinate and strain benchmark metrics.
+    modality: HAADF-STEM
+    report_path: cases/c_atomic_strain_public/analysis_report.json
+    tags: [public, minimal, c, atomic, strain]
+    reference:
+      atom_coordinates:
+        - [10.0, 10.0]
+        - [14.0, 10.0]
+        - [12.0, 13.464]
+      atom_nearest_distances: [4.0, 4.0, 3.999912]
+      strain_maps:
+        strain_xx:
+          values:
+            - [0.10, 0.20]
+            - [0.30, 0.40]
+    acceptance_criteria:
+      - metric: workflow_no_failed_steps
+        op: ">="
+        threshold: 1
+      - metric: atom_coordinate_rmse
+        op: "<="
+        threshold: 0.01
+      - metric: atom_nearest_distance_mean_relative_error
+        op: "<="
+        threshold: 0.02
+      - metric: strain_xx_mae
+        op: "<="
+        threshold: 0.001

@@ -205,3 +205,60 @@ def test_cli_analyze_invalid_pdf_cover_field(tmp_path: Path, capsys) -> None:
     captured = capsys.readouterr()
     assert exit_code == EXIT_CONFIG_ERROR
     assert "configuration error" in captured.err
+
+
+def test_cli_benchmark_success(monkeypatch, tmp_path: Path, capsys) -> None:
+    suite_path = tmp_path / "suite.yaml"
+    suite_path.write_text("cases: []", encoding="utf-8")
+
+    def _fake_runner(*, suite_path, output_dir=None):
+        assert output_dir is None
+        return {
+            "suite_id": "test_suite",
+            "acceptance": {"all_passed": True},
+            "cases_executed": 1,
+            "trend_report_json": "out/benchmark_suite_trend.json",
+        }
+
+    monkeypatch.setattr("autotem.cli.run_benchmark_suite_from_file", _fake_runner)
+    exit_code = main(["benchmark", "--suite", str(suite_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "A4 benchmark suite completed." in captured.out
+    assert "test_suite" in captured.out
+    assert "benchmark_suite_trend.json" in captured.out
+
+
+def test_cli_benchmark_fail_on_failed(monkeypatch, tmp_path: Path, capsys) -> None:
+    suite_path = tmp_path / "suite.yaml"
+    suite_path.write_text("cases: []", encoding="utf-8")
+
+    def _fake_runner(*, suite_path, output_dir=None):
+        return {
+            "suite_id": "test_suite",
+            "acceptance": {"all_passed": False},
+            "cases_executed": 1,
+        }
+
+    monkeypatch.setattr("autotem.cli.run_benchmark_suite_from_file", _fake_runner)
+    exit_code = main(["benchmark", "--suite", str(suite_path), "--fail-on-failed"])
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_RUNTIME_ERROR
+    assert "A4 benchmark suite completed." in captured.out
+
+
+def test_cli_benchmark_config_error(monkeypatch, tmp_path: Path, capsys) -> None:
+    suite_path = tmp_path / "suite.yaml"
+    suite_path.write_text("cases: []", encoding="utf-8")
+
+    def _fake_runner(*, suite_path, output_dir=None):
+        raise ValueError("bad suite")
+
+    monkeypatch.setattr("autotem.cli.run_benchmark_suite_from_file", _fake_runner)
+    exit_code = main(["benchmark", "--suite", str(suite_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_CONFIG_ERROR
+    assert "benchmark configuration error" in captured.err

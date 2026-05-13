@@ -8,11 +8,12 @@ from typing import Any
 import yaml
 from pydantic import Field
 
+from autotem.calibration.open_source_adapters import SUPPORTED_DIFFRACTION_CALIBRATION_ENGINES
 from autotem.core.models import AutoTEMModel, WorkflowConfig, WorkflowStep
 
 DEFAULT_WORKFLOW_NAME = "a2_default"
 DEFAULT_WORKFLOW_DESCRIPTION = "A2 baseline load-calibrate-diffraction-simulation workflow."
-WORKFLOW_PARAMETER_SCHEMA_VERSION = "2026-05-13.a2"
+WORKFLOW_PARAMETER_SCHEMA_VERSION = "2026-05-13.b1.1"
 DEFAULT_STEP_SEQUENCE: tuple[str, ...] = (
     "load",
     "assess_quality",
@@ -29,6 +30,14 @@ _SUPPORTED_OUTPUT_FORMATS = {"json", "csv", "html", "svg", "pdf"}
 _SUPPORTED_CALIBRATION_METHODS = {"auto", "metadata", "manual", "reference"}
 _SUPPORTED_PREPROCESS_RECIPES = {"auto", "min_max"}
 _SUPPORTED_ACCEPTANCE_OPS = {">=", "<=", ">", "<", "=="}
+_QUALITY_THRESHOLD_RANGE_01_KEYS = {
+    "blur_risk_max",
+    "contamination_risk_max",
+    "astigmatism_risk_max",
+    "undersampling_risk_max",
+    "overall_score_min",
+}
+_QUALITY_THRESHOLD_NONNEG_KEYS = {"snr_min", "drift_px_max"}
 
 
 class WorkflowOutputs(AutoTEMModel):
@@ -115,6 +124,34 @@ def _validate_output_formats(formats: list[str]) -> list[str]:
 def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
     params = dict(parameters)
 
+    quality = params.get("quality")
+    if quality is not None:
+        if not isinstance(quality, dict):
+            raise ValueError("workflow.parameters.quality must be a mapping.")
+        quality_thresholds = quality.get("thresholds", quality)
+        if not isinstance(quality_thresholds, dict):
+            raise ValueError(
+                "workflow.parameters.quality.thresholds must be a mapping when provided."
+            )
+        for key in _QUALITY_THRESHOLD_NONNEG_KEYS:
+            if key in quality_thresholds:
+                value = _as_float(
+                    quality_thresholds[key],
+                    field_name=f"quality.thresholds.{key}",
+                )
+                if value < 0:
+                    raise ValueError(f"workflow.parameters.quality.thresholds.{key} must be >= 0.")
+        for key in _QUALITY_THRESHOLD_RANGE_01_KEYS:
+            if key in quality_thresholds:
+                value = _as_float(
+                    quality_thresholds[key],
+                    field_name=f"quality.thresholds.{key}",
+                )
+                if not (0 <= value <= 1):
+                    raise ValueError(
+                        f"workflow.parameters.quality.thresholds.{key} must be within [0, 1]."
+                    )
+
     calibration = params.get("calibration")
     if calibration is not None:
         if not isinstance(calibration, dict):
@@ -136,11 +173,130 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
             voltage_kv = _as_float(calibration["voltage_kv"], field_name="calibration.voltage_kv")
             if voltage_kv <= 0:
                 raise ValueError("workflow.parameters.calibration.voltage_kv must be > 0.")
+        if "known_d_spacing" in calibration:
+            known_d = _as_float(
+                calibration["known_d_spacing"],
+                field_name="calibration.known_d_spacing",
+            )
+            if known_d <= 0:
+                raise ValueError("workflow.parameters.calibration.known_d_spacing must be > 0.")
+        if "measured_radius_px" in calibration:
+            measured_radius_px = _as_float(
+                calibration["measured_radius_px"],
+                field_name="calibration.measured_radius_px",
+            )
+            if measured_radius_px <= 0:
+                raise ValueError("workflow.parameters.calibration.measured_radius_px must be > 0.")
+        if "diffraction_scale_inv_nm_per_px" in calibration:
+            diffraction_scale = _as_float(
+                calibration["diffraction_scale_inv_nm_per_px"],
+                field_name="calibration.diffraction_scale_inv_nm_per_px",
+            )
+            if diffraction_scale <= 0:
+                raise ValueError(
+                    "workflow.parameters.calibration.diffraction_scale_inv_nm_per_px must be > 0."
+                )
+        if "detector_pixel_size_um" in calibration:
+            detector_pixel_size = _as_float(
+                calibration["detector_pixel_size_um"],
+                field_name="calibration.detector_pixel_size_um",
+            )
+            if detector_pixel_size <= 0:
+                raise ValueError(
+                    "workflow.parameters.calibration.detector_pixel_size_um must be > 0."
+                )
+        if "pixel_size_uncertainty_nm" in calibration:
+            pixel_uncertainty_nm = _as_float(
+                calibration["pixel_size_uncertainty_nm"],
+                field_name="calibration.pixel_size_uncertainty_nm",
+            )
+            if pixel_uncertainty_nm < 0:
+                raise ValueError(
+                    "workflow.parameters.calibration.pixel_size_uncertainty_nm must be >= 0."
+                )
+        if "known_d_uncertainty_nm" in calibration:
+            known_d_uncertainty_nm = _as_float(
+                calibration["known_d_uncertainty_nm"],
+                field_name="calibration.known_d_uncertainty_nm",
+            )
+            if known_d_uncertainty_nm < 0:
+                raise ValueError(
+                    "workflow.parameters.calibration.known_d_uncertainty_nm must be >= 0."
+                )
+        if "measured_radius_uncertainty_px" in calibration:
+            measured_radius_uncertainty_px = _as_float(
+                calibration["measured_radius_uncertainty_px"],
+                field_name="calibration.measured_radius_uncertainty_px",
+            )
+            if measured_radius_uncertainty_px < 0:
+                raise ValueError(
+                    "workflow.parameters.calibration.measured_radius_uncertainty_px must be >= 0."
+                )
+        if "diffraction_calibration_engine" in calibration:
+            calibration_engine = str(calibration["diffraction_calibration_engine"]).strip().lower()
+            if calibration_engine not in SUPPORTED_DIFFRACTION_CALIBRATION_ENGINES:
+                raise ValueError(
+                    "workflow.parameters.calibration.diffraction_calibration_engine must be one of "
+                    f"{sorted(SUPPORTED_DIFFRACTION_CALIBRATION_ENGINES)}."
+                )
+        if "known_d_spacing_unit" in calibration:
+            if not isinstance(calibration["known_d_spacing_unit"], str) or not calibration[
+                "known_d_spacing_unit"
+            ].strip():
+                raise ValueError(
+                    "workflow.parameters.calibration.known_d_spacing_unit must be a non-empty string."
+                )
         reference = calibration.get("reference")
         if reference is not None and not isinstance(reference, dict):
             raise ValueError(
                 "workflow.parameters.calibration.reference must be a mapping when provided."
             )
+        if isinstance(reference, dict):
+            if "known_d_spacing" in reference:
+                ref_known_d = _as_float(
+                    reference["known_d_spacing"],
+                    field_name="calibration.reference.known_d_spacing",
+                )
+                if ref_known_d <= 0:
+                    raise ValueError(
+                        "workflow.parameters.calibration.reference.known_d_spacing must be > 0."
+                    )
+            if "measured_radius_px" in reference:
+                ref_measured_radius_px = _as_float(
+                    reference["measured_radius_px"],
+                    field_name="calibration.reference.measured_radius_px",
+                )
+                if ref_measured_radius_px <= 0:
+                    raise ValueError(
+                        "workflow.parameters.calibration.reference.measured_radius_px must be > 0."
+                    )
+            if "detector_pixel_size_um" in reference:
+                ref_detector_pixel_size = _as_float(
+                    reference["detector_pixel_size_um"],
+                    field_name="calibration.reference.detector_pixel_size_um",
+                )
+                if ref_detector_pixel_size <= 0:
+                    raise ValueError(
+                        "workflow.parameters.calibration.reference.detector_pixel_size_um must be > 0."
+                    )
+            if "known_d_uncertainty_nm" in reference:
+                ref_known_d_uncertainty = _as_float(
+                    reference["known_d_uncertainty_nm"],
+                    field_name="calibration.reference.known_d_uncertainty_nm",
+                )
+                if ref_known_d_uncertainty < 0:
+                    raise ValueError(
+                        "workflow.parameters.calibration.reference.known_d_uncertainty_nm must be >= 0."
+                    )
+            if "measured_radius_uncertainty_px" in reference:
+                ref_radius_uncertainty = _as_float(
+                    reference["measured_radius_uncertainty_px"],
+                    field_name="calibration.reference.measured_radius_uncertainty_px",
+                )
+                if ref_radius_uncertainty < 0:
+                    raise ValueError(
+                        "workflow.parameters.calibration.reference.measured_radius_uncertainty_px must be >= 0."
+                    )
 
     preprocessing = params.get("preprocessing")
     if preprocessing is not None:

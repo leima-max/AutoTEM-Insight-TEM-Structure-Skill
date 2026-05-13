@@ -28,6 +28,41 @@ jobs:
       - name: Validate Runtime Output Contracts
         run: python -m autotem.validation.runtime_contract
 
+      - name: Run A4 Benchmark Smoke Gate
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import numpy as np
+
+          root = Path("ci_benchmark_smoke")
+          root.mkdir(parents=True, exist_ok=True)
+          input_path = root / "input.npy"
+          image = np.zeros((48, 48), dtype=np.float32)
+          image[24, 16] = 8.0
+          image[24, 32] = 8.0
+          np.save(input_path, image)
+
+          suite_path = root / "suite.yaml"
+          suite_path.write_text(
+              "\n".join(
+                  [
+                      "suite:",
+                      "  suite_id: ci_smoke",
+                      "cases:",
+                      "  - case_id: ci_case_01",
+                      f"    input_path: {input_path.as_posix()}",
+                      "    workflow_path: configs/default.yaml",
+                      "    acceptance_criteria:",
+                      "      - metric: workflow_no_failed_steps",
+                      "        op: \">=\"",
+                      "        threshold: 1",
+                  ]
+              ),
+              encoding="utf-8",
+          )
+          PY
+          autotem benchmark --suite ci_benchmark_smoke/suite.yaml --output ci_benchmark_smoke/out --fail-on-failed
+
       - name: Run lint
         run: python -m ruff check .
 

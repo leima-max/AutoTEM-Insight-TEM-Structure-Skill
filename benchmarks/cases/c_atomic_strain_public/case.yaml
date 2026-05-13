@@ -1,0 +1,31 @@
+case:
+  schema_version: 2026-05-13.a4.case-schema.v1
+  case_id: c_atomic_strain_public
+  description: Public C-side fixture for atom-coordinate and strain metrics.
+  modality: HAADF-STEM
+  report_path: analysis_report.json
+  tags: [public, minimal, c, atomic, strain]
+  reference:
+    atom_coordinates:
+      - [10.0, 10.0]
+      - [14.0, 10.0]
+      - [12.0, 13.464]
+    atom_nearest_distances: [4.0, 4.0, 3.999912]
+    strain_maps:
+      strain_xx:
+        values:
+          - [0.10, 0.20]
+          - [0.30, 0.40]
+  acceptance_criteria:
+    - metric: workflow_no_failed_steps
+      op: ">="
+      threshold: 1
+    - metric: atom_coordinate_rmse
+      op: "<="
+      threshold: 0.01
+    - metric: atom_nearest_distance_mean_relative_error
+      op: "<="
+      threshold: 0.02
+    - metric: strain_xx_mae
+      op: "<="
+      threshold: 0.001

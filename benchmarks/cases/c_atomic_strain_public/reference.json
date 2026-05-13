@@ -1,0 +1,9 @@
+{
+  "atom_coordinates": [[10.0, 10.0], [14.0, 10.0], [12.0, 13.464]],
+  "atom_nearest_distances": [4.0, 4.0, 3.999912],
+  "strain_maps": {
+    "strain_xx": {
+      "values": [[0.10, 0.20], [0.30, 0.40]]
+    }
+  }
+}

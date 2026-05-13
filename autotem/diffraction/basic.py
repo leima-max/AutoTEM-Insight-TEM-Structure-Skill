@@ -164,11 +164,45 @@ def run_diffraction_analysis(
 
     h, w = magnitude.shape
     cy, cx = h / 2.0, w / 2.0
+    fft_min_dim = float(min(h, w))
 
     pixel_nm = 0.1
     if calibration.pixel_size is not None and calibration.pixel_size.unit == "nm":
         pixel_nm = float(calibration.pixel_size.value)
-    reciprocal_scale = 1.0 / (min(h, w) * max(pixel_nm, 1e-9))
+    reciprocal_scale = 1.0 / (fft_min_dim * max(pixel_nm, 1e-9))
+    reciprocal_scale_source = "derived_from_pixel_size"
+    if calibration.diffraction_scale is not None:
+        scale_value = calibration.diffraction_scale.value
+        try:
+            candidate_scale = float(scale_value)
+        except (TypeError, ValueError):
+            warnings.append(
+                "Invalid diffraction_scale value in calibration; fallback to pixel-size-derived scale."
+            )
+        else:
+            if candidate_scale <= 0:
+                warnings.append(
+                    "Non-positive diffraction_scale in calibration; fallback to pixel-size-derived scale."
+                )
+            else:
+                scale_method = calibration.diffraction_scale.method or ""
+                # Legacy fallback calibration stores reciprocal pixel size (1/nm),
+                # while diffraction analysis expects per-FFT-pixel scale (1/nm/pixel-bin).
+                if scale_method == "reciprocal_pixel_size":
+                    reciprocal_scale = candidate_scale / fft_min_dim
+                    reciprocal_scale_source = (
+                        "calibration.diffraction_scale.reciprocal_pixel_size_normalized"
+                    )
+                else:
+                    reciprocal_scale = candidate_scale
+                    reciprocal_scale_source = "calibration.diffraction_scale"
+    reciprocal_scale_uncertainty = None
+    if calibration.diffraction_scale is not None:
+        try:
+            if calibration.diffraction_scale.uncertainty is not None:
+                reciprocal_scale_uncertainty = float(calibration.diffraction_scale.uncertainty)
+        except (TypeError, ValueError):
+            reciprocal_scale_uncertainty = None
 
     peaks: list[DiffractionPeak] = []
     g_vectors: list[GVector] = []
@@ -182,19 +216,36 @@ def run_diffraction_analysis(
         gx_val = dx * reciprocal_scale
         gy_val = dy * reciprocal_scale
         g_mag = float(np.hypot(gx_val, gy_val))
+        g_mag_uncertainty = None
+        if reciprocal_scale_uncertainty is not None:
+            pixel_radius = float(np.hypot(dx, dy))
+            g_mag_uncertainty = pixel_radius * reciprocal_scale_uncertainty
         angle_deg = float(np.degrees(np.arctan2(gy_val, gx_val)))
         g_vectors.append(
             GVector(
                 gx=Measurement(value=gx_val, unit="1/nm", method="fft_pixel_offset"),
                 gy=Measurement(value=gy_val, unit="1/nm", method="fft_pixel_offset"),
-                magnitude=Measurement(value=g_mag, unit="1/nm", method="vector_norm"),
+                magnitude=Measurement(
+                    value=g_mag,
+                    unit="1/nm",
+                    method="vector_norm",
+                    uncertainty=g_mag_uncertainty,
+                ),
                 angle=Measurement(value=angle_deg, unit="deg", method="atan2"),
                 source_peak_index=i,
             )
         )
         if g_mag > 1e-8:
             d_spacing_nm = 1.0 / g_mag
-            d_measurement = Measurement(value=d_spacing_nm, unit="nm", method="inverse_g_magnitude")
+            d_uncertainty = None
+            if g_mag_uncertainty is not None:
+                d_uncertainty = g_mag_uncertainty / max(g_mag * g_mag, 1e-16)
+            d_measurement = Measurement(
+                value=d_spacing_nm,
+                unit="nm",
+                method=f"inverse_g_magnitude[{reciprocal_scale_source}]",
+                uncertainty=d_uncertainty,
+            )
             d_spacings.append(d_measurement)
             hkl = _make_index(dx, dy)
             indexed_spots.append(
@@ -250,5 +301,7 @@ def run_diffraction_analysis(
                     sorted(allowed_phase_names) if allowed_phase_names is not None else None
                 ),
             },
+            "calibration_scale_source": reciprocal_scale_source,
+            "calibration_scale_inv_nm_per_px": reciprocal_scale,
         },
     )
