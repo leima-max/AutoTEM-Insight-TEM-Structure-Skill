@@ -90,6 +90,8 @@ UI supports:
 - direct click add/remove on image canvas
 - irregular polygon ROI selection
 - CSV export of edited atom coordinates
+- subpixel refinement (`gaussian` / `com`) with displacement summary
+- optional lattice-constraint correction (can be disabled for defect/GPA workflows)
 
 ## C0 Contract Alignment
 
