@@ -311,6 +311,39 @@ for key, default in [
     if key not in st.session_state:
         st.session_state[key] = default
 
+uploaded = st.file_uploader("Upload TEM image", type=["dm", "dm3", "dm4", "tif", "tiff"])
+manual_run = st.button("Run Detection", type="primary", disabled=uploaded is None)
+
+if uploaded is None:
+    st.info("Upload a TEM image to begin.")
+    st.stop()
+
+current_file_sig = f"{uploaded.name}:{uploaded.size}"
+if st.session_state.uploaded_sig != current_file_sig:
+    st.session_state.uploaded_sig = current_file_sig
+    st.session_state.uploaded_temp_path = _save_upload_to_temp(uploaded)
+    st.session_state.last_detection_signature = None
+    st.session_state.base_result = None
+    st.session_state.base_image_raw = None
+    st.session_state.base_image_norm = None
+    st.session_state.edited_coords = None
+    st.session_state.edited_intensities = None
+    st.session_state.auto_coords = None
+    st.session_state.auto_intensities = None
+    st.session_state.roi_mask = None
+    st.session_state.canvas_nonce = 0
+    st.session_state.refinement_info = None
+    st.session_state.lattice_info = None
+    auto_nm, auto_source, auto_messages = _cached_infer_pixel_size_nm(
+        st.session_state.uploaded_temp_path,
+        file_size=uploaded.size,
+    )
+    st.session_state.pixel_size_auto_nm = auto_nm
+    st.session_state.pixel_size_auto_source = auto_source
+    st.session_state.pixel_size_auto_messages = auto_messages
+    if auto_nm is not None:
+        st.session_state.distance_pixel_size = float(auto_nm)
+
 
 with st.sidebar:
     st.header("Parameters")
@@ -424,39 +457,6 @@ with st.sidebar:
         if st.session_state.pixel_size_auto_messages:
             with st.expander("Auto-read details"):
                 st.code("\n".join(st.session_state.pixel_size_auto_messages), language="text")
-
-uploaded = st.file_uploader("Upload TEM image", type=["dm", "dm3", "dm4", "tif", "tiff"])
-manual_run = st.button("Run Detection", type="primary", disabled=uploaded is None)
-
-if uploaded is None:
-    st.info("Upload a TEM image to begin.")
-    st.stop()
-
-current_file_sig = f"{uploaded.name}:{uploaded.size}"
-if st.session_state.uploaded_sig != current_file_sig:
-    st.session_state.uploaded_sig = current_file_sig
-    st.session_state.uploaded_temp_path = _save_upload_to_temp(uploaded)
-    st.session_state.last_detection_signature = None
-    st.session_state.base_result = None
-    st.session_state.base_image_raw = None
-    st.session_state.base_image_norm = None
-    st.session_state.edited_coords = None
-    st.session_state.edited_intensities = None
-    st.session_state.auto_coords = None
-    st.session_state.auto_intensities = None
-    st.session_state.roi_mask = None
-    st.session_state.canvas_nonce = 0
-    st.session_state.refinement_info = None
-    st.session_state.lattice_info = None
-    auto_nm, auto_source, auto_messages = _cached_infer_pixel_size_nm(
-        st.session_state.uploaded_temp_path,
-        file_size=uploaded.size,
-    )
-    st.session_state.pixel_size_auto_nm = auto_nm
-    st.session_state.pixel_size_auto_source = auto_source
-    st.session_state.pixel_size_auto_messages = auto_messages
-    if auto_nm is not None:
-        st.session_state.distance_pixel_size = float(auto_nm)
 
 params = {
     "mode": mode,
