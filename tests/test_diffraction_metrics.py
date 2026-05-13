@@ -13,7 +13,9 @@ def _make_periodic_image(size: int, kx: int) -> np.ndarray:
     return signal.astype(np.float32)
 
 
-def _make_dataset_and_preprocess(tmp_path: Path, image: np.ndarray) -> tuple[TEMDataset, PreprocessingResult]:
+def _make_dataset_and_preprocess(
+    tmp_path: Path, image: np.ndarray
+) -> tuple[TEMDataset, PreprocessingResult]:
     image_path = tmp_path / "pattern.npy"
     np.save(image_path, image)
     data_ref = ArrayReference(

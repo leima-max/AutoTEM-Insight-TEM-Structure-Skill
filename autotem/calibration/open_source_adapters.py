@@ -67,7 +67,7 @@ def scale_from_known_d_spacing_with_adapter(
     if engine == "py4dstem":
         try:
             qpixelsize = importlib.import_module("py4DSTEM.process.calibration.qpixelsize")
-            fn = getattr(qpixelsize, "get_Q_pixel_size")
+            fn = qpixelsize.get_Q_pixel_size
             raw = fn(q_meas=measured_radius_px, q_known=known_d_nm * 10.0, units="A")
             if isinstance(raw, tuple):
                 raw_value = raw[0]

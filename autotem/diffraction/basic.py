@@ -177,12 +177,14 @@ def run_diffraction_analysis(
             candidate_scale = float(scale_value)
         except (TypeError, ValueError):
             warnings.append(
-                "Invalid diffraction_scale value in calibration; fallback to pixel-size-derived scale."
+                "Invalid diffraction_scale value in calibration; "
+                "fallback to pixel-size-derived scale."
             )
         else:
             if candidate_scale <= 0:
                 warnings.append(
-                    "Non-positive diffraction_scale in calibration; fallback to pixel-size-derived scale."
+                    "Non-positive diffraction_scale in calibration; "
+                    "fallback to pixel-size-derived scale."
                 )
             else:
                 scale_method = calibration.diffraction_scale.method or ""

@@ -244,7 +244,8 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
                 "known_d_spacing_unit"
             ].strip():
                 raise ValueError(
-                    "workflow.parameters.calibration.known_d_spacing_unit must be a non-empty string."
+                    "workflow.parameters.calibration.known_d_spacing_unit "
+                    "must be a non-empty string."
                 )
         reference = calibration.get("reference")
         if reference is not None and not isinstance(reference, dict):
@@ -277,7 +278,8 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
                 )
                 if ref_detector_pixel_size <= 0:
                     raise ValueError(
-                        "workflow.parameters.calibration.reference.detector_pixel_size_um must be > 0."
+                        "workflow.parameters.calibration.reference.detector_pixel_size_um "
+                        "must be > 0."
                     )
             if "known_d_uncertainty_nm" in reference:
                 ref_known_d_uncertainty = _as_float(
@@ -286,7 +288,8 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
                 )
                 if ref_known_d_uncertainty < 0:
                     raise ValueError(
-                        "workflow.parameters.calibration.reference.known_d_uncertainty_nm must be >= 0."
+                        "workflow.parameters.calibration.reference.known_d_uncertainty_nm "
+                        "must be >= 0."
                     )
             if "measured_radius_uncertainty_px" in reference:
                 ref_radius_uncertainty = _as_float(
@@ -295,7 +298,8 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
                 )
                 if ref_radius_uncertainty < 0:
                     raise ValueError(
-                        "workflow.parameters.calibration.reference.measured_radius_uncertainty_px must be >= 0."
+                        "workflow.parameters.calibration.reference.measured_radius_uncertainty_px "
+                        "must be >= 0."
                     )
 
     preprocessing = params.get("preprocessing")

@@ -318,7 +318,8 @@ def resolve_voltage_kv(
             return None
         for view in _metadata_views(container):
             value = _as_float(
-                view.get("voltage_uncertainty_kv") or view.get("accelerating_voltage_uncertainty_kv")
+                view.get("voltage_uncertainty_kv")
+                or view.get("accelerating_voltage_uncertainty_kv")
             )
             if value is not None and value >= 0:
                 return value
