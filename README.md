@@ -25,7 +25,25 @@ Run the workflow from CLI:
 autotem analyze examples/sample.npy --workflow configs/default.yaml --output outputs/sample
 ```
 
-Key A2 outputs:
+Override output formats/title from CLI when needed:
+
+```bash
+autotem analyze examples/sample.npy --output outputs/sample --formats json,csv,html,svg,pdf --report-title "A3 custom report"
+```
+
+Control A3 HTML sections from CLI:
+
+```bash
+autotem analyze examples/sample.npy --output outputs/sample --formats json,html --report-sections overview,workflow_details,interface_checks --open-step-sections
+```
+
+Control PDF structure from CLI:
+
+```bash
+autotem analyze examples/sample.npy --output outputs/sample --formats json,pdf --pdf-sections cover,overview,figures --pdf-max-figures 6 --pdf-cover-field sample_id=S01 --pdf-cover-field operator=member-a
+```
+
+Key A2/A3 outputs:
 
 - `analysis_report.json`
 - `workflow_used.yaml`
@@ -33,6 +51,12 @@ Key A2 outputs:
 - `run.log`
 - `tables/*.csv` (when `outputs.formats` contains `csv`)
 - `report.html` (when `outputs.formats` contains `html`)
+- `figures/*.png` (A3 baseline plots and overlays)
+- `figures/*.svg` (when `svg` format is requested)
+- `json/*.json` (A3 module snapshots and bundle summary)
+- `report.pdf` (when `pdf` format is requested)
+- `intermediates/*` (when `save_intermediates: true`)
+  - large arrays are tiered to HDF5 when available, with preview + metadata sidecars
 
 Runtime contract outputs:
 
@@ -43,6 +67,7 @@ See docs for contract details:
 
 - `docs/runtime-contracts.md`
 - `docs/a2-reserved-step-contracts.md`
+- `docs/a3-output-conventions.md`
 
 ## A2 Workflow Parameters
 

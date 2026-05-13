@@ -1,0 +1,128 @@
+{
+  "title_present": true,
+  "section_titles": [
+    "Workflow Steps",
+    "Interface Completeness (B/C)"
+  ],
+  "step_rows": [
+    [
+      "load",
+      "warning",
+      "5"
+    ],
+    [
+      "assess_quality",
+      "warning",
+      "5"
+    ],
+    [
+      "calibrate",
+      "warning",
+      "6"
+    ],
+    [
+      "preprocess",
+      "warning",
+      "5"
+    ],
+    [
+      "fft",
+      "warning",
+      "11"
+    ],
+    [
+      "diffraction_peaks",
+      "warning",
+      "11"
+    ],
+    [
+      "index_diffraction",
+      "warning",
+      "11"
+    ],
+    [
+      "phase_match",
+      "warning",
+      "11"
+    ],
+    [
+      "simulate",
+      "warning",
+      "11"
+    ],
+    [
+      "report",
+      "done",
+      "0"
+    ]
+  ],
+  "interface_rows": [
+    [
+      "B",
+      "TEMDataset",
+      "pass",
+      "Input dataset object for downstream calibration/diffraction."
+    ],
+    [
+      "B",
+      "DiffractionResult",
+      "pass",
+      "Reciprocal-space container for peaks, d-spacing, and phase candidates."
+    ],
+    [
+      "B",
+      "Diffraction peaks",
+      "pass",
+      "At least one detected peak is expected."
+    ],
+    [
+      "B",
+      "d-spacing table",
+      "pass",
+      "d-spacing entries should be exported for phase matching."
+    ],
+    [
+      "B",
+      "Phase candidates",
+      "pass",
+      "Top-N phase candidates for downstream review."
+    ],
+    [
+      "B",
+      "Diffraction overlay figure",
+      "pass",
+      "FFT peak overlay in figures."
+    ],
+    [
+      "C",
+      "AtomLattice",
+      "missing",
+      "Atom lattice object for atom/strain pipelines."
+    ],
+    [
+      "C",
+      "Atom coordinates",
+      "missing",
+      "At least one atom coordinate expected when atom step is active."
+    ],
+    [
+      "C",
+      "Atom overlay figure",
+      "missing",
+      "Atom overlay visual for reportability."
+    ],
+    [
+      "C",
+      "StrainResult",
+      "missing",
+      "Structured strain result object."
+    ],
+    [
+      "C",
+      "Strain map availability",
+      "missing",
+      "At least one strain/rotation map should be provided."
+    ]
+  ],
+  "contains_step_detail_class": false
+}

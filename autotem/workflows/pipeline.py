@@ -34,8 +34,17 @@ from autotem.core import (
 from autotem.diffraction import run_diffraction_analysis
 from autotem.io import load_tem_dataset
 from autotem.preprocessing import assess_quality, preprocess_dataset
-from autotem.reporting import export_csv_tables, export_html_report
+from autotem.reporting import (
+    ensure_a3_output_layout,
+    export_csv_tables_with_models,
+    export_html_report,
+    export_json_bundle,
+    export_pdf_report,
+    persist_intermediate_artifacts,
+    write_output_manifest,
+)
 from autotem.simulation import simulate_from_diffraction
+from autotem.visualization import build_core_overlays, build_core_plots
 from autotem.workflows.recipes import (
     WORKFLOW_PARAMETER_SCHEMA_VERSION,
     load_workflow_recipe,
@@ -127,6 +136,19 @@ _STEP_TO_PARAM_KEYS: dict[str, tuple[str, ...]] = {
     "index_diffraction": ("diffraction", "analyze"),
     "phase_match": ("diffraction", "analyze"),
 }
+_SUPPORTED_EXPORT_FORMATS: set[str] = {"json", "csv", "html", "svg", "pdf"}
+_RUNTIME_DEPENDENCY_NAMES: tuple[str, ...] = (
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "pydantic",
+    "pyyaml",
+    "Pillow",
+    "imageio",
+    "tifffile",
+    "ncempy",
+    "h5py",
+)
 
 
 def _collect_warnings(*warning_lists: list[str]) -> list[str]:
@@ -183,7 +205,17 @@ def _sha256_of_file(path: Path) -> str | None:
     return digest.hexdigest()
 
 
-def _runtime_context() -> dict[str, str]:
+def _runtime_dependency_versions() -> dict[str, str]:
+    versions: dict[str, str] = {}
+    for name in _RUNTIME_DEPENDENCY_NAMES:
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = "not_installed"
+    return versions
+
+
+def _runtime_context() -> dict[str, object]:
     try:
         package_version = importlib.metadata.version("autotem-insight")
     except importlib.metadata.PackageNotFoundError:
@@ -193,7 +225,98 @@ def _runtime_context() -> dict[str, str]:
         "python_version": platform.python_version(),
         "platform": platform.platform(),
         "autotem_insight_version": package_version,
+        "dependency_versions": _runtime_dependency_versions(),
     }
+
+
+def _hash_json_payload(payload: object) -> str:
+    digest = hashlib.sha256()
+    digest.update(json.dumps(payload, sort_keys=True, default=str).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _evaluate_quality_gates(
+    workflow: WorkflowConfig,
+    report: AnalysisReport,
+) -> tuple[list[str], dict[str, object]]:
+    gate_warnings: list[str] = []
+    gate_results: dict[str, dict[str, object]] = {}
+    step_names = {step.name for step in workflow.steps}
+
+    any_failed_step = any(step.status == "failed" for step in workflow.steps)
+    gate_results["workflow_no_failed_steps"] = {
+        "passed": not any_failed_step,
+        "required": True,
+    }
+    if any_failed_step:
+        gate_warnings.append(
+            "BLOCKING: Workflow contains failed step(s); report is not acceptance-ready."
+        )
+
+    diffraction_required = bool(
+        step_names.intersection({"fft", "diffraction_peaks", "index_diffraction", "phase_match"})
+    )
+    if diffraction_required:
+        has_diffraction = report.diffraction is not None
+        has_peaks = has_diffraction and len(report.diffraction.peaks) > 0
+        has_d_spacings = has_diffraction and len(report.diffraction.d_spacings) > 0
+        gate_results["diffraction_result_present"] = {
+            "passed": bool(has_diffraction),
+            "required": True,
+        }
+        gate_results["diffraction_peak_table_present"] = {
+            "passed": bool(has_peaks),
+            "required": True,
+        }
+        gate_results["d_spacing_table_present"] = {
+            "passed": bool(has_d_spacings),
+            "required": True,
+        }
+        if not has_diffraction:
+            gate_warnings.append(
+                "BLOCKING: Diffraction step requested but DiffractionResult is missing."
+            )
+        if has_diffraction and not has_peaks:
+            gate_warnings.append(
+                "BLOCKING: Diffraction step requested but no peaks were detected."
+            )
+        if has_diffraction and not has_d_spacings:
+            gate_warnings.append(
+                "BLOCKING: Diffraction step requested but d-spacing table is empty."
+            )
+
+    atom_required = "detect_atoms" in step_names
+    if atom_required:
+        atom_present = report.atom_lattice is not None
+        atom_coordinates_present = atom_present and len(report.atom_lattice.atoms) > 0
+        gate_results["atom_lattice_present"] = {
+            "passed": bool(atom_present),
+            "required": True,
+        }
+        gate_results["atom_coordinates_present"] = {
+            "passed": bool(atom_coordinates_present),
+            "required": True,
+        }
+        if not atom_present:
+            gate_warnings.append(
+                "BLOCKING: detect_atoms step requested but AtomLattice is missing."
+            )
+        elif not atom_coordinates_present:
+            gate_warnings.append(
+                "BLOCKING: detect_atoms step requested but atom coordinates are empty."
+            )
+
+    passed = all(
+        bool(result.get("passed", False))
+        for result in gate_results.values()
+        if bool(result.get("required", False))
+    )
+    summary = {
+        "passed": passed,
+        "blocking_warning_count": len(gate_warnings),
+        "gates": gate_results,
+    }
+    return gate_warnings, summary
 
 
 def _input_fingerprint(input_path: Path) -> dict[str, object]:
@@ -308,10 +431,18 @@ class TEMAnalysisSkill:
         metadata: dict[str, object] | None = None,
         detect_atoms_step: bool | None = None,
         atom_detection_options: dict[str, Any] | None = None,
+        output_formats_override: list[str] | None = None,
+        report_title: str | None = None,
+        report_sections_override: list[str] | None = None,
+        open_step_sections: bool | None = None,
+        pdf_sections_override: list[str] | None = None,
+        pdf_max_figure_pages: int | None = None,
+        pdf_cover_fields: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Run the configured A2 workflow and emit structured outputs."""
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        ensure_a3_output_layout(output_dir)
         log_path = output_dir / "run.log"
         logger = _RunLogger(log_path)
         logger.info(
@@ -324,6 +455,10 @@ class TEMAnalysisSkill:
             if detect_atoms_step is True:
                 _ensure_forced_step(recipe.workflow, "detect_atoms")
             workflow_parameters = dict(recipe.workflow.parameters)
+            reporting_parameters = _extract_stage_parameters(
+                workflow_parameters,
+                ("reporting", "report"),
+            )
             workflow_used_path = save_effective_workflow(recipe, output_dir)
             logger.info(
                 f"Loaded workflow '{recipe.workflow.name}' with "
@@ -555,10 +690,70 @@ class TEMAnalysisSkill:
             ]
             requested_formats = {item.lower() for item in recipe.outputs.formats}
             requested_formats.update(item.lower() for item in recipe.workflow.output_formats)
+            if output_formats_override:
+                requested_formats.update(item.lower() for item in output_formats_override)
+            unknown_formats = sorted(requested_formats.difference(_SUPPORTED_EXPORT_FORMATS))
+            if unknown_formats:
+                raise ValueError(
+                    "Unsupported output format override(s): "
+                    f"{unknown_formats}. Supported: {sorted(_SUPPORTED_EXPORT_FORMATS)}."
+                )
+
+            requested_sections = reporting_parameters.get("sections")
+            if isinstance(requested_sections, list):
+                requested_sections = [str(item) for item in requested_sections]
+            else:
+                requested_sections = None
+            if report_sections_override:
+                requested_sections = list(report_sections_override)
+            open_sections_from_params = reporting_parameters.get("open_step_sections")
+            if isinstance(open_sections_from_params, bool):
+                open_sections_setting = open_sections_from_params
+            else:
+                open_sections_setting = False
+            if isinstance(open_step_sections, bool):
+                open_sections_setting = open_step_sections
+
+            pdf_parameters = reporting_parameters.get("pdf")
+            if not isinstance(pdf_parameters, dict):
+                pdf_parameters = {}
+            pdf_sections = pdf_parameters.get("sections")
+            if isinstance(pdf_sections, list):
+                pdf_sections = [str(item) for item in pdf_sections]
+            else:
+                pdf_sections = None
+            if pdf_sections_override:
+                pdf_sections = list(pdf_sections_override)
+            pdf_max_pages = pdf_parameters.get("max_figure_pages")
+            if isinstance(pdf_max_pages, bool):
+                pdf_max_pages = None
+            elif isinstance(pdf_max_pages, (int, float)):
+                pdf_max_pages = int(pdf_max_pages)
+            else:
+                pdf_max_pages = None
+            if isinstance(pdf_max_figure_pages, int):
+                pdf_max_pages = pdf_max_figure_pages
+            pdf_cover = pdf_parameters.get("cover_fields")
+            if not isinstance(pdf_cover, dict):
+                pdf_cover = {}
+            if pdf_cover_fields:
+                merged_cover = dict(pdf_cover)
+                merged_cover.update(pdf_cover_fields)
+                pdf_cover = merged_cover
 
             input_path_obj = Path(input_path)
+            report_summary = report_title or "A2 baseline workflow completed."
+            report_options_payload = {
+                "report_title": report_title,
+                "output_formats_override": output_formats_override or [],
+                "report_sections_override": report_sections_override or [],
+                "open_step_sections": open_sections_setting,
+                "pdf_sections_override": pdf_sections_override or [],
+                "pdf_max_figure_pages": pdf_max_pages,
+                "pdf_cover_fields": pdf_cover,
+            }
             report = AnalysisReport(
-                summary="A2 baseline workflow completed.",
+                summary=report_summary,
                 workflow=workflow,
                 dataset=dataset,
                 quality=quality,
@@ -567,6 +762,8 @@ class TEMAnalysisSkill:
                 diffraction=diffraction,
                 simulation=simulation,
                 atom_lattice=atom_lattice,
+                figures=[],
+                tables=[],
                 artifacts=artifacts,
                 warnings=_collect_warnings(
                     run_warnings,
@@ -586,17 +783,80 @@ class TEMAnalysisSkill:
                         "sha256": _sha256_of_file(workflow_used_path),
                     },
                     "workflow_parameters_snapshot": recipe.workflow.parameters,
+                    "workflow_parameters_hash_sha256": _hash_json_payload(
+                        recipe.workflow.parameters
+                    ),
+                    "requested_formats": sorted(requested_formats),
+                    "requested_formats_hash_sha256": _hash_json_payload(sorted(requested_formats)),
                     "workflow_parameter_schema_version": recipe.workflow.provenance.get(
                         "workflow_parameter_schema_version",
                         WORKFLOW_PARAMETER_SCHEMA_VERSION,
                     ),
+                    "report_options": report_options_payload,
+                    "report_options_hash_sha256": _hash_json_payload(report_options_payload),
                 },
             )
+            export_svg = "svg" in requested_formats
+            figure_artifacts, figures, figure_warnings = build_core_plots(
+                report,
+                output_dir,
+                export_svg=export_svg,
+            )
+            overlay_artifacts, overlay_figures, overlay_warnings = build_core_overlays(
+                report,
+                output_dir,
+                export_svg=export_svg,
+            )
+            report.figures = [*figures, *overlay_figures]
+            report.warnings = _collect_warnings(
+                report.warnings,
+                figure_warnings,
+                overlay_warnings,
+            )
+            artifacts.extend(figure_artifacts)
+            artifacts.extend(overlay_artifacts)
+
+            if "json" in requested_formats:
+                artifacts.extend(export_json_bundle(report, output_dir))
             if "csv" in requested_formats:
-                artifacts.extend(export_csv_tables(report, output_dir))
+                csv_artifacts, report_tables = export_csv_tables_with_models(report, output_dir)
+                report.tables = report_tables
+                artifacts.extend(csv_artifacts)
             if "html" in requested_formats:
-                artifacts.append(export_html_report(report, output_dir))
+                artifacts.append(
+                    export_html_report(
+                        report,
+                        output_dir,
+                        options={
+                            "sections": requested_sections,
+                            "open_step_sections": open_sections_setting,
+                        },
+                    )
+                )
+            if "pdf" in requested_formats:
+                artifacts.append(
+                    export_pdf_report(
+                        report,
+                        output_dir,
+                        options={
+                            "sections": pdf_sections,
+                            "max_figure_pages": pdf_max_pages if pdf_max_pages is not None else 8,
+                            "cover_fields": pdf_cover,
+                        },
+                    )
+                )
+            if recipe.workflow.save_intermediates:
+                artifacts.extend(persist_intermediate_artifacts(report, output_dir))
+            gate_warnings, gate_summary = _evaluate_quality_gates(workflow, report)
+            report.warnings = _collect_warnings(report.warnings, gate_warnings)
+            report.provenance["quality_gates"] = gate_summary
             report.artifacts = artifacts
+            manifest_artifact = write_output_manifest(
+                report,
+                output_dir,
+                requested_formats=requested_formats,
+            )
+            report.artifacts.append(manifest_artifact)
             write_json(report_path, report)
             logger.info(f"Report written to '{report_path}'.")
             run_summary_path = output_dir / "run_summary.json"

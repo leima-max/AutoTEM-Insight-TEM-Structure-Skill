@@ -25,7 +25,7 @@ DEFAULT_STEP_SEQUENCE: tuple[str, ...] = (
 STEP_ALIASES: dict[str, tuple[str, ...]] = {
     "analyze": ("fft", "diffraction_peaks", "index_diffraction", "phase_match"),
 }
-_SUPPORTED_OUTPUT_FORMATS = {"json", "csv", "html"}
+_SUPPORTED_OUTPUT_FORMATS = {"json", "csv", "html", "svg", "pdf"}
 _SUPPORTED_CALIBRATION_METHODS = {"auto", "metadata", "manual", "reference"}
 _SUPPORTED_PREPROCESS_RECIPES = {"auto", "min_max"}
 

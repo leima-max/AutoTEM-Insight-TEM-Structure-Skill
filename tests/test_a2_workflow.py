@@ -324,6 +324,24 @@ def test_workflow_recipe_rejects_unsupported_output_format(tmp_path: Path) -> No
         load_workflow_recipe(workflow_path)
 
 
+def test_workflow_recipe_accepts_svg_and_pdf_output_formats(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "svg_pdf_format.yaml"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: svg_pdf_format",
+                "outputs:",
+                "  formats: [json, html, svg, pdf]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    recipe = load_workflow_recipe(workflow_path)
+    assert set(recipe.outputs.formats) == {"json", "html", "svg", "pdf"}
+
+
 def test_reserved_step_contracts_are_emitted(tmp_path: Path) -> None:
     image = np.ones((24, 24), dtype=np.float32)
     input_path = tmp_path / "reserved.npy"

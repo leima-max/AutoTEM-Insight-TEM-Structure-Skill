@@ -1,12 +1,11 @@
-"""Baseline report exporters for CSV tables and HTML summary pages."""
+"""A3 table export helpers."""
 
 from __future__ import annotations
 
 import csv
-import html
 from pathlib import Path
 
-from autotem.core import AnalysisReport, OutputArtifact
+from autotem.core import AnalysisReport, OutputArtifact, ReportTable
 
 
 def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, object]]) -> None:
@@ -19,10 +18,20 @@ def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, object]])
 
 
 def export_csv_tables(report: AnalysisReport, output_dir: str | Path) -> list[OutputArtifact]:
-    """Export key baseline analysis tables as CSV files."""
+    """Backward-compatible wrapper that returns CSV artifacts only."""
+    artifacts, _ = export_csv_tables_with_models(report, output_dir)
+    return artifacts
+
+
+def export_csv_tables_with_models(
+    report: AnalysisReport,
+    output_dir: str | Path,
+) -> tuple[list[OutputArtifact], list[ReportTable]]:
+    """Export key analysis tables as CSV files and report-table metadata."""
     output_dir = Path(output_dir)
     tables_dir = output_dir / "tables"
     artifacts: list[OutputArtifact] = []
+    report_tables: list[ReportTable] = []
 
     if report.diffraction is not None:
         peaks_rows = [
@@ -43,6 +52,14 @@ def export_csv_tables(report: AnalysisReport, output_dir: str | Path) -> list[Ou
                 uri=str(peaks_path),
                 label="Diffraction Peaks",
                 mime_type="text/csv",
+            )
+        )
+        report_tables.append(
+            ReportTable(
+                label="Diffraction Peaks",
+                uri=str(peaks_path),
+                rows=peaks_rows,
+                table_type="diffraction_peaks",
             )
         )
 
@@ -69,6 +86,14 @@ def export_csv_tables(report: AnalysisReport, output_dir: str | Path) -> list[Ou
                 uri=str(d_spacing_path),
                 label="d-Spacings",
                 mime_type="text/csv",
+            )
+        )
+        report_tables.append(
+            ReportTable(
+                label="d-Spacings",
+                uri=str(d_spacing_path),
+                rows=d_spacing_rows,
+                table_type="d_spacings",
             )
         )
 
@@ -106,6 +131,50 @@ def export_csv_tables(report: AnalysisReport, output_dir: str | Path) -> list[Ou
                 mime_type="text/csv",
             )
         )
+        report_tables.append(
+            ReportTable(
+                label="Phase Candidates",
+                uri=str(phases_path),
+                rows=phase_rows,
+                table_type="phase_candidates",
+            )
+        )
+
+    atom_rows = []
+    if report.atom_lattice is not None:
+        atom_rows = [
+            {
+                "index": idx,
+                "x": atom.x,
+                "y": atom.y,
+                "intensity": atom.intensity.value if atom.intensity is not None else "",
+                "intensity_unit": atom.intensity.unit if atom.intensity is not None else "",
+                "confidence": atom.confidence,
+            }
+            for idx, atom in enumerate(report.atom_lattice.atoms)
+        ]
+    atom_path = tables_dir / "atom_coordinates.csv"
+    _write_csv(
+        atom_path,
+        ["index", "x", "y", "intensity", "intensity_unit", "confidence"],
+        atom_rows,
+    )
+    artifacts.append(
+        OutputArtifact(
+            kind="table",
+            uri=str(atom_path),
+            label="Atom Coordinates",
+            mime_type="text/csv",
+        )
+    )
+    report_tables.append(
+        ReportTable(
+            label="Atom Coordinates",
+            uri=str(atom_path),
+            rows=atom_rows,
+            table_type="atom_coordinates",
+        )
+    )
 
     warnings_rows = [
         {"index": idx, "warning": warning} for idx, warning in enumerate(report.warnings)
@@ -120,56 +189,12 @@ def export_csv_tables(report: AnalysisReport, output_dir: str | Path) -> list[Ou
             mime_type="text/csv",
         )
     )
-    return artifacts
-
-
-def export_html_report(report: AnalysisReport, output_dir: str | Path) -> OutputArtifact:
-    """Export a simple baseline HTML report."""
-    output_dir = Path(output_dir)
-    report_path = output_dir / "report.html"
-
-    workflow_name = report.workflow.name if report.workflow is not None else "unknown"
-    dataset_path = report.dataset.source_path if report.dataset is not None else "unknown"
-    peak_count = len(report.diffraction.peaks) if report.diffraction is not None else 0
-    phase_count = len(report.diffraction.phase_candidates) if report.diffraction is not None else 0
-
-    warnings_html = "".join(f"<li>{html.escape(item)}</li>" for item in report.warnings)
-    if not warnings_html:
-        warnings_html = "<li>None</li>"
-
-    body = f"""<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <title>AutoTEM A2 Report</title>
-    <style>
-      body {{ font-family: Arial, sans-serif; margin: 24px; color: #1f2937; }}
-      h1 {{ margin-bottom: 0.2rem; }}
-      .meta {{ color: #4b5563; margin-bottom: 1rem; }}
-      table {{ border-collapse: collapse; width: 100%; margin-top: 1rem; }}
-      th, td {{ border: 1px solid #d1d5db; padding: 8px; text-align: left; }}
-      th {{ background: #f3f4f6; }}
-    </style>
-  </head>
-  <body>
-    <h1>AutoTEM A2 Analysis Report</h1>
-    <div class="meta">{html.escape(report.summary)}</div>
-    <table>
-      <tr><th>Workflow</th><td>{html.escape(workflow_name)}</td></tr>
-      <tr><th>Input</th><td>{html.escape(dataset_path)}</td></tr>
-      <tr><th>Diffraction Peaks</th><td>{peak_count}</td></tr>
-      <tr><th>Phase Candidates</th><td>{phase_count}</td></tr>
-      <tr><th>Warnings</th><td>{len(report.warnings)}</td></tr>
-    </table>
-    <h2>Warnings</h2>
-    <ul>{warnings_html}</ul>
-  </body>
-</html>
-"""
-    report_path.write_text(body, encoding="utf-8")
-    return OutputArtifact(
-        kind="html",
-        uri=str(report_path),
-        label="HTML Report",
-        mime_type="text/html",
+    report_tables.append(
+        ReportTable(
+            label="Warnings",
+            uri=str(warnings_path),
+            rows=warnings_rows,
+            table_type="warnings",
+        )
     )
+    return artifacts, report_tables

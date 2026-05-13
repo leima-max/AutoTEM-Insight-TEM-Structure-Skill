@@ -1,0 +1,28 @@
+{
+  "schema_version": "0.1.0",
+  "requested_formats": [
+    "html",
+    "json",
+    "pdf",
+    "svg"
+  ],
+  "directories_keys": [
+    "figures",
+    "intermediates",
+    "json",
+    "tables"
+  ],
+  "counts_keys": [
+    "artifacts",
+    "figures",
+    "tables",
+    "warnings"
+  ],
+  "artifact_kind_counts": {
+    "array": 3,
+    "html": 1,
+    "image": 11,
+    "json": 14,
+    "other": 3
+  }
+}

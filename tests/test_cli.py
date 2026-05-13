@@ -110,3 +110,98 @@ def test_cli_analyze_without_detect_atoms_flag(monkeypatch, tmp_path: Path, caps
 
     assert exit_code == 0
     assert "ok" in captured.out
+
+
+def test_cli_analyze_formats_and_report_title(monkeypatch, tmp_path: Path, capsys) -> None:
+    class DummySkill:
+        def run(self, **kwargs):
+            assert kwargs["output_formats_override"] == ["json", "csv", "html"]
+            assert kwargs["report_title"] == "A3 Custom Title"
+            assert kwargs["report_sections_override"] is None
+            assert kwargs["open_step_sections"] is None
+            return {"status": "ok"}
+
+    monkeypatch.setattr("autotem.cli.TEMAnalysisSkill", DummySkill)
+    input_path = tmp_path / "sample.npy"
+    np.save(input_path, np.zeros((8, 8), dtype=np.float32))
+
+    exit_code = main(
+        [
+            "analyze",
+            str(input_path),
+            "--formats",
+            "json,csv,html",
+            "--report-title",
+            "A3 Custom Title",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "ok" in captured.out
+
+
+def test_cli_analyze_report_section_controls(monkeypatch, tmp_path: Path, capsys) -> None:
+    class DummySkill:
+        def run(self, **kwargs):
+            assert kwargs["report_sections_override"] == ["overview", "interface_checks"]
+            assert kwargs["open_step_sections"] is True
+            return {"status": "ok"}
+
+    monkeypatch.setattr("autotem.cli.TEMAnalysisSkill", DummySkill)
+    input_path = tmp_path / "sample.npy"
+    np.save(input_path, np.zeros((8, 8), dtype=np.float32))
+
+    exit_code = main(
+        [
+            "analyze",
+            str(input_path),
+            "--report-sections",
+            "overview,interface_checks",
+            "--open-step-sections",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "ok" in captured.out
+
+
+def test_cli_analyze_pdf_controls(monkeypatch, tmp_path: Path, capsys) -> None:
+    class DummySkill:
+        def run(self, **kwargs):
+            assert kwargs["pdf_sections_override"] == ["cover", "figures"]
+            assert kwargs["pdf_max_figure_pages"] == 2
+            assert kwargs["pdf_cover_fields"] == {"sample_id": "S01", "operator": "member-a"}
+            return {"status": "ok"}
+
+    monkeypatch.setattr("autotem.cli.TEMAnalysisSkill", DummySkill)
+    input_path = tmp_path / "sample.npy"
+    np.save(input_path, np.zeros((8, 8), dtype=np.float32))
+
+    exit_code = main(
+        [
+            "analyze",
+            str(input_path),
+            "--pdf-sections",
+            "cover,figures",
+            "--pdf-max-figures",
+            "2",
+            "--pdf-cover-field",
+            "sample_id=S01",
+            "--pdf-cover-field",
+            "operator=member-a",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "ok" in captured.out
+
+
+def test_cli_analyze_invalid_pdf_cover_field(tmp_path: Path, capsys) -> None:
+    input_path = tmp_path / "sample.npy"
+    np.save(input_path, np.zeros((8, 8), dtype=np.float32))
+    exit_code = main(["analyze", str(input_path), "--pdf-cover-field", "bad-field"])
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_CONFIG_ERROR
+    assert "configuration error" in captured.err
