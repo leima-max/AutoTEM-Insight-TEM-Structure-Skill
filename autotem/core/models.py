@@ -182,6 +182,7 @@ class RunSummary(VersionedAutoTEMModel):
     input_fingerprint: JsonDict = Field(default_factory=dict)
     workflow_fingerprint: JsonDict = Field(default_factory=dict)
     workflow_parameters_snapshot: JsonDict = Field(default_factory=dict)
+    bc_interface_summary: JsonDict = Field(default_factory=dict)
 
 
 class TEMDataset(VersionedAutoTEMModel):

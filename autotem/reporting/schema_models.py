@@ -36,8 +36,30 @@ class OutputManifestModel(ReportingContractModel):
     provenance: dict[str, Any] = Field(default_factory=dict)
 
 
+class InterfaceCompletenessSummaryModel(ReportingContractModel):
+    total: int = 0
+    passed: int = 0
+    missing: int = 0
+    pass_rate: float = 0.0
+
+
+class InterfaceCompletenessCheckModel(ReportingContractModel):
+    owner: str
+    item: str
+    status: Literal["pass", "missing"]
+    detail: str
+
+
+class InterfaceCompletenessContractModel(ReportingContractModel):
+    schema_version: Literal["0.1.0"] = CURRENT_SCHEMA_VERSION
+    contract: Literal["A3_BC_interface_completeness"] = "A3_BC_interface_completeness"
+    summary: InterfaceCompletenessSummaryModel
+    checks: list[InterfaceCompletenessCheckModel] = Field(default_factory=list)
+
+
 def reporting_contract_schemas() -> dict[str, dict[str, Any]]:
     return {
         "ReportBundleSummary": ReportBundleSummaryModel.model_json_schema(),
         "OutputManifest": OutputManifestModel.model_json_schema(),
+        "InterfaceCompletenessContract": InterfaceCompletenessContractModel.model_json_schema(),
     }

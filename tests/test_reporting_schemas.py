@@ -4,6 +4,7 @@ import numpy as np
 
 from autotem import TEMAnalysisSkill
 from autotem.reporting import (
+    InterfaceCompletenessContractModel,
     OutputManifestModel,
     ReportBundleSummaryModel,
     reporting_schema_manifest,
@@ -18,10 +19,15 @@ def test_reporting_schema_manifest_and_export(tmp_path: Path) -> None:
     assert (schema_dir / "manifest.json").exists()
     assert (schema_dir / "OutputManifest.schema.json").exists()
     assert (schema_dir / "ReportBundleSummary.schema.json").exists()
+    assert (schema_dir / "InterfaceCompletenessContract.schema.json").exists()
 
     manifest = reporting_schema_manifest()
     assert manifest["schema_version"] == "0.1.0"
-    assert manifest["models"] == ["ReportBundleSummary", "OutputManifest"]
+    assert manifest["models"] == [
+        "ReportBundleSummary",
+        "OutputManifest",
+        "InterfaceCompletenessContract",
+    ]
 
 
 def test_generated_reporting_json_validate_against_models(tmp_path: Path) -> None:
@@ -42,11 +48,17 @@ def test_generated_reporting_json_validate_against_models(tmp_path: Path) -> Non
     bundle_payload = (output_dir / "json" / "report_bundle_summary.json").read_text(
         encoding="utf-8"
     )
+    interface_payload = (output_dir / "json" / "interface_completeness_bc.json").read_text(
+        encoding="utf-8"
+    )
 
     manifest = OutputManifestModel.model_validate_json(manifest_payload)
     bundle = ReportBundleSummaryModel.model_validate_json(bundle_payload)
+    interface_contract = InterfaceCompletenessContractModel.model_validate_json(interface_payload)
 
     assert manifest.schema_version == "0.1.0"
     assert "figures" in manifest.directories
     assert bundle.schema_version == "0.1.0"
     assert bundle.warning_count >= 0
+    assert interface_contract.schema_version == "0.1.0"
+    assert interface_contract.contract == "A3_BC_interface_completeness"

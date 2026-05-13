@@ -1,0 +1,52 @@
+workflow:
+  name: a4_validation_benchmark
+  description: A4 validation and benchmark baseline workflow.
+  steps:
+    - load
+    - assess_quality
+    - calibrate
+    - preprocess
+    - analyze
+    - validate
+    - benchmark
+    - report
+  parameters:
+    calibration:
+      method: auto
+      voltage_kv: 200
+    preprocessing:
+      recipe: min_max
+      clip_percentile_low: 1.0
+      clip_percentile_high: 99.0
+    diffraction:
+      top_k_peaks: 24
+      min_peak_distance: 3.0
+      center_exclusion_radius: 3.0
+      phase_top_n: 3
+    validation:
+      acceptance_criteria:
+        - metric: workflow_no_failed_steps
+          op: ">="
+          threshold: 1
+        - metric: quality_gates_passed_flag
+          op: ">="
+          threshold: 1
+    benchmark:
+      case_id: mvp_sample_case
+      acceptance_criteria:
+        - metric: workflow_no_failed_steps
+          op: ">="
+          threshold: 1
+        - metric: diffraction_peak_count
+          op: ">="
+          threshold: 1
+        - metric: d_spacing_count
+          op: ">="
+          threshold: 1
+
+outputs:
+  formats:
+    - json
+    - csv
+    - html
+  save_intermediates: true

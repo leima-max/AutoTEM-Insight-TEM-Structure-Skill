@@ -111,8 +111,11 @@ def test_a3_output_format_override_without_workflow(tmp_path: Path) -> None:
 
     assert (output_dir / "report.html").exists()
     assert (output_dir / "tables" / "diffraction_peaks.csv").exists()
+    assert (output_dir / "tables" / "interface_completeness_bc.csv").exists()
+    assert (output_dir / "json" / "interface_completeness_bc.json").exists()
     report = read_json(output_dir / "analysis_report.json", AnalysisReport)
     assert report.summary == "A3 Stage2 Custom Report"
+    assert any(table.table_type == "interface_completeness_bc" for table in report.tables)
 
 
 def test_a3_svg_pdf_and_intermediates_exports(tmp_path: Path) -> None:
@@ -180,3 +183,48 @@ def test_a3_rejects_unsupported_output_override(tmp_path: Path) -> None:
             output_dir=tmp_path / "outputs",
             output_formats_override=["json", "xml"],
         )
+
+
+def test_a3_manifest_includes_runtime_contract_artifacts(tmp_path: Path) -> None:
+    image = np.zeros((28, 28), dtype=np.float32)
+    image[14, 18] = 3.0
+    input_path = tmp_path / "a3_manifest_runtime.npy"
+    np.save(input_path, image)
+    output_dir = tmp_path / "outputs"
+
+    TEMAnalysisSkill().run(
+        input_path=input_path,
+        output_dir=output_dir,
+        output_formats_override=["json", "html"],
+    )
+
+    manifest = json.loads((output_dir / "json" / "output_manifest.json").read_text(encoding="utf-8"))
+    artifact_uris = [Path(item["uri"]).name for item in manifest["artifacts"]]
+
+    assert "analysis_report.json" in artifact_uris
+    assert "workflow_used.yaml" in artifact_uris
+    assert "run_summary.json" in artifact_uris
+    assert "run.log" in artifact_uris
+    assert "interface_completeness_bc.json" in artifact_uris
+    assert manifest["artifact_kind_counts"].get("log", 0) >= 1
+
+
+def test_a3_interface_contract_json_summary_fields(tmp_path: Path) -> None:
+    image = np.zeros((24, 24), dtype=np.float32)
+    image[12, 16] = 5.0
+    input_path = tmp_path / "a3_interface_contract.npy"
+    np.save(input_path, image)
+    output_dir = tmp_path / "outputs"
+
+    TEMAnalysisSkill().run(
+        input_path=input_path,
+        output_dir=output_dir,
+        output_formats_override=["json", "csv"],
+    )
+
+    contract_payload = json.loads(
+        (output_dir / "json" / "interface_completeness_bc.json").read_text(encoding="utf-8")
+    )
+    assert contract_payload["contract"] == "A3_BC_interface_completeness"
+    assert contract_payload["summary"]["total"] >= 1
+    assert "pass_rate" in contract_payload["summary"]

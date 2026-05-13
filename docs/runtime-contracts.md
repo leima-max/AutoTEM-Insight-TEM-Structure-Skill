@@ -27,6 +27,7 @@ Required top-level fields:
 | `input_fingerprint` | object | Input file path/hash/size info. |
 | `workflow_fingerprint` | object | Effective workflow hash and path. |
 | `workflow_parameters_snapshot` | object | Frozen parameters used for run. |
+| `bc_interface_summary` | object | B/C interface completeness summary (`total/passed/missing/pass_rate/by_owner`). |
 
 `RunSummaryStep` fields:
 

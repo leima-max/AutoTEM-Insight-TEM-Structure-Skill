@@ -54,6 +54,7 @@ Key A2/A3 outputs:
 - `figures/*.png` (A3 baseline plots and overlays)
 - `figures/*.svg` (when `svg` format is requested)
 - `json/*.json` (A3 module snapshots and bundle summary)
+  - includes A4 `validation_summary.json` / `benchmark_report.json` when `validate` / `benchmark` steps are enabled
 - `report.pdf` (when `pdf` format is requested)
 - `intermediates/*` (when `save_intermediates: true`)
   - large arrays are tiered to HDF5 when available, with preview + metadata sidecars
@@ -68,6 +69,7 @@ See docs for contract details:
 - `docs/runtime-contracts.md`
 - `docs/a2-reserved-step-contracts.md`
 - `docs/a3-output-conventions.md`
+- `docs/a4-validation-benchmark.md`
 
 ## A2 Workflow Parameters
 
@@ -98,6 +100,35 @@ outputs:
 ```
 
 Validation is enforced during workflow loading; invalid ranges or unsupported formats fail fast with clear `ValueError` messages.
+
+## A4 Validation & Benchmark
+
+Enable A4 steps directly in workflow:
+
+```yaml
+workflow:
+  steps: [load, assess_quality, calibrate, preprocess, analyze, validate, benchmark, report]
+  parameters:
+    validation:
+      acceptance_criteria:
+        - metric: workflow_no_failed_steps
+          op: ">="
+          threshold: 1
+    benchmark:
+      case_id: hrtem_mvp
+      reference:
+        d_spacings_nm: [0.235, 0.204]
+      acceptance_criteria:
+        - metric: d_spacing_mean_relative_error
+          op: "<="
+          threshold: 0.02
+```
+
+A4 outputs (when enabled):
+
+- `json/validation_summary.json`
+- `json/benchmark_report.json`
+- `analysis_report.json -> benchmark` snapshot
 
 ## Local UI (Atom Detection C0)
 

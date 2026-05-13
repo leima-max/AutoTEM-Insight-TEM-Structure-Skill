@@ -41,7 +41,15 @@ Inside `json/`:
 
 - `report_bundle_summary.json`: high-level summary of report modules and counts
 - `output_manifest.json`: canonical artifact inventory for downstream automation
+- `interface_completeness_bc.json`: B/C interface completeness contract summary and checks
 - module snapshots: `workflow.json`, `dataset.json`, `diffraction.json`, `atom_lattice.json`, etc. (when present)
+
+`output_manifest.json` includes runtime contract artifacts as well, including
+`analysis_report.json`, `run_summary.json`, `run.log`, and `workflow_used.yaml`.
+
+Inside `tables/`, A3 also writes:
+
+- `interface_completeness_bc.csv`: flat contract table for project board and acceptance automation
 
 Both `output_manifest.json` and `report_bundle_summary.json` are validated against Pydantic
 contract models and have exportable JSON Schemas.

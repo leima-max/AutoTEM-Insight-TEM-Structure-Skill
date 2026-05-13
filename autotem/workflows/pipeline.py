@@ -36,14 +36,17 @@ from autotem.io import load_tem_dataset
 from autotem.preprocessing import assess_quality, preprocess_dataset
 from autotem.reporting import (
     ensure_a3_output_layout,
+    evaluate_bc_interface_completeness,
     export_csv_tables_with_models,
     export_html_report,
     export_json_bundle,
     export_pdf_report,
     persist_intermediate_artifacts,
+    summarize_bc_interface_rows,
     write_output_manifest,
 )
 from autotem.simulation import simulate_from_diffraction
+from autotem.validation import run_benchmark_summary, run_validation_summary
 from autotem.visualization import build_core_overlays, build_core_plots
 from autotem.workflows.recipes import (
     WORKFLOW_PARAMETER_SCHEMA_VERSION,
@@ -62,8 +65,6 @@ _UNIMPLEMENTED_A2_STEPS: set[str] = {
     "analyze_spectroscopy",
     "analyze_4dstem",
     "ai_inference",
-    "validate",
-    "benchmark",
 }
 _RESERVED_STEP_CONTRACTS: dict[str, dict[str, object]] = {
     "detect_atoms": {
@@ -135,6 +136,8 @@ _STEP_TO_PARAM_KEYS: dict[str, tuple[str, ...]] = {
     "diffraction_peaks": ("diffraction", "fft", "analyze"),
     "index_diffraction": ("diffraction", "analyze"),
     "phase_match": ("diffraction", "analyze"),
+    "validate": ("validation", "validate"),
+    "benchmark": ("benchmark",),
 }
 _SUPPORTED_EXPORT_FORMATS: set[str] = {"json", "csv", "html", "svg", "pdf"}
 _RUNTIME_DEPENDENCY_NAMES: tuple[str, ...] = (
@@ -235,9 +238,16 @@ def _hash_json_payload(payload: object) -> str:
     return digest.hexdigest()
 
 
+def _write_json_payload(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
 def _evaluate_quality_gates(
     workflow: WorkflowConfig,
     report: AnalysisReport,
+    *,
+    reporting_parameters: dict[str, Any] | None = None,
 ) -> tuple[list[str], dict[str, object]]:
     gate_warnings: list[str] = []
     gate_results: dict[str, dict[str, object]] = {}
@@ -306,6 +316,54 @@ def _evaluate_quality_gates(
                 "BLOCKING: detect_atoms step requested but atom coordinates are empty."
             )
 
+    reporting_parameters = reporting_parameters or {}
+    interface_gate_cfg_raw = reporting_parameters.get("interface_gates")
+    interface_gate_cfg = (
+        dict(interface_gate_cfg_raw)
+        if isinstance(interface_gate_cfg_raw, dict)
+        else {}
+    )
+    interface_gates_enabled = bool(interface_gate_cfg.get("enabled", True))
+    required_items_override_raw = interface_gate_cfg.get("required_items")
+    required_items_override = (
+        [str(item) for item in required_items_override_raw]
+        if isinstance(required_items_override_raw, list)
+        else []
+    )
+
+    default_required_items: list[str] = []
+    if diffraction_required:
+        default_required_items.extend(
+            ["B.DiffractionResult", "B.Diffraction peaks", "B.d-spacing table"]
+        )
+    strain_required = bool(step_names.intersection({"run_gpa", "atom_strain"}))
+    if atom_required or strain_required:
+        default_required_items.extend(["C.AtomLattice", "C.Atom coordinates"])
+    if strain_required:
+        default_required_items.append("C.StrainResult")
+
+    required_items = (
+        required_items_override if required_items_override else default_required_items
+    )
+    if interface_gates_enabled and required_items:
+        checks = evaluate_bc_interface_completeness(report)
+        check_map = {f"{item['owner']}.{item['item']}": item["status"] for item in checks}
+        missing_items = [
+            item for item in required_items if check_map.get(item, "missing") != "pass"
+        ]
+        interface_passed = len(missing_items) == 0
+        gate_results["bc_interface_required_items_present"] = {
+            "passed": interface_passed,
+            "required": True,
+            "required_items": required_items,
+            "missing_items": missing_items,
+        }
+        if not interface_passed:
+            gate_warnings.append(
+                "BLOCKING: B/C interface completeness gate failed; missing required items: "
+                + ", ".join(missing_items)
+            )
+
     passed = all(
         bool(result.get("passed", False))
         for result in gate_results.values()
@@ -328,6 +386,15 @@ def _input_fingerprint(input_path: Path) -> dict[str, object]:
         "sha256": _sha256_of_file(input_path),
         "size_bytes": input_path.stat().st_size,
     }
+
+
+def _append_artifact_unique(
+    artifacts: list[OutputArtifact],
+    artifact: OutputArtifact,
+) -> None:
+    if any(item.uri == artifact.uri for item in artifacts):
+        return
+    artifacts.append(artifact)
 
 
 class _RunLogger:
@@ -477,6 +544,8 @@ class TEMAnalysisSkill:
             run_warnings: list[str] = []
             diffraction_signature: str | None = None
             diffraction_source_step: str | None = None
+            validate_step_indices: list[int] = []
+            benchmark_step_indices: list[int] = []
 
             for step in recipe.workflow.steps:
                 step_record = WorkflowStep(
@@ -589,6 +658,24 @@ class TEMAnalysisSkill:
                         simulation = self.simulate_from_diffraction(diffraction)
                         step_record.status = "warning" if simulation.warnings else "done"
                         step_record.warnings.extend(simulation.warnings)
+                elif step_record.name == "validate":
+                    stage_parameters = _extract_stage_parameters(
+                        workflow_parameters,
+                        _STEP_TO_PARAM_KEYS.get("validate", ("validation",)),
+                    )
+                    step_record.parameters = stage_parameters
+                    step_record.outputs = ["ValidationMetric[]", "validation_summary.json"]
+                    step_record.status = "done"
+                    validate_step_indices.append(len(step_records))
+                elif step_record.name == "benchmark":
+                    stage_parameters = _extract_stage_parameters(
+                        workflow_parameters,
+                        _STEP_TO_PARAM_KEYS.get("benchmark", ("benchmark",)),
+                    )
+                    step_record.parameters = stage_parameters
+                    step_record.outputs = ["BenchmarkResult", "benchmark_report.json"]
+                    step_record.status = "done"
+                    benchmark_step_indices.append(len(step_records))
                 elif step_record.name == "report":
                     step_record.status = "done"
                 elif step_record.name in _UNIMPLEMENTED_A2_STEPS:
@@ -847,18 +934,111 @@ class TEMAnalysisSkill:
                 )
             if recipe.workflow.save_intermediates:
                 artifacts.extend(persist_intermediate_artifacts(report, output_dir))
-            gate_warnings, gate_summary = _evaluate_quality_gates(workflow, report)
+            gate_warnings, gate_summary = _evaluate_quality_gates(
+                workflow,
+                report,
+                reporting_parameters=reporting_parameters,
+            )
             report.warnings = _collect_warnings(report.warnings, gate_warnings)
             report.provenance["quality_gates"] = gate_summary
-            report.artifacts = artifacts
-            manifest_artifact = write_output_manifest(
-                report,
-                output_dir,
-                requested_formats=requested_formats,
+            report.provenance["bc_interface_completeness"] = summarize_bc_interface_rows(
+                [
+                    {
+                        "owner": item["owner"],
+                        "item": item["item"],
+                        "status": item["status"],
+                        "detail": item["detail"],
+                    }
+                    for item in evaluate_bc_interface_completeness(report)
+                ]
             )
-            report.artifacts.append(manifest_artifact)
-            write_json(report_path, report)
-            logger.info(f"Report written to '{report_path}'.")
+
+            validation_metrics = []
+            validation_step_params: dict[str, Any] = {}
+            if validate_step_indices:
+                validation_step_params = dict(step_records[validate_step_indices[0]].parameters)
+            if validate_step_indices or benchmark_step_indices:
+                validation_metrics, validation_payload, validation_warnings = (
+                    run_validation_summary(
+                        report,
+                        validate_parameters=validation_step_params,
+                    )
+                )
+                report.warnings = _collect_warnings(report.warnings, validation_warnings)
+                report.provenance["validation_summary"] = {
+                    "metric_count": validation_payload.get("metric_count", 0),
+                    "acceptance": validation_payload.get("acceptance", {}),
+                }
+            else:
+                validation_payload = {}
+
+            if validate_step_indices:
+                validation_path = output_dir / "json" / "validation_summary.json"
+                _write_json_payload(validation_path, validation_payload)
+                artifacts.append(
+                    OutputArtifact(
+                        kind="json",
+                        uri=str(validation_path),
+                        label="A4 validation summary",
+                        mime_type="application/json",
+                    )
+                )
+                acceptance = validation_payload.get("acceptance", {})
+                for idx in validate_step_indices:
+                    step_record = workflow.steps[idx]
+                    step_record.outputs = [
+                        "ValidationMetric[]",
+                        str(validation_path),
+                    ]
+                    step_record.warnings = _collect_warnings(
+                        step_record.warnings,
+                        [
+                            warning
+                            for warning in report.warnings
+                            if warning.startswith("Validation notice:")
+                        ],
+                    )
+                    if isinstance(acceptance, dict) and acceptance.get("all_passed") is False:
+                        step_record.status = "warning"
+
+            if benchmark_step_indices:
+                benchmark_step_params = dict(step_records[benchmark_step_indices[0]].parameters)
+                benchmark_result, benchmark_payload, benchmark_warnings = run_benchmark_summary(
+                    report,
+                    benchmark_parameters=benchmark_step_params,
+                    baseline_metrics=validation_metrics if validation_metrics else None,
+                )
+                report.benchmark = benchmark_result
+                report.warnings = _collect_warnings(report.warnings, benchmark_warnings)
+                benchmark_path = output_dir / "json" / "benchmark_report.json"
+                _write_json_payload(benchmark_path, benchmark_payload)
+                artifacts.append(
+                    OutputArtifact(
+                        kind="json",
+                        uri=str(benchmark_path),
+                        label="A4 benchmark report",
+                        mime_type="application/json",
+                    )
+                )
+                report.provenance["benchmark_summary"] = {
+                    "case_id": benchmark_payload.get("case_id", ""),
+                    "metric_count": benchmark_payload.get("metric_count", 0),
+                    "passed": benchmark_payload.get("passed", None),
+                    "acceptance": benchmark_payload.get("acceptance", {}),
+                }
+                for idx in benchmark_step_indices:
+                    step_record = workflow.steps[idx]
+                    step_record.outputs = [
+                        "BenchmarkResult",
+                        str(benchmark_path),
+                    ]
+                    step_record.warnings = _collect_warnings(
+                        step_record.warnings,
+                        benchmark_warnings,
+                    )
+                    if benchmark_result.passed is False:
+                        step_record.status = "warning"
+
             run_summary_path = output_dir / "run_summary.json"
             summary = RunSummary(
                 status="A2 baseline workflow completed.",
@@ -891,9 +1071,59 @@ class TEMAnalysisSkill:
                     "workflow_parameters_snapshot",
                     {},
                 ),
+                bc_interface_summary=report.provenance.get("bc_interface_completeness", {}),
             )
             _write_run_summary(run_summary_path, summary)
             logger.info(f"Run summary written to '{run_summary_path}'.")
+
+            _append_artifact_unique(
+                artifacts,
+                OutputArtifact(
+                    kind="log",
+                    uri=str(log_path),
+                    label="Run log",
+                    mime_type="application/x-ndjson",
+                ),
+            )
+            _append_artifact_unique(
+                artifacts,
+                OutputArtifact(
+                    kind="json",
+                    uri=str(run_summary_path),
+                    label="Run summary",
+                    mime_type="application/json",
+                    provenance={"sha256": _sha256_of_file(run_summary_path)},
+                ),
+            )
+            _append_artifact_unique(
+                artifacts,
+                OutputArtifact(
+                    kind="other",
+                    uri=str(workflow_used_path),
+                    label="Effective workflow recipe",
+                    mime_type="application/x-yaml",
+                    provenance={"sha256": _sha256_of_file(workflow_used_path)},
+                ),
+            )
+            _append_artifact_unique(
+                artifacts,
+                OutputArtifact(
+                    kind="json",
+                    uri=str(report_path),
+                    label="Analysis report",
+                    mime_type="application/json",
+                ),
+            )
+
+            report.artifacts = artifacts
+            manifest_artifact = write_output_manifest(
+                report,
+                output_dir,
+                requested_formats=requested_formats,
+            )
+            report.artifacts.append(manifest_artifact)
+            write_json(report_path, report)
+            logger.info(f"Report written to '{report_path}'.")
 
             return {
                 "status": summary.status,

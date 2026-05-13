@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from typing import TypedDict
+import csv
+import json
+from pathlib import Path
+from typing import Any, TypedDict
 
-from autotem.core import AnalysisReport
+from autotem.core import AnalysisReport, OutputArtifact, ReportTable
+from autotem.reporting.schema_models import InterfaceCompletenessContractModel
 
 
 class InterfaceCheck(TypedDict):
@@ -115,3 +119,104 @@ def evaluate_bc_interface_completeness(report: AnalysisReport) -> list[Interface
     )
 
     return checks
+
+
+def interface_check_rows(report: AnalysisReport) -> list[dict[str, str]]:
+    """Return normalized interface-check rows for CSV/JSON contract exports."""
+    rows: list[dict[str, str]] = []
+    for check in evaluate_bc_interface_completeness(report):
+        rows.append(
+            {
+                "owner": check["owner"],
+                "item": check["item"],
+                "status": check["status"],
+                "detail": check["detail"],
+            }
+        )
+    return rows
+
+
+def summarize_bc_interface_rows(rows: list[dict[str, str]]) -> dict[str, Any]:
+    """Summarize pass/missing counts for B/C interface checks."""
+    total = len(rows)
+    passed = sum(1 for row in rows if row["status"] == "pass")
+    missing = sum(1 for row in rows if row["status"] == "missing")
+    by_owner: dict[str, dict[str, int]] = {}
+    for row in rows:
+        owner = row["owner"]
+        bucket = by_owner.setdefault(owner, {"total": 0, "passed": 0, "missing": 0})
+        bucket["total"] += 1
+        if row["status"] == "pass":
+            bucket["passed"] += 1
+        else:
+            bucket["missing"] += 1
+    return {
+        "total": total,
+        "passed": passed,
+        "missing": missing,
+        "pass_rate": (passed / total) if total > 0 else 0.0,
+        "by_owner": by_owner,
+    }
+
+
+def export_bc_interface_contract_csv(
+    report: AnalysisReport,
+    output_dir: str | Path,
+) -> tuple[OutputArtifact, ReportTable]:
+    """Export B/C interface completeness contract table as CSV."""
+    output_dir = Path(output_dir)
+    tables_dir = output_dir / "tables"
+    path = tables_dir / "interface_completeness_bc.csv"
+    rows = interface_check_rows(report)
+    fieldnames = ["owner", "item", "status", "detail"]
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
+
+    artifact = OutputArtifact(
+        kind="table",
+        uri=str(path),
+        label="B/C Interface Completeness",
+        mime_type="text/csv",
+    )
+    table = ReportTable(
+        label="B/C Interface Completeness",
+        uri=str(path),
+        rows=rows,
+        table_type="interface_completeness_bc",
+    )
+    return artifact, table
+
+
+def export_bc_interface_contract_json(
+    report: AnalysisReport,
+    output_dir: str | Path,
+) -> OutputArtifact:
+    """Export B/C interface completeness contract payload as JSON."""
+    output_dir = Path(output_dir)
+    json_dir = output_dir / "json"
+    path = json_dir / "interface_completeness_bc.json"
+    rows = interface_check_rows(report)
+    summary = summarize_bc_interface_rows(rows)
+    payload = InterfaceCompletenessContractModel(
+        schema_version=report.schema_version,
+        summary={
+            "total": int(summary["total"]),
+            "passed": int(summary["passed"]),
+            "missing": int(summary["missing"]),
+            "pass_rate": float(summary["pass_rate"]),
+        },
+        checks=rows,
+    ).model_dump(mode="json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return OutputArtifact(
+        kind="json",
+        uri=str(path),
+        label="B/C interface completeness contract",
+        mime_type="application/json",
+    )

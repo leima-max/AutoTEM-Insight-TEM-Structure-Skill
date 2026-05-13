@@ -43,6 +43,8 @@ def test_a2_workflow_generates_report_with_diffraction(tmp_path: Path) -> None:
     assert summary.report_path == str(report_path)
     assert summary.warning_count >= 0
     assert summary.workflow_parameter_schema_version
+    assert isinstance(summary.bc_interface_summary, dict)
+    assert "pass_rate" in summary.bc_interface_summary
     workflow_used = yaml.safe_load(Path(result["workflow_used_path"]).read_text(encoding="utf-8"))
     assert (
         workflow_used["workflow"]["workflow_parameter_schema_version"]

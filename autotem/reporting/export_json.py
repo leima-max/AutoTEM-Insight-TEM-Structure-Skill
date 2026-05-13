@@ -8,6 +8,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from autotem.core import AnalysisReport, OutputArtifact
+from autotem.reporting.interface_contracts import export_bc_interface_contract_json
 from autotem.reporting.schema_models import ReportBundleSummaryModel
 
 
@@ -81,5 +82,6 @@ def export_json_bundle(report: AnalysisReport, output_dir: str | Path) -> list[O
             mime_type="application/json",
         )
     )
+    artifacts.append(export_bc_interface_contract_json(report, output_dir))
 
     return artifacts

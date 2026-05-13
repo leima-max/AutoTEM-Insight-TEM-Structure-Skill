@@ -28,6 +28,7 @@ STEP_ALIASES: dict[str, tuple[str, ...]] = {
 _SUPPORTED_OUTPUT_FORMATS = {"json", "csv", "html", "svg", "pdf"}
 _SUPPORTED_CALIBRATION_METHODS = {"auto", "metadata", "manual", "reference"}
 _SUPPORTED_PREPROCESS_RECIPES = {"auto", "min_max"}
+_SUPPORTED_ACCEPTANCE_OPS = {">=", "<=", ">", "<", "=="}
 
 
 class WorkflowOutputs(AutoTEMModel):
@@ -210,6 +211,54 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
                     "workflow.parameters.diffraction.candidate_phases must be a non-empty "
                     "string list."
                 )
+
+    def _validate_acceptance_criteria(
+        value: Any,
+        *,
+        field_name: str,
+    ) -> None:
+        if value is None:
+            return
+        if not isinstance(value, list):
+            raise ValueError(f"{field_name} must be a list when provided.")
+        for idx, row in enumerate(value):
+            if not isinstance(row, dict):
+                raise ValueError(f"{field_name}[{idx}] must be a mapping.")
+            metric = row.get("metric")
+            threshold = row.get("threshold")
+            op = row.get("op")
+            if not isinstance(metric, str) or not metric.strip():
+                raise ValueError(f"{field_name}[{idx}].metric must be a non-empty string.")
+            if not isinstance(threshold, (int, float)):
+                raise ValueError(f"{field_name}[{idx}].threshold must be numeric.")
+            if not isinstance(op, str) or op not in _SUPPORTED_ACCEPTANCE_OPS:
+                raise ValueError(
+                    f"{field_name}[{idx}].op must be one of {sorted(_SUPPORTED_ACCEPTANCE_OPS)}."
+                )
+
+    validation = params.get("validation")
+    if validation is not None:
+        if not isinstance(validation, dict):
+            raise ValueError("workflow.parameters.validation must be a mapping.")
+        _validate_acceptance_criteria(
+            validation.get("acceptance_criteria"),
+            field_name="workflow.parameters.validation.acceptance_criteria",
+        )
+
+    benchmark = params.get("benchmark")
+    if benchmark is not None:
+        if not isinstance(benchmark, dict):
+            raise ValueError("workflow.parameters.benchmark must be a mapping.")
+        case_id = benchmark.get("case_id")
+        if case_id is not None and (not isinstance(case_id, str) or not case_id.strip()):
+            raise ValueError("workflow.parameters.benchmark.case_id must be a non-empty string.")
+        reference = benchmark.get("reference")
+        if reference is not None and not isinstance(reference, dict):
+            raise ValueError("workflow.parameters.benchmark.reference must be a mapping.")
+        _validate_acceptance_criteria(
+            benchmark.get("acceptance_criteria"),
+            field_name="workflow.parameters.benchmark.acceptance_criteria",
+        )
 
     return params
 

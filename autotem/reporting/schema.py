@@ -13,7 +13,11 @@ from autotem.reporting.schema_models import reporting_contract_schemas
 def reporting_schema_manifest() -> dict[str, Any]:
     return {
         "schema_version": CURRENT_SCHEMA_VERSION,
-        "models": ["ReportBundleSummary", "OutputManifest"],
+        "models": [
+            "ReportBundleSummary",
+            "OutputManifest",
+            "InterfaceCompletenessContract",
+        ],
     }
 
 

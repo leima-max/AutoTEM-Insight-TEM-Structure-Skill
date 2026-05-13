@@ -6,6 +6,7 @@ import csv
 from pathlib import Path
 
 from autotem.core import AnalysisReport, OutputArtifact, ReportTable
+from autotem.reporting.interface_contracts import export_bc_interface_contract_csv
 
 
 def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, object]]) -> None:
@@ -197,4 +198,8 @@ def export_csv_tables_with_models(
             table_type="warnings",
         )
     )
+
+    interface_artifact, interface_table = export_bc_interface_contract_csv(report, output_dir)
+    artifacts.append(interface_artifact)
+    report_tables.append(interface_table)
     return artifacts, report_tables
