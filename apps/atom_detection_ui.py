@@ -14,6 +14,7 @@ from scipy import ndimage as ndi
 from streamlit_drawable_canvas import st_canvas
 
 from autotem.atomic.atom_detection import _load_image, _normalize_image, detect_atoms
+from autotem.atomic.distance_statistics import compute_distance_statistics
 from autotem.atomic.gaussian_refinement import refine_atom_coordinates
 from autotem.atomic.lattice_constraint import apply_lattice_constraint
 
@@ -125,6 +126,24 @@ def _coordinates_csv(coords: np.ndarray, intensities: np.ndarray) -> str:
     buffer.write("y,x,intensity\n")
     for (y, x), v in zip(coords, intensities, strict=False):
         buffer.write(f"{float(y):.6f},{float(x):.6f},{float(v):.6f}\n")
+    return buffer.getvalue()
+
+
+def _distance_csv(
+    coords: np.ndarray,
+    nearest: np.ndarray,
+    next_nearest: np.ndarray,
+    unit: str,
+) -> str:
+    buffer = io.StringIO()
+    buffer.write(f"unit,{unit}\n")
+    buffer.write("atom_index,y,x,nearest_distance,next_nearest_distance\n")
+    for idx, ((y, x), nn, nnn) in enumerate(
+        zip(coords, nearest, next_nearest, strict=False)
+    ):
+        nn_text = "" if not np.isfinite(nn) else f"{float(nn):.6f}"
+        nnn_text = "" if not np.isfinite(nnn) else f"{float(nnn):.6f}"
+        buffer.write(f"{idx},{float(y):.6f},{float(x):.6f},{nn_text},{nnn_text}\n")
     return buffer.getvalue()
 
 
@@ -314,6 +333,28 @@ with st.sidebar:
         "Lattice max shift/iter (px)", min_value=0.1, max_value=2.0, value=0.6, step=0.1
     )
 
+    st.divider()
+    st.subheader("Distance Statistics")
+    use_physical_unit = st.checkbox(
+        "Convert distance to physical unit",
+        value=False,
+        help="If enabled, distance output will be scaled by pixel size.",
+    )
+    pixel_size = st.number_input(
+        "Pixel size",
+        min_value=1e-6,
+        value=0.02,
+        step=0.001,
+        format="%.6f",
+        disabled=not use_physical_unit,
+    )
+    distance_unit = st.selectbox(
+        "Distance unit",
+        ["nm", "angstrom", "pm", "um"],
+        index=0,
+        disabled=not use_physical_unit,
+    )
+
 uploaded = st.file_uploader("Upload TEM image", type=["dm", "dm3", "dm4", "tif", "tiff"])
 manual_run = st.button("Run Detection", type="primary", disabled=uploaded is None)
 
@@ -355,6 +396,9 @@ params = {
     "lattice_max_shift_per_iter": float(lattice_max_shift_per_iter),
     "fast_mode_realtime": bool(fast_mode_realtime),
     "fast_gaussian_max_points": int(fast_gaussian_max_points),
+    "use_physical_unit": bool(use_physical_unit),
+    "pixel_size": float(pixel_size),
+    "distance_unit": str(distance_unit),
 }
 
 sig = _signature(current_file_sig, params)
@@ -490,6 +534,12 @@ intensities = np.asarray(st.session_state.edited_intensities, dtype=np.float64)
 raw = np.asarray(st.session_state.base_image_raw, dtype=np.float64)
 norm = np.asarray(st.session_state.base_image_norm, dtype=np.float64)
 roi_mask = st.session_state.roi_mask
+
+distance_stats = compute_distance_statistics(
+    coords,
+    pixel_size=params["pixel_size"] if params["use_physical_unit"] else None,
+    output_unit=params["distance_unit"] if params["use_physical_unit"] else None,
+)
 
 st.subheader("Direct Image Interaction")
 tool = st.radio(
@@ -697,6 +747,28 @@ with right:
     st.write("Method:", result.method)
     st.write("Parameters:", result.parameters)
     st.write("Provenance:", result.provenance)
+    st.write("Distance unit:", distance_stats.unit)
+    st.write(
+        "Nearest-neighbor summary:",
+        {
+            "count": int(distance_stats.nearest_summary["count"]),
+            "mean": distance_stats.nearest_summary["mean"],
+            "median": distance_stats.nearest_summary["median"],
+            "std": distance_stats.nearest_summary["std"],
+        },
+    )
+    st.write(
+        "Next-nearest summary:",
+        {
+            "count": int(distance_stats.next_nearest_summary["count"]),
+            "mean": distance_stats.next_nearest_summary["mean"],
+            "median": distance_stats.next_nearest_summary["median"],
+            "std": distance_stats.next_nearest_summary["std"],
+        },
+    )
+    if distance_stats.warnings:
+        summary = _warning_summary_lines(distance_stats.warnings)
+        st.warning("\n".join(summary))
     if result.warnings:
         summary = _warning_summary_lines(result.warnings)
         st.warning("\n".join(summary))
@@ -718,5 +790,18 @@ st.download_button(
     label="Download edited coordinates CSV",
     data=csv_text.encode("utf-8"),
     file_name=f"{Path(uploaded.name).stem}_atom_coordinates_edited.csv",
+    mime="text/csv",
+)
+
+distance_csv_text = _distance_csv(
+    coords=coords,
+    nearest=distance_stats.nearest_distances,
+    next_nearest=distance_stats.next_nearest_distances,
+    unit=distance_stats.unit,
+)
+st.download_button(
+    label="Download distance statistics CSV",
+    data=distance_csv_text.encode("utf-8"),
+    file_name=f"{Path(uploaded.name).stem}_atom_distance_statistics.csv",
     mime="text/csv",
 )
