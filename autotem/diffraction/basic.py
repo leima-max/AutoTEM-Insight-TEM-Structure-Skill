@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy import ndimage as ndi
 
 from autotem.core import (
     ArrayReference,
@@ -57,28 +58,117 @@ def _detect_peaks(
     top_k: int = 24,
     min_distance: float = 3.0,
     center_exclusion_radius: float = 3.0,
-) -> list[tuple[int, int, float]]:
+    threshold: float = 0.0,
+) -> list[tuple[float, float, float]]:
     if magnitude.size == 0:
         return []
-    flat = magnitude.ravel()
-    k = min(top_k * 4, flat.size)
-    idx = np.argpartition(flat, -k)[-k:]
-    sorted_idx = idx[np.argsort(flat[idx])[::-1]]
+
+    local_max = magnitude >= ndi.maximum_filter(magnitude, size=3, mode="nearest")
+    candidate_mask = local_max & (magnitude >= float(threshold))
+    candidate_idx = np.argwhere(candidate_mask)
+    if candidate_idx.size == 0:
+        return []
+
+    candidate_values = magnitude[candidate_mask]
+    sort_order = np.argsort(candidate_values)[::-1]
+    sorted_idx = candidate_idx[sort_order]
     h, w = magnitude.shape
     cy, cx = h // 2, w // 2
 
-    selected: list[tuple[int, int, float]] = []
-    for flat_index in sorted_idx:
-        y, x = np.unravel_index(int(flat_index), magnitude.shape)
+    selected: list[tuple[float, float, float]] = []
+    for yx in sorted_idx:
+        y = int(yx[0])
+        x = int(yx[1])
         if np.hypot(y - cy, x - cx) < center_exclusion_radius:
             continue
         intensity = float(magnitude[y, x])
         if any(np.hypot(y - py, x - px) < min_distance for py, px, _ in selected):
             continue
-        selected.append((int(y), int(x), intensity))
+        selected.append((float(y), float(x), intensity))
         if len(selected) >= top_k:
             break
     return selected
+
+
+def _compute_peak_threshold(
+    magnitude: np.ndarray,
+    *,
+    strategy: str,
+    value: float | None,
+) -> float:
+    flat = magnitude.ravel().astype(np.float64)
+    if flat.size == 0:
+        return 0.0
+    median = float(np.median(flat))
+    mad = float(np.median(np.abs(flat - median))) * 1.4826
+    mean = float(np.mean(flat))
+    std = float(np.std(flat))
+    max_val = float(np.max(flat))
+    quantile_995 = float(np.quantile(flat, 0.995))
+
+    strategy_key = strategy.lower().strip()
+    if strategy_key == "quantile":
+        q = 0.995 if value is None else float(value)
+        q = min(0.999999, max(0.0, q))
+        return float(np.quantile(flat, q))
+    if strategy_key == "std":
+        z = 3.0 if value is None else float(value)
+        z = max(0.0, z)
+        return mean + z * std
+    if strategy_key == "relative_max":
+        r = 0.2 if value is None else float(value)
+        r = min(1.0, max(0.0, r))
+        return r * max_val
+    if strategy_key == "mad":
+        k = 6.0 if value is None else float(value)
+        k = max(0.0, k)
+        return median + k * mad
+
+    # "auto" and any unknown value fallback:
+    # use the stricter of high quantile and robust MAD threshold,
+    # but keep threshold reachable in the current FFT magnitude range.
+    return min(max_val, max(quantile_995, median + 6.0 * mad))
+
+
+def _refine_peak_subpixel(
+    magnitude: np.ndarray,
+    *,
+    y: float,
+    x: float,
+    window_radius: int = 2,
+    max_shift: float = 1.5,
+) -> tuple[float, float]:
+    yi = int(round(y))
+    xi = int(round(x))
+    h, w = magnitude.shape
+    y0 = max(0, yi - window_radius)
+    y1 = min(h, yi + window_radius + 1)
+    x0 = max(0, xi - window_radius)
+    x1 = min(w, xi + window_radius + 1)
+    patch = magnitude[y0:y1, x0:x1]
+    if patch.size == 0:
+        return y, x
+
+    weights = patch.astype(np.float64)
+    min_val = float(np.min(weights))
+    weights = weights - min_val
+    if np.all(weights <= 0):
+        return y, x
+    weights += 1e-9
+
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    denom = float(np.sum(weights))
+    y_refined = float(np.sum(yy * weights) / denom)
+    x_refined = float(np.sum(xx * weights) / denom)
+
+    dy = y_refined - y
+    dx = x_refined - x
+    shift = float(np.hypot(dy, dx))
+    if shift > max_shift and shift > 1e-9:
+        scale = max_shift / shift
+        y_refined = y + dy * scale
+        x_refined = x + dx * scale
+    return y_refined, x_refined
 
 
 def _make_index(dx: float, dy: float) -> tuple[int, int, int]:
@@ -86,6 +176,87 @@ def _make_index(dx: float, dy: float) -> tuple[int, int, int]:
     h = int(np.rint(dx / denom * 4))
     k = int(np.rint(dy / denom * 4))
     return h, k, 0
+
+
+def _select_basis_indices(
+    gxy: list[tuple[float, float]],
+    intensities: list[float],
+) -> tuple[int, int] | None:
+    if len(gxy) < 2:
+        return None
+    ranked = sorted(
+        range(len(gxy)),
+        key=lambda idx: float(intensities[idx]),
+        reverse=True,
+    )[: min(12, len(gxy))]
+
+    best_pair: tuple[int, int] | None = None
+    best_score = -np.inf
+    for i in range(len(ranked)):
+        for j in range(i + 1, len(ranked)):
+            idx1 = ranked[i]
+            idx2 = ranked[j]
+            v1 = np.array(gxy[idx1], dtype=np.float64)
+            v2 = np.array(gxy[idx2], dtype=np.float64)
+            n1 = float(np.linalg.norm(v1))
+            n2 = float(np.linalg.norm(v2))
+            if n1 <= 1e-9 or n2 <= 1e-9:
+                continue
+            cosang = float(np.dot(v1, v2) / (n1 * n2))
+            cosang = max(-1.0, min(1.0, cosang))
+            angle = float(np.arccos(cosang))
+            if angle < np.deg2rad(10.0) or angle > np.deg2rad(170.0):
+                continue
+            bmat = np.column_stack((v1, v2))
+            cond = float(np.linalg.cond(bmat))
+            if not np.isfinite(cond) or cond > 1000:
+                continue
+            score = float(np.sin(angle) * np.sqrt(n1 * n2) / (1.0 + 0.02 * cond))
+            if score > best_score:
+                best_score = score
+                best_pair = (idx1, idx2)
+    return best_pair
+
+
+def _index_spots_with_lattice_fit(
+    gxy: list[tuple[float, float]],
+    intensities: list[float],
+) -> tuple[list[tuple[int, int, int, float, float]], dict[str, Any]]:
+    basis_pair = _select_basis_indices(gxy, intensities)
+    if basis_pair is None:
+        return [], {"indexing_method": "lattice_fit_fallback"}
+
+    i1, i2 = basis_pair
+    basis_1 = np.array(gxy[i1], dtype=np.float64)
+    basis_2 = np.array(gxy[i2], dtype=np.float64)
+    bmat = np.column_stack((basis_1, basis_2))
+    basis_scale = max(float(np.linalg.norm(basis_1)), float(np.linalg.norm(basis_2)), 1e-9)
+
+    indexed: list[tuple[int, int, int, float, float]] = []
+    for gx, gy in gxy:
+        gvec = np.array([gx, gy], dtype=np.float64)
+        coeff = np.linalg.solve(bmat, gvec)
+        rounded = np.rint(coeff)
+        h = int(rounded[0])
+        k = int(rounded[1])
+        recon = bmat @ rounded
+        residual = float(np.linalg.norm(gvec - recon))
+        coeff_err = float(np.linalg.norm(coeff - rounded))
+        confidence = float(
+            np.exp(-residual / (0.12 * basis_scale + 1e-9)) * np.exp(-coeff_err / 0.5)
+        )
+        confidence = max(0.05, min(0.95, confidence))
+        indexed.append((h, k, 0, residual, confidence))
+
+    metadata = {
+        "indexing_method": "lattice_fit",
+        "basis_indices": [i1, i2],
+        "basis_vectors_1_per_nm": {
+            "g1": [float(basis_1[0]), float(basis_1[1])],
+            "g2": [float(basis_2[0]), float(basis_2[1])],
+        },
+    }
+    return indexed, metadata
 
 
 def _phase_candidates_from_d_spacings(
@@ -150,16 +321,31 @@ def run_diffraction_analysis(
     top_k = int(parameters.get("top_k_peaks", 24))
     min_peak_distance = float(parameters.get("min_peak_distance", 3.0))
     center_exclusion_radius = float(parameters.get("center_exclusion_radius", 3.0))
+    indexing_mode = str(parameters.get("indexing_mode", "auto")).strip().lower()
+    peak_threshold_strategy = str(parameters.get("peak_threshold_strategy", "auto"))
+    peak_threshold_value_raw = parameters.get("peak_threshold_value")
+    peak_threshold_value = (
+        None if peak_threshold_value_raw is None else float(peak_threshold_value_raw)
+    )
+    subpixel_refine = bool(parameters.get("subpixel_refine", True))
+    subpixel_window_radius = int(parameters.get("subpixel_window_radius", 2))
+    subpixel_max_shift = float(parameters.get("subpixel_max_shift", 1.5))
     phase_top_n = int(parameters.get("phase_top_n", 3))
     candidate_phases_raw = parameters.get("candidate_phases")
     allowed_phase_names = None
     if isinstance(candidate_phases_raw, list):
         allowed_phase_names = {str(item) for item in candidate_phases_raw}
+    peak_threshold = _compute_peak_threshold(
+        magnitude,
+        strategy=peak_threshold_strategy,
+        value=peak_threshold_value,
+    )
     peak_triplets = _detect_peaks(
         magnitude,
         top_k=max(1, top_k),
         min_distance=max(0.0, min_peak_distance),
         center_exclusion_radius=max(0.0, center_exclusion_radius),
+        threshold=peak_threshold,
     )
 
     h, w = magnitude.shape
@@ -210,13 +396,36 @@ def run_diffraction_analysis(
     g_vectors: list[GVector] = []
     d_spacings: list[Measurement] = []
     indexed_spots: list[IndexedSpot] = []
+    gxy: list[tuple[float, float]] = []
+    peak_intensities: list[float] = []
+    d_by_peak: list[Measurement | None] = []
 
     for i, (y, x, intensity) in enumerate(peak_triplets):
-        peaks.append(DiffractionPeak(x=float(x), y=float(y), intensity=intensity, confidence=0.65))
-        dx = float(x - cx)
-        dy = float(y - cy)
+        y_refined = float(y)
+        x_refined = float(x)
+        if subpixel_refine:
+            y_refined, x_refined = _refine_peak_subpixel(
+                magnitude,
+                y=y_refined,
+                x=x_refined,
+                window_radius=max(1, subpixel_window_radius),
+                max_shift=max(0.0, subpixel_max_shift),
+            )
+        peak_conf = 0.75 if subpixel_refine else 0.65
+        peaks.append(
+            DiffractionPeak(
+                x=float(x_refined),
+                y=float(y_refined),
+                intensity=intensity,
+                confidence=peak_conf,
+            )
+        )
+        peak_intensities.append(float(intensity))
+        dx = float(x_refined - cx)
+        dy = float(y_refined - cy)
         gx_val = dx * reciprocal_scale
         gy_val = dy * reciprocal_scale
+        gxy.append((gx_val, gy_val))
         g_mag = float(np.hypot(gx_val, gy_val))
         g_mag_uncertainty = None
         if reciprocal_scale_uncertainty is not None:
@@ -237,6 +446,7 @@ def run_diffraction_analysis(
                 source_peak_index=i,
             )
         )
+        d_measurement: Measurement | None = None
         if g_mag > 1e-8:
             d_spacing_nm = 1.0 / g_mag
             d_uncertainty = None
@@ -249,6 +459,39 @@ def run_diffraction_analysis(
                 uncertainty=d_uncertainty,
             )
             d_spacings.append(d_measurement)
+        d_by_peak.append(d_measurement)
+
+    indexed_by_lattice: list[tuple[int, int, int, float, float]] = []
+    indexing_meta: dict[str, Any] = {"indexing_method": "baseline"}
+    if indexing_mode in {"auto", "lattice_fit"}:
+        indexed_by_lattice, indexing_meta = _index_spots_with_lattice_fit(gxy, peak_intensities)
+        if not indexed_by_lattice and indexing_mode == "lattice_fit":
+            warnings.append(
+                "Lattice-fit indexing requested but basis selection failed; fallback to baseline."
+            )
+
+    for i, peak in enumerate(peaks):
+        d_measurement = d_by_peak[i] if i < len(d_by_peak) else None
+        if indexed_by_lattice:
+            h, k, ell, residual, conf = indexed_by_lattice[i]
+            indexed_spots.append(
+                IndexedSpot(
+                    peak_index=i,
+                    h=h,
+                    k=k,
+                    l=ell,
+                    d_spacing=d_measurement,
+                    error=Measurement(
+                        value=residual,
+                        unit="1/nm",
+                        method="lattice_fit_residual",
+                    ),
+                    confidence=conf,
+                )
+            )
+        else:
+            dx = float(peak.x - cx)
+            dy = float(peak.y - cy)
             hkl = _make_index(dx, dy)
             indexed_spots.append(
                 IndexedSpot(
@@ -298,6 +541,13 @@ def run_diffraction_analysis(
                 "top_k_peaks": max(1, top_k),
                 "min_peak_distance": max(0.0, min_peak_distance),
                 "center_exclusion_radius": max(0.0, center_exclusion_radius),
+                "indexing_mode": indexing_mode,
+                "peak_threshold_strategy": peak_threshold_strategy,
+                "peak_threshold_value": peak_threshold_value,
+                "peak_threshold_used": peak_threshold,
+                "subpixel_refine": subpixel_refine,
+                "subpixel_window_radius": max(1, subpixel_window_radius),
+                "subpixel_max_shift": max(0.0, subpixel_max_shift),
                 "phase_top_n": phase_top_n,
                 "candidate_phases": (
                     sorted(allowed_phase_names) if allowed_phase_names is not None else None
@@ -305,5 +555,6 @@ def run_diffraction_analysis(
             },
             "calibration_scale_source": reciprocal_scale_source,
             "calibration_scale_inv_nm_per_px": reciprocal_scale,
+            "indexing": indexing_meta,
         },
     )
