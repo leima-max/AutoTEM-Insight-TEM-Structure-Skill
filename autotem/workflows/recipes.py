@@ -28,7 +28,9 @@ STEP_ALIASES: dict[str, tuple[str, ...]] = {
 }
 _SUPPORTED_OUTPUT_FORMATS = {"json", "csv", "html", "svg", "pdf"}
 _SUPPORTED_CALIBRATION_METHODS = {"auto", "metadata", "manual", "reference"}
-_SUPPORTED_PREPROCESS_RECIPES = {"auto", "min_max"}
+_SUPPORTED_PREPROCESS_RECIPES = {"auto", "min_max", "b2_fft"}
+_SUPPORTED_PEAK_THRESHOLD_STRATEGIES = {"auto", "quantile", "std", "relative_max", "mad"}
+_SUPPORTED_INDEXING_MODES = {"auto", "baseline", "lattice_fit"}
 _SUPPORTED_ACCEPTANCE_OPS = {">=", "<=", ">", "<", "=="}
 _QUALITY_THRESHOLD_RANGE_01_KEYS = {
     "blur_risk_max",
@@ -328,6 +330,22 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
                     "workflow.parameters.preprocessing clip percentiles must satisfy "
                     "0 <= low < high <= 100."
                 )
+        if "denoise_sigma" in preprocessing:
+            denoise_sigma = _as_float(
+                preprocessing["denoise_sigma"],
+                field_name="preprocessing.denoise_sigma",
+            )
+            if denoise_sigma < 0:
+                raise ValueError("workflow.parameters.preprocessing.denoise_sigma must be >= 0.")
+        if "background_sigma" in preprocessing:
+            background_sigma = _as_float(
+                preprocessing["background_sigma"],
+                field_name="preprocessing.background_sigma",
+            )
+            if background_sigma < 0:
+                raise ValueError(
+                    "workflow.parameters.preprocessing.background_sigma must be >= 0."
+                )
 
     diffraction = params.get("diffraction")
     if diffraction is not None:
@@ -370,6 +388,45 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(
                     "workflow.parameters.diffraction.candidate_phases must be a non-empty "
                     "string list."
+                )
+        if "indexing_mode" in diffraction:
+            indexing_mode = str(diffraction["indexing_mode"]).strip().lower()
+            if indexing_mode not in _SUPPORTED_INDEXING_MODES:
+                raise ValueError(
+                    "workflow.parameters.diffraction.indexing_mode must be one of "
+                    f"{sorted(_SUPPORTED_INDEXING_MODES)}."
+                )
+        if "peak_threshold_strategy" in diffraction:
+            strategy = str(diffraction["peak_threshold_strategy"]).strip().lower()
+            if strategy not in _SUPPORTED_PEAK_THRESHOLD_STRATEGIES:
+                raise ValueError(
+                    "workflow.parameters.diffraction.peak_threshold_strategy must be one of "
+                    f"{sorted(_SUPPORTED_PEAK_THRESHOLD_STRATEGIES)}."
+                )
+        if "peak_threshold_value" in diffraction:
+            _as_float(
+                diffraction["peak_threshold_value"],
+                field_name="diffraction.peak_threshold_value",
+            )
+        if "subpixel_window_radius" in diffraction:
+            radius = int(
+                _as_float(
+                    diffraction["subpixel_window_radius"],
+                    field_name="diffraction.subpixel_window_radius",
+                )
+            )
+            if radius < 1:
+                raise ValueError(
+                    "workflow.parameters.diffraction.subpixel_window_radius must be >= 1."
+                )
+        if "subpixel_max_shift" in diffraction:
+            max_shift = _as_float(
+                diffraction["subpixel_max_shift"],
+                field_name="diffraction.subpixel_max_shift",
+            )
+            if max_shift < 0:
+                raise ValueError(
+                    "workflow.parameters.diffraction.subpixel_max_shift must be >= 0."
                 )
 
     def _validate_acceptance_criteria(

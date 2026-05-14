@@ -191,6 +191,50 @@ def test_a2_workflow_applies_workflow_parameters(tmp_path: Path) -> None:
         assert report.diffraction.phase_candidates[0].name == "Gold"
 
 
+def test_a2_workflow_b2_preprocess_recipe_applies_denoise_and_background(tmp_path: Path) -> None:
+    image = np.zeros((64, 64), dtype=np.float32)
+    image[30:34, 30:34] = 10.0
+    image += np.random.default_rng(7).normal(0.0, 0.2, size=image.shape).astype(np.float32)
+    input_path = tmp_path / "b2_preprocess.npy"
+    np.save(input_path, image)
+
+    workflow_path = tmp_path / "workflow_b2_preprocess.yaml"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: b2_preprocess_test",
+                "  steps:",
+                "    - load",
+                "    - assess_quality",
+                "    - calibrate",
+                "    - preprocess",
+                "    - analyze",
+                "    - report",
+                "  parameters:",
+                "    preprocessing:",
+                "      recipe: b2_fft",
+                "      denoise_sigma: 1.2",
+                "      background_sigma: 10.0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = TEMAnalysisSkill().run(
+        input_path=input_path,
+        workflow_path=workflow_path,
+        output_dir=tmp_path / "outputs",
+    )
+    report = read_json(Path(result["report_path"]), AnalysisReport)
+
+    assert report.preprocessing is not None
+    ops = report.preprocessing.operations
+    assert any(op.startswith("gaussian_denoise(") for op in ops)
+    assert any(op.startswith("background_subtract_gaussian(") for op in ops)
+    assert "min_max_normalize" in ops
+
+
 def test_a2_workflow_exports_csv_and_html_when_requested(tmp_path: Path) -> None:
     image = np.zeros((32, 32), dtype=np.float32)
     image[10, 16] = 6.0
@@ -299,6 +343,67 @@ def test_workflow_recipe_rejects_invalid_parameters(tmp_path: Path) -> None:
                 "      clip_percentile_high: 5",
                 "outputs:",
                 "  formats: [json]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_workflow_recipe(workflow_path)
+
+
+def test_workflow_recipe_rejects_negative_preprocess_sigmas(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "invalid_preprocess_sigma.yaml"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: invalid_preprocess_sigma",
+                "  steps: [load, assess_quality, calibrate, preprocess, analyze, report]",
+                "  parameters:",
+                "    preprocessing:",
+                "      recipe: b2_fft",
+                "      denoise_sigma: -1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_workflow_recipe(workflow_path)
+
+
+def test_workflow_recipe_rejects_invalid_peak_threshold_strategy(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "invalid_peak_threshold_strategy.yaml"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: invalid_peak_threshold_strategy",
+                "  steps: [load, assess_quality, calibrate, preprocess, analyze, report]",
+                "  parameters:",
+                "    diffraction:",
+                "      peak_threshold_strategy: unknown_strategy",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_workflow_recipe(workflow_path)
+
+
+def test_workflow_recipe_rejects_invalid_indexing_mode(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "invalid_indexing_mode.yaml"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: invalid_indexing_mode",
+                "  steps: [load, assess_quality, calibrate, preprocess, analyze, report]",
+                "  parameters:",
+                "    diffraction:",
+                "      indexing_mode: impossible_mode",
             ]
         ),
         encoding="utf-8",

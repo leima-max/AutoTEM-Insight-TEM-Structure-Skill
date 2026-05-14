@@ -93,13 +93,21 @@ workflow:
       measured_radius_uncertainty_px: 0.25
       detector_pixel_size_um: 15.0
     preprocessing:
-      recipe: min_max
+      recipe: b2_fft
       clip_percentile_low: 1.0
       clip_percentile_high: 99.0
+      denoise_sigma: 1.0
+      background_sigma: 12.0
     diffraction:
       top_k_peaks: 24
       min_peak_distance: 3.0
       center_exclusion_radius: 3.0
+      indexing_mode: auto
+      peak_threshold_strategy: auto
+      peak_threshold_value: 0.995
+      subpixel_refine: true
+      subpixel_window_radius: 2
+      subpixel_max_shift: 1.5
       phase_top_n: 3
       candidate_phases: [Gold, Silicon]
 outputs:
@@ -225,6 +233,24 @@ UI supports:
 - CSV export of edited atom coordinates
 - subpixel refinement (`gaussian` / `com`) with displacement summary
 - optional lattice-constraint correction (can be disabled for defect/GPA workflows)
+
+## Local UI (B2 Diffraction / FFT)
+
+Run a parameter-tuning UI for B2 diffraction testing:
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run apps\b2_diffraction_ui.py
+```
+
+UI supports:
+
+- upload `npy/tif/tiff/png/jpg/dm3/dm4/mrc/h5` and other baseline reader formats
+- built-in demo sample generation for quick smoke testing
+- calibration controls (`pixel_size_nm`, `voltage_kv`)
+- preprocess controls (recipe + optional percentile clipping)
+- diffraction controls (`top_k_peaks`, `min_peak_distance`, `center_exclusion_radius`)
+- phase candidate filtering and `phase_top_n`
+- FFT peak overlay visualization and CSV export for peaks/phase candidates
 
 ## C0 Contract Alignment
 

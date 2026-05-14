@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+from scipy import ndimage as ndi
 
 from autotem.core import (
     ArrayReference,
@@ -65,10 +66,36 @@ def preprocess_dataset(
             working = np.clip(working, lo_clip, hi_clip)
             operations.append(f"clip_percentile({lo_pct},{hi_pct})")
 
-    if recipe not in {"auto", "min_max"}:
+    if recipe not in {"auto", "min_max", "b2_fft"}:
         warnings.append(
             f"Unsupported preprocess recipe '{recipe}'; fallback to min-max normalization."
         )
+
+    # B2 extension: deterministic denoise + background subtraction.
+    apply_b2_ops = recipe == "b2_fft"
+    denoise_sigma_raw = parameters.get("denoise_sigma")
+    background_sigma_raw = parameters.get("background_sigma")
+    if denoise_sigma_raw is not None or background_sigma_raw is not None:
+        apply_b2_ops = True
+
+    if apply_b2_ops:
+        denoise_sigma = 1.0 if denoise_sigma_raw is None else float(denoise_sigma_raw)
+        background_sigma = (
+            12.0 if background_sigma_raw is None else float(background_sigma_raw)
+        )
+
+        if denoise_sigma > 0:
+            working = ndi.gaussian_filter(working, sigma=denoise_sigma).astype(np.float32)
+            operations.append(f"gaussian_denoise(sigma={denoise_sigma:.3f})")
+        else:
+            warnings.append("denoise_sigma <= 0; denoise step skipped.")
+
+        if background_sigma > 0:
+            background = ndi.gaussian_filter(working, sigma=background_sigma).astype(np.float32)
+            working = (working - background).astype(np.float32)
+            operations.append(f"background_subtract_gaussian(sigma={background_sigma:.3f})")
+        else:
+            warnings.append("background_sigma <= 0; background subtraction skipped.")
 
     lo = float(np.min(working))
     hi = float(np.max(working))
