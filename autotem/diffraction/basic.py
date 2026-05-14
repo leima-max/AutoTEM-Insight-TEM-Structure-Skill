@@ -125,8 +125,9 @@ def _compute_peak_threshold(
         return median + k * mad
 
     # "auto" and any unknown value fallback:
-    # use the stricter of high quantile and robust MAD threshold.
-    return max(quantile_995, median + 6.0 * mad)
+    # use the stricter of high quantile and robust MAD threshold,
+    # but keep threshold reachable in the current FFT magnitude range.
+    return min(max_val, max(quantile_995, median + 6.0 * mad))
 
 
 def _refine_peak_subpixel(
