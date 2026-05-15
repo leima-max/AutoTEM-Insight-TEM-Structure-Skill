@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,16 @@ from streamlit_drawable_canvas import st_canvas
 
 from autotem.calibration import calibrate_dataset
 from autotem.diffraction import run_diffraction_analysis
+from autotem.diffraction.phase_lookup import lookup_phase_candidates
+from autotem.diffraction.phase_mvp import (
+    PhaseEntry,
+    load_cif_phase_entries,
+    match_candidates,
+    plot_annotated_fft,
+    plot_atom_projection,
+    plot_experimental_vs_simulated_overlay,
+    plot_simulated_diffraction,
+)
 from autotem.io import load_tem_dataset, read_image
 from autotem.preprocessing import assess_quality, preprocess_dataset
 
@@ -37,12 +48,83 @@ if not hasattr(st_image, "image_to_url"):
     st_image.image_to_url = _image_to_url_compat
 
 PHASE_OPTIONS = ["Silicon", "Gold", "Graphite", "Titanium Dioxide"]
+FFT_DETECTOR_BUILD_TAG = "b2_fft_peak_v2_2026-05-15"
 PHASE_REFERENCE_DB: list[tuple[str, str, str, tuple[float, ...]]] = [
     ("Silicon", "Si", "mp-149", (0.313, 0.192, 0.163, 0.136)),
     ("Gold", "Au", "mp-81", (0.235, 0.204, 0.144, 0.123)),
     ("Graphite", "C", "mp-48", (0.335, 0.213, 0.168, 0.142)),
     ("Titanium Dioxide", "TiO2", "mp-2657", (0.325, 0.249, 0.190, 0.169)),
 ]
+
+INDEXING_MODE_LABELS: dict[str, str] = {
+    "auto": "auto (auto select)",
+    "lattice_fit": "lattice_fit (vector lattice fit)",
+    "baseline": "baseline (basic indexing)",
+    "b4_mvp": "b4_mvp (lattice-parameter calibration)",
+    "b4_strict": "b4_strict (CIF-model calibration)",
+}
+
+INDEXING_MODE_HINTS: dict[str, str] = {
+    "auto": "Automatically choose baseline or lattice-fit for quick exploration.",
+    "lattice_fit": "Fit two major vectors and index spots on the fitted lattice.",
+    "baseline": "Fast baseline h,k,l assignment with lower reliability.",
+    "b4_mvp": (
+        "B4 MVP: generate theoretical d_hkl from lattice parameters "
+        "(a,b,c,alpha,beta,gamma) and match measured spots."
+    ),
+    "b4_strict": (
+        "B4 Strict: CIF-model based calibration with extinction checks, "
+        "Friedel-pair consistency, and zone-axis consistency scoring."
+    ),
+}
+
+DEFAULT_B4_CANDIDATE_JSON = (
+    '[{"name":"Silicon_like","a":0.543,"b":0.543,"c":0.543,'
+    '"alpha":90,"beta":90,"gamma":90,"space_group":"Fd-3m"}]'
+)
+
+FALLBACK_PHASE_LATTICE: dict[str, dict[str, Any]] = {
+    "Silicon": {
+        "formula": "Si",
+        "a": 0.5431,
+        "b": 0.5431,
+        "c": 0.5431,
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 90.0,
+        "space_group": "Fd-3m",
+    },
+    "Gold": {
+        "formula": "Au",
+        "a": 0.4078,
+        "b": 0.4078,
+        "c": 0.4078,
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 90.0,
+        "space_group": "Fm-3m",
+    },
+    "Graphite": {
+        "formula": "C",
+        "a": 0.2460,
+        "b": 0.2460,
+        "c": 0.6710,
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 120.0,
+        "space_group": "P63/mmc",
+    },
+    "Titanium Dioxide": {
+        "formula": "TiO2",
+        "a": 0.4594,
+        "b": 0.4594,
+        "c": 0.2958,
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 90.0,
+        "space_group": "P42/mnm",
+    },
+}
 
 
 def _measurement_value(measurement: Any) -> float | None:
@@ -62,6 +144,104 @@ def _materialize_upload(name: str, payload: bytes) -> Path:
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(payload)
         return Path(tmp.name)
+
+
+def _parse_elements_text(raw: str) -> list[str]:
+    tokens = [token.strip() for token in str(raw).replace(";", ",").split(",")]
+    return [token for token in tokens if token]
+
+
+def _parse_zone_axis_text(raw: str) -> tuple[int, int, int]:
+    parts = [token.strip() for token in str(raw).replace(";", ",").split(",")]
+    vals: list[int] = []
+    for token in parts:
+        if not token:
+            continue
+        try:
+            vals.append(int(token))
+        except ValueError:
+            continue
+    if len(vals) >= 3:
+        return (vals[0], vals[1], vals[2])
+    return (0, 0, 1)
+
+
+def _phase_entries_from_candidate_params(
+    candidate_phase_params: list[dict[str, Any]],
+    *,
+    selected_names: set[str] | None = None,
+) -> tuple[list[PhaseEntry], list[str]]:
+    warnings: list[str] = []
+    rows: list[PhaseEntry] = []
+    for item in candidate_phase_params:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        if not name:
+            continue
+        if selected_names is not None and name not in selected_names:
+            continue
+        try:
+            a_val = float(item.get("a"))
+            b_val = float(item.get("b"))
+            c_val = float(item.get("c"))
+            # Backward compatibility: older auto-fetch values were in Angstrom.
+            if max(a_val, b_val, c_val) > 3.0:
+                a_val *= 0.1
+                b_val *= 0.1
+                c_val *= 0.1
+                warnings.append(
+                    f"{name}: lattice lengths look like Angstrom, auto-converted to nm."
+                )
+            entry = PhaseEntry(
+                name=name,
+                path="candidate_phase_params",
+                a=a_val,
+                b=b_val,
+                c=c_val,
+                alpha_deg=float(item.get("alpha")),
+                beta_deg=float(item.get("beta")),
+                gamma_deg=float(item.get("gamma")),
+                space_group=str(item.get("space_group", "P1")),
+                formula=(
+                    None
+                    if item.get("formula") is None
+                    else str(item.get("formula"))
+                ),
+                atoms=[],
+            )
+            rows.append(entry)
+        except (TypeError, ValueError):
+            warnings.append(f"Invalid lattice params in candidate_phase_params: {name}")
+    if not rows:
+        warnings.append("No valid lattice candidates in candidate_phase_params.")
+    return rows, warnings
+
+
+def _fallback_phase_entries(
+    *,
+    selected_names: set[str] | None = None,
+) -> list[PhaseEntry]:
+    out: list[PhaseEntry] = []
+    for name, payload in FALLBACK_PHASE_LATTICE.items():
+        if selected_names is not None and name not in selected_names:
+            continue
+        out.append(
+            PhaseEntry(
+                name=name,
+                path="builtin_fallback",
+                a=float(payload["a"]),
+                b=float(payload["b"]),
+                c=float(payload["c"]),
+                alpha_deg=float(payload["alpha"]),
+                beta_deg=float(payload["beta"]),
+                gamma_deg=float(payload["gamma"]),
+                space_group=str(payload["space_group"]),
+                formula=str(payload["formula"]),
+                atoms=[],
+            )
+        )
+    return out
 
 
 def _write_npy_array(array: np.ndarray, *, prefix: str) -> Path:
@@ -127,6 +307,135 @@ def _to_csv(rows: list[dict[str, Any]]) -> str:
         values = [str(row.get(key, "")) for key in keys]
         buffer.write(",".join(values) + "\n")
     return buffer.getvalue()
+
+
+def _fig_to_bytes(fig: plt.Figure, *, fmt: str) -> bytes:
+    buf = io.BytesIO()
+    fig.savefig(buf, format=fmt, bbox_inches="tight")
+    return buf.getvalue()
+
+
+def _as_array_from_debug(value: Any) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value, dtype=np.float32)
+    except Exception:  # noqa: BLE001
+        return None
+    if arr.ndim != 2 or arr.size == 0:
+        return None
+    return arr
+
+
+def _build_core_peak_rows(
+    diffraction_obj: Any,
+    *,
+    pixel_size_nm: float,
+) -> tuple[list[dict[str, Any]], list[float]]:
+    if diffraction_obj is None:
+        return [], []
+    center = getattr(diffraction_obj, "center", None)
+    if not isinstance(center, (list, tuple)) or len(center) != 2:
+        return [], []
+    cx, cy = float(center[0]), float(center[1])
+    peaks = list(getattr(diffraction_obj, "peaks", []))
+    g_vectors = list(getattr(diffraction_obj, "g_vectors", []))
+    indexed_spots = list(getattr(diffraction_obj, "indexed_spots", []))
+    idx_map = {int(getattr(row, "peak_index", -1)): row for row in indexed_spots}
+    prov = getattr(diffraction_obj, "provenance", {})
+    pd = prov.get("peak_detection", {}) if isinstance(prov, dict) else {}
+    details = pd.get("peak_details", []) if isinstance(pd, dict) else []
+    detail_map: dict[int, dict[str, Any]] = {}
+    for row in details:
+        if not isinstance(row, dict):
+            continue
+        try:
+            detail_map[int(row.get("peak_id", -1))] = row
+        except (TypeError, ValueError):
+            continue
+
+    rows: list[dict[str, Any]] = []
+    residuals: list[float] = []
+    for i, peak in enumerate(peaks):
+        x = float(peak.x)
+        y = float(peak.y)
+        detail = detail_map.get(i, {})
+        g_row = g_vectors[i] if i < len(g_vectors) else None
+        if g_row is None:
+            gx = 0.0
+            gy = 0.0
+        else:
+            gx = float(getattr(g_row.gx, "value", 0.0))
+            gy = float(getattr(g_row.gy, "value", 0.0))
+        g_norm = float(np.hypot(gx, gy))
+        d_nm = 0.0 if g_norm <= 1e-9 else 1.0 / g_norm
+
+        indexed = idx_map.get(i)
+        if indexed is None:
+            h_val = int(detail.get("h", 0))
+            k_val = int(detail.get("k", 0))
+            l_val = int(detail.get("l", 0))
+            residual_obj = None
+            conf_val = getattr(peak, "confidence", None)
+        else:
+            h_val = int(indexed.h)
+            k_val = int(indexed.k)
+            l_val = int(indexed.l)
+            residual_obj = indexed.error
+            conf_val = indexed.confidence
+        residual_val = None if residual_obj is None else getattr(residual_obj, "value", None)
+        if residual_val is not None:
+            try:
+                residuals.append(float(residual_val))
+            except (TypeError, ValueError):
+                pass
+        theta_fallback = np.degrees(np.arctan2(y - cy, x - cx))
+        rows.append(
+            {
+                "peak_id": i,
+                "x": round(float(detail.get("x", x)), 4),
+                "y": round(float(detail.get("y", y)), 4),
+                "refined_x": round(float(detail.get("refined_x", x)), 4),
+                "refined_y": round(float(detail.get("refined_y", y)), 4),
+                "dx": round(float(detail.get("dx", x - cx)), 4),
+                "dy": round(float(detail.get("dy", y - cy)), 4),
+                "r_px": round(float(detail.get("r_px", np.hypot(x - cx, y - cy))), 4),
+                "theta_deg": round(float(detail.get("theta_deg", theta_fallback)), 3),
+                "g_x": round(gx, 6),
+                "g_y": round(gy, 6),
+                "g_norm": round(g_norm, 6),
+                "d_spacing": round(d_nm, 6),
+                "gx_1_per_nm": round(gx, 6),
+                "gy_1_per_nm": round(gy, 6),
+                "g_mag_1_per_nm": round(g_norm, 6),
+                "d_nm": round(d_nm, 6),
+                "h": h_val,
+                "k": k_val,
+                "l": l_val,
+                "intensity": round(float(getattr(peak, "intensity", 0.0) or 0.0), 6),
+                "snr": round(float(detail.get("snr", 0.0)), 4),
+                "local_background": round(float(detail.get("local_background", 0.0)), 6),
+                "subpixel_shift_px": round(float(detail.get("shift_px", 0.0)), 4),
+                "residual_error": (
+                    "" if residual_val is None else round(float(residual_val), 6)
+                ),
+                "residual_error_1_per_nm": (
+                    "" if residual_val is None else round(float(residual_val), 6)
+                ),
+                "confidence": (
+                    "" if conf_val is None else round(float(conf_val), 6)
+                ),
+                "paired": bool(detail.get("paired", False)),
+                "pair_error_px": (
+                    ""
+                    if detail.get("pair_error_px") is None
+                    else round(float(detail.get("pair_error_px")), 4)
+                ),
+                "warning": str(detail.get("warning", "")),
+                "algo_build_tag": FFT_DETECTOR_BUILD_TAG,
+            }
+        )
+    return rows, residuals
 
 
 def _extract_auto_pixel_size_nm(dataset) -> tuple[float | None, str]:
@@ -549,6 +858,206 @@ def _generate_lattice_points_from_two_basis(
     return points
 
 
+def _extract_zone_axis_text(
+    phase_rows: list[dict[str, Any]],
+    *,
+    fallback: tuple[int, int, int] = (0, 0, 1),
+) -> str:
+    if phase_rows:
+        raw = phase_rows[0].get("zone_axis")
+        if isinstance(raw, (list, tuple)) and len(raw) == 3:
+            try:
+                u, v, w = int(raw[0]), int(raw[1]), int(raw[2])
+                return f"[{u} {v} {w}]"
+            except (TypeError, ValueError):
+                pass
+    return f"[{fallback[0]} {fallback[1]} {fallback[2]}]"
+
+
+def _build_simulated_reciprocal_rows(
+    peak_rows: list[dict[str, Any]],
+    *,
+    max_index: int = 4,
+) -> list[dict[str, Any]]:
+    valid: list[tuple[int, int, int, float, float]] = []
+    for row in peak_rows:
+        try:
+            h = int(row.get("h", 0))
+            k = int(row.get("k", 0))
+            ell = int(row.get("l", 0))
+            gx = float(row.get("gx_1_per_nm", row.get("g_x", 0.0)))
+            gy = float(row.get("gy_1_per_nm", row.get("g_y", 0.0)))
+        except (TypeError, ValueError):
+            continue
+        if h == 0 and k == 0 and ell == 0:
+            continue
+        valid.append((h, k, ell, gx, gy))
+    if len(valid) < 3:
+        return []
+
+    a_mat = np.array([[h, k, ell] for h, k, ell, _, _ in valid], dtype=np.float64)
+    g_mat = np.array([[gx, gy] for _, _, _, gx, gy in valid], dtype=np.float64)
+    try:
+        coeff, _, _, _ = np.linalg.lstsq(a_mat, g_mat, rcond=None)
+    except np.linalg.LinAlgError:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for h in range(-max_index, max_index + 1):
+        for k in range(-max_index, max_index + 1):
+            for ell in range(-max_index, max_index + 1):
+                if h == 0 and k == 0 and ell == 0:
+                    continue
+                vec = np.array([h, k, ell], dtype=np.float64)
+                gx, gy = (vec @ coeff).tolist()
+                g_mag = float(np.hypot(gx, gy))
+                if g_mag <= 1e-8 or g_mag > 40.0:
+                    continue
+                rows.append(
+                    {
+                        "h": h,
+                        "k": k,
+                        "l": ell,
+                        "gx_1_per_nm": float(gx),
+                        "gy_1_per_nm": float(gy),
+                        "g_mag_1_per_nm": g_mag,
+                    }
+                )
+    rows.sort(key=lambda item: float(item["g_mag_1_per_nm"]))
+    return rows[:180]
+
+
+def _phase_rows_from_candidate_params(
+    candidate_phase_params: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in candidate_phase_params:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "name": str(item.get("name", "")),
+                "formula": item.get("formula"),
+                "score": "",
+                "matched_spot_count": 0,
+                "zone_axis": "",
+                "mean_d_error": "",
+                "source": str(item.get("source", "candidate_phase_params")),
+                "identifier": item.get("identifier"),
+                "status": "candidate_loaded_not_matched",
+            }
+        )
+    return rows
+
+
+def _build_b4_diagnostic_rows(
+    *,
+    diffraction_provenance: dict[str, Any],
+) -> list[dict[str, Any]]:
+    indexing_meta = diffraction_provenance.get("indexing", {})
+    if not isinstance(indexing_meta, dict):
+        return []
+    b4_meta = indexing_meta.get("b4", {})
+    if not isinstance(b4_meta, dict):
+        return []
+    per_phase = b4_meta.get("per_phase_diagnostics", [])
+    if not isinstance(per_phase, list):
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for item in per_phase:
+        if not isinstance(item, dict):
+            continue
+        total_spot_count = int(item.get("total_spot_count", 0))
+        valid_d_count = int(item.get("valid_d_spot_count", 0))
+        within_d_count = int(item.get("within_d_count", 0))
+        within_angle_count = int(item.get("within_angle_count", 0))
+        hit_count = int(item.get("matched_within_all_constraints_count", 0))
+        rows.append(
+            {
+                "phase_name": str(item.get("phase_name", "")),
+                "anchor_pair_found": bool(item.get("anchor_pair_found", False)),
+                "total_spots": total_spot_count,
+                "valid_d_spots": valid_d_count,
+                "d_pass_count": within_d_count,
+                "angle_pass_count": within_angle_count,
+                "all_constraints_pass_count": hit_count,
+                "d_pass_ratio": (
+                    round(within_d_count / max(1, valid_d_count), 3)
+                    if valid_d_count > 0
+                    else 0.0
+                ),
+                "angle_pass_ratio": (
+                    round(within_angle_count / max(1, total_spot_count), 3)
+                    if total_spot_count > 0
+                    else 0.0
+                ),
+                "mean_best_d_error": item.get("mean_best_d_error"),
+                "mean_best_angle_error_deg": item.get("mean_best_angle_error_deg"),
+            }
+        )
+    return rows
+
+
+def _build_b4_diagnostic_summary(
+    *,
+    diffraction_provenance: dict[str, Any],
+) -> list[str]:
+    indexing_meta = diffraction_provenance.get("indexing", {})
+    if not isinstance(indexing_meta, dict):
+        return ["b4_not_executed: indexing metadata missing."]
+    if "b4" not in indexing_meta:
+        return ["b4_not_executed: B4 branch was not entered in this run."]
+    b4_meta = indexing_meta.get("b4", {})
+    if not isinstance(b4_meta, dict):
+        return ["b4_not_executed: invalid B4 metadata payload."]
+
+    summary: list[str] = []
+    reason_map = {
+        "no_phase_candidates": (
+            "No valid phase candidates loaded "
+            "(check candidate_phase_params/CIF query)."
+        ),
+        "no_g_vectors": "No usable g-vectors detected (effective spots are missing).",
+        "all_matches_failed": (
+            "All candidates failed constraints "
+            "(check d/angle tolerance, spot selection, scale)."
+        ),
+    }
+    if not bool(b4_meta.get("active", False)):
+        raw_reason = str(b4_meta.get("reason", "unknown"))
+        summary.append(f"b4_active=False reason={raw_reason}")
+        if raw_reason in reason_map:
+            summary.append(f"reason_explained: {reason_map[raw_reason]}")
+    diagnostics = b4_meta.get("diagnostics", {})
+    if isinstance(diagnostics, dict):
+        if "valid_d_count" in diagnostics and "g_vector_count" in diagnostics:
+            summary.append(
+                "valid_d_count/g_vector_count="
+                f"{diagnostics.get('valid_d_count')}/{diagnostics.get('g_vector_count')}"
+            )
+        if "phase_candidate_count" in diagnostics:
+            summary.append(f"phase_candidate_count={diagnostics.get('phase_candidate_count')}")
+        selected_diag = diagnostics.get("selected_phase_diagnostics")
+        if isinstance(selected_diag, dict):
+            summary.append(
+                "selected_phase_all_constraints_pass_count="
+                f"{selected_diag.get('matched_within_all_constraints_count', 0)}"
+            )
+            summary.append(
+                "selected_phase_anchor_pair_found="
+                f"{selected_diag.get('anchor_pair_found', False)}"
+            )
+    used = diffraction_provenance.get("used_parameters", {})
+    if isinstance(used, dict):
+        if "candidate_phase_params_count" in used:
+            summary.append(
+                "candidate_phase_params_count="
+                f"{used.get('candidate_phase_params_count')}"
+            )
+    return summary
+
+
 def main() -> None:
     st.set_page_config(page_title="AutoTEM B2 Diffraction UI", layout="wide")
     st.title("AutoTEM-Insight: B2 FFT / Diffraction Test UI")
@@ -556,6 +1065,21 @@ def main() -> None:
         "Upload a TEM image, tune B2 parameters, and inspect FFT peaks, "
         "d-spacing, indexing, and phase candidates."
     )
+    st.caption(f"FFT detector build: `{FFT_DETECTOR_BUILD_TAG}`")
+    if "b4_candidate_params_text" not in st.session_state:
+        st.session_state["b4_candidate_params_text"] = DEFAULT_B4_CANDIDATE_JSON
+    if "b2_candidate_phases_selected" not in st.session_state:
+        st.session_state["b2_candidate_phases_selected"] = list(PHASE_OPTIONS[:3])
+    if "b4_candidate_params_text_pending" in st.session_state:
+        st.session_state["b4_candidate_params_text"] = st.session_state.pop(
+            "b4_candidate_params_text_pending"
+        )
+    if "b2_candidate_phases_selected_pending" in st.session_state:
+        st.session_state["b2_candidate_phases_selected"] = st.session_state.pop(
+            "b2_candidate_phases_selected_pending"
+        )
+    if "b4_lookup_message" in st.session_state:
+        st.success(str(st.session_state.pop("b4_lookup_message")))
 
     with st.sidebar:
         st.subheader("Input")
@@ -613,7 +1137,12 @@ def main() -> None:
         )
 
         st.subheader("Diffraction")
+        high_recall_mode = st.checkbox(
+            "High recall mode (select as many diffraction spots as possible)",
+            value=True,
+        )
         top_k_peaks = st.slider("Top-k peaks", min_value=1, max_value=128, value=24, step=1)
+        max_peaks = st.slider("Max accepted peaks", min_value=1, max_value=256, value=48, step=1)
         min_peak_distance = st.slider(
             "Min peak distance (px)",
             min_value=0.0,
@@ -621,26 +1150,460 @@ def main() -> None:
             value=3.0,
             step=0.5,
         )
+        min_snr = st.slider("Min SNR", min_value=0.0, max_value=12.0, value=1.2, step=0.1)
         center_exclusion_radius = st.slider(
-            "Center exclusion radius (px)",
+            "Center mask radius (px)",
             min_value=0.0,
             max_value=30.0,
-            value=3.0,
+            value=5.5,
             step=0.5,
         )
-        indexing_mode = st.selectbox(
-            "indexing_mode",
-            options=["auto", "lattice_fit", "baseline"],
+        center_reject_margin = st.slider(
+            "Center reject margin (px)",
+            min_value=0.0,
+            max_value=20.0,
+            value=5.0,
+            step=0.5,
+        )
+        center_keep_snr = st.slider(
+            "Center keep SNR (anti-duplicate)",
+            min_value=0.0,
+            max_value=20.0,
+            value=2.0,
+            step=0.1,
+        )
+        min_radius_px_hard = st.slider(
+            "Min radius hard cutoff (px)",
+            min_value=0.0,
+            max_value=80.0,
+            value=9.0,
+            step=0.5,
+        )
+        axis_streak_mask_width = st.slider(
+            "Axis streak mask width (px)",
+            min_value=0.0,
+            max_value=20.0,
+            value=1.5,
+            step=0.5,
+        )
+        dedup_distance_px = st.slider(
+            "Dedup distance (px)",
+            min_value=0.5,
+            max_value=30.0,
+            value=6.0,
+            step=0.5,
+        )
+        dedup_radial_tol_px = st.slider(
+            "Dedup radial tol (px)",
+            min_value=0.2,
+            max_value=20.0,
+            value=3.0,
+            step=0.2,
+        )
+        dedup_angle_tol_deg = st.slider(
+            "Dedup angle tol (deg)",
+            min_value=0.1,
+            max_value=15.0,
+            value=2.2,
+            step=0.1,
+        )
+        max_radius_ratio = st.slider(
+            "Max radius ratio (vs Nyquist radius)",
+            min_value=0.05,
+            max_value=1.0,
+            value=0.45,
+            step=0.01,
+        )
+        max_candidates_for_refine = st.slider(
+            "Max candidates for refine",
+            min_value=20,
+            max_value=2000,
+            value=140,
+            step=10,
+        )
+        max_gaussian_refine_count = st.slider(
+            "Max Gaussian subpixel fits (speed)",
+            min_value=0,
+            max_value=400,
+            value=24,
+            step=10,
+        )
+        return_peak_debug = st.checkbox(
+            "Enable full debug maps (slow)",
+            value=False,
+        )
+        rescue_on_empty = st.checkbox(
+            "Rescue when no accepted peak",
+            value=True,
+        )
+        rescue_min_snr = st.slider(
+            "Rescue min SNR",
+            min_value=0.0,
+            max_value=6.0,
+            value=0.6,
+            step=0.1,
+            disabled=not rescue_on_empty,
+        )
+        allow_relaxed_fallback = st.checkbox(
+            "Allow relaxed fallback (not recommended for real FFT)",
+            value=False,
+        )
+        enable_inner_pair_recovery = st.checkbox(
+            "Enable inner ±g pair recovery",
+            value=True,
+        )
+        inner_pair_min_snr = st.slider(
+            "Inner pair min SNR",
+            min_value=0.0,
+            max_value=6.0,
+            value=0.8,
+            step=0.1,
+            disabled=not enable_inner_pair_recovery,
+        )
+        inner_pair_recover_radius_px = st.slider(
+            "Inner pair recover radius (px)",
+            min_value=8.0,
+            max_value=120.0,
+            value=44.0,
+            step=1.0,
+            disabled=not enable_inner_pair_recovery,
+        )
+        inner_pair_max_pairs = st.slider(
+            "Inner pair max pairs",
+            min_value=0,
+            max_value=20,
+            value=8,
+            step=1,
+            disabled=not enable_inner_pair_recovery,
+        )
+        ensure_multiring_coverage = st.checkbox(
+            "Ensure multi-ring coverage",
+            value=True,
+        )
+        inner_ring_recover_pairs = st.slider(
+            "Inner ring recover pairs",
+            min_value=0,
+            max_value=20,
+            value=4,
+            step=1,
+            disabled=not ensure_multiring_coverage,
+        )
+        inner_ring_recover_min_snr = st.slider(
+            "Inner ring recover min SNR",
+            min_value=0.0,
+            max_value=6.0,
+            value=0.7,
+            step=0.1,
+            disabled=not ensure_multiring_coverage,
+        )
+        enable_lattice_consistency_filter = st.checkbox(
+            "Enable lattice consistency filter (parallelogram rule)",
+            value=False,
+        )
+        auto_center_cluster_filter = st.checkbox(
+            "Auto remove center clutter cluster",
+            value=False,
+        )
+        lattice_coeff_tol = st.slider(
+            "Lattice coeff tol",
+            min_value=0.05,
+            max_value=1.5,
+            value=0.38,
+            step=0.01,
+            disabled=not enable_lattice_consistency_filter,
+        )
+        lattice_recon_tol_px = st.slider(
+            "Lattice recon tol (px)",
+            min_value=0.5,
+            max_value=20.0,
+            value=4.0,
+            step=0.1,
+            disabled=not enable_lattice_consistency_filter,
+        )
+        lattice_filter_min_keep = st.slider(
+            "Lattice filter min keep",
+            min_value=2,
+            max_value=40,
+            value=6,
+            step=1,
+            disabled=not enable_lattice_consistency_filter,
+        )
+        origin_g_norm_threshold = st.slider(
+            "Origin g-norm cutoff (1/nm)",
+            min_value=0.0,
+            max_value=2.0,
+            value=0.12,
+            step=0.01,
+        )
+        origin_hkl_g_max = st.slider(
+            "Origin hkl(000) max g-norm (1/nm)",
+            min_value=0.0,
+            max_value=2.0,
+            value=0.30,
+            step=0.01,
+        )
+        origin_filter_max_radius_px = st.slider(
+            "Origin filter max radius (px)",
+            min_value=0.0,
+            max_value=80.0,
+            value=20.0,
+            step=0.5,
+        )
+        border_mask = st.slider(
+            "Border mask (px)",
+            min_value=0.0,
+            max_value=20.0,
+            value=2.0,
+            step=0.5,
+        )
+        radial_bin_width = st.slider(
+            "Radial bin width (px)",
+            min_value=0.5,
+            max_value=20.0,
+            value=2.0,
+            step=0.5,
+        )
+        peak_threshold_strategy = st.selectbox(
+            "peak_threshold_strategy",
+            options=[
+                "hybrid",
+                "radial_mad",
+                "local_max",
+                "log_blob",
+                "auto",
+                "relative_max",
+                "mad",
+            ],
             index=0,
         )
+        peak_threshold_value = st.number_input(
+            "peak_threshold_value (empty uses default)",
+            value=4.0,
+            step=0.1,
+            format="%.3f",
+        )
+        fft_window = st.selectbox("FFT window", options=["none", "hann", "tukey"], index=1)
+        fft_window_tukey_alpha = st.slider(
+            "Tukey alpha",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.25,
+            step=0.05,
+            disabled=fft_window != "tukey",
+        )
+        fft_compression = st.selectbox("FFT compression", options=["log1p", "asinh"], index=0)
+        bg_sub_method = st.selectbox(
+            "Background subtraction",
+            options=["radial_mad", "gaussian", "hybrid"],
+            index=2,
+        )
+        gaussian_background_sigma = st.slider(
+            "Gaussian background sigma",
+            min_value=1.0,
+            max_value=80.0,
+            value=12.0,
+            step=1.0,
+            disabled=bg_sub_method == "radial_mad",
+        )
+        clip_low_percentile = st.slider(
+            "Clip low percentile",
+            min_value=0.0,
+            max_value=20.0,
+            value=1.0,
+            step=0.5,
+        )
+        clip_high_percentile = st.slider(
+            "Clip high percentile",
+            min_value=80.0,
+            max_value=100.0,
+            value=99.8,
+            step=0.1,
+        )
+        pair_tolerance_px = st.slider(
+            "±g pair tolerance (px)",
+            min_value=0.5,
+            max_value=20.0,
+            value=4.0,
+            step=0.5,
+        )
+        min_pair_count_for_strict = st.slider(
+            "Min ±g pairs for strict indexing",
+            min_value=1,
+            max_value=10,
+            value=3,
+            step=1,
+        )
+        if high_recall_mode:
+            top_k_peaks = max(int(top_k_peaks), 96)
+            max_peaks = max(int(max_peaks), 128)
+            min_peak_distance = min(float(min_peak_distance), 2.0)
+            min_snr = min(float(min_snr), 0.7)
+            center_exclusion_radius = min(float(center_exclusion_radius), 4.0)
+            center_reject_margin = min(float(center_reject_margin), 2.0)
+            center_keep_snr = min(float(center_keep_snr), 1.2)
+            min_radius_px_hard = min(float(min_radius_px_hard), 6.0)
+            max_radius_ratio = max(float(max_radius_ratio), 0.62)
+            max_candidates_for_refine = max(int(max_candidates_for_refine), 500)
+            allow_relaxed_fallback = True
+            rescue_on_empty = True
+            rescue_min_snr = min(float(rescue_min_snr), 0.3)
+            enable_inner_pair_recovery = True
+            inner_pair_min_snr = min(float(inner_pair_min_snr), 0.4)
+            inner_pair_recover_radius_px = max(float(inner_pair_recover_radius_px), 70.0)
+            inner_pair_max_pairs = max(int(inner_pair_max_pairs), 10)
+            ensure_multiring_coverage = True
+            inner_ring_recover_pairs = max(int(inner_ring_recover_pairs), 8)
+            inner_ring_recover_min_snr = min(float(inner_ring_recover_min_snr), 0.4)
+            enable_lattice_consistency_filter = False
+            auto_center_cluster_filter = False
+            min_pair_count_for_strict = max(1, int(min_pair_count_for_strict))
+            st.caption(
+                "High recall mode applied: relaxed center/radius thresholds, "
+                "larger candidate budget, and multi-ring recovery enabled."
+            )
+        indexing_mode = st.selectbox(
+            "indexing_mode",
+            options=["auto", "lattice_fit", "baseline", "b4_mvp", "b4_strict"],
+            index=0,
+            format_func=lambda key: INDEXING_MODE_LABELS.get(str(key), str(key)),
+        )
+        st.caption(INDEXING_MODE_HINTS.get(str(indexing_mode), ""))
+        max_hkl = st.slider("B4 max_hkl", min_value=1, max_value=8, value=4, step=1)
+        d_spacing_tolerance_rel = st.slider(
+            "B4 d-spacing tolerance (relative)",
+            min_value=0.01,
+            max_value=0.4,
+            value=0.08,
+            step=0.01,
+        )
+        angle_tolerance_deg = st.slider(
+            "B4 angle tolerance (deg)",
+            min_value=1.0,
+            max_value=45.0,
+            value=12.0,
+            step=0.5,
+        )
+        candidate_phase_params_text = st.text_area(
+            "B4 candidate_phase_params (JSON list)",
+            key="b4_candidate_params_text",
+            height=120,
+        )
+        cif_candidates_dir = st.text_input(
+            "B4 cif_candidates_dir (for b4_strict)",
+            value="",
+            placeholder="./cif_candidates",
+        )
+        with st.expander("Auto Lookup: formula/elements", expanded=False):
+            phase_formula = st.text_input(
+                "Chemical formula (e.g., SiO2, Al2O3)",
+                value="",
+                key="b4_lookup_formula",
+            )
+            phase_elements_text = st.text_input(
+                "Possible elements (comma-separated, optional)",
+                value="",
+                key="b4_lookup_elements",
+                placeholder="Si, O",
+            )
+            lookup_sources = st.multiselect(
+                "Lookup sources",
+                options=["materials_project_optimade", "cod"],
+                default=["materials_project_optimade", "cod"],
+                key="b4_lookup_sources",
+            )
+            lookup_limit = st.slider(
+                "Max candidates per source",
+                min_value=1,
+                max_value=30,
+                value=10,
+                step=1,
+                key="b4_lookup_limit",
+            )
+            do_lookup = st.button(
+                "Auto Fetch Candidate Lattice Parameters",
+                key="b4_lookup_btn",
+            )
+            st.caption(
+                "Materials Project is queried via public OPTIMADE API; "
+                "COD is queried by formula. ICDD PDF card is licensed and not queried directly."
+            )
+            if do_lookup:
+                lookup_result = lookup_phase_candidates(
+                    formula=str(phase_formula).strip() or None,
+                    elements=_parse_elements_text(phase_elements_text),
+                    sources=[str(item) for item in lookup_sources],
+                    limit_per_source=int(lookup_limit),
+                )
+                if lookup_result.candidates:
+                    st.session_state["b4_candidate_params_text_pending"] = json.dumps(
+                        lookup_result.candidates,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    fetched_names = [
+                        str(item.get("name", "")).strip()
+                        for item in lookup_result.candidates
+                        if str(item.get("name", "")).strip()
+                    ]
+                    st.session_state["b4_candidate_phase_names"] = fetched_names
+                    st.session_state["b2_candidate_phases_selected_pending"] = list(fetched_names)
+                    st.session_state["b4_lookup_message"] = (
+                        f"Fetched {len(lookup_result.candidates)} candidates and "
+                        "auto-filled candidate_phase_params."
+                    )
+                    st.rerun()
+                else:
+                    st.warning("No candidates found for current query.")
+                for warning in lookup_result.warnings:
+                    st.warning(warning)
         phase_top_n = st.slider("Phase top-n", min_value=1, max_value=8, value=3, step=1)
+        phase_options = list(PHASE_OPTIONS)
+        for name in st.session_state.get("b4_candidate_phase_names", []):
+            text = str(name).strip()
+            if text and text not in phase_options:
+                phase_options.append(text)
         candidate_phases = st.multiselect(
             "Candidate phases",
-            options=PHASE_OPTIONS,
-            default=PHASE_OPTIONS[:3],
+            options=phase_options,
+            key="b2_candidate_phases_selected",
+        )
+        st.subheader("MVP Phase Match")
+        mvp_zone_axis_text = st.text_input(
+            "Zone axis (u,v,w)",
+            value="0,0,1",
+            help="Used for CIF simulated diffraction and atomic projection.",
+        )
+        mvp_max_hkl = st.slider(
+            "MVP max_hkl",
+            min_value=2,
+            max_value=10,
+            value=6,
+            step=1,
+        )
+        mvp_d_tol_rel = st.slider(
+            "MVP d-spacing tolerance (relative)",
+            min_value=0.01,
+            max_value=0.35,
+            value=0.10,
+            step=0.01,
+        )
+        mvp_angle_tol_deg = st.slider(
+            "MVP angle tolerance (deg)",
+            min_value=2.0,
+            max_value=45.0,
+            value=14.0,
+            step=0.5,
+        )
+        run_phase_match_clicked = st.button(
+            "Run Phase Match",
+            key="run_phase_match_mvp",
         )
 
         st.subheader("FFT Display (Gray)")
+        show_peak_indices = st.checkbox(
+            "Show peak indices on FFT",
+            value=True,
+        )
         fft_brightness = st.slider(
             "Brightness",
             min_value=-1.0,
@@ -661,8 +1624,108 @@ def main() -> None:
         st.info("Upload a file or click 'Use Built-In Demo Sample' to start B2 testing.")
         return
 
-    run_clicked = st.button("Run B2 Analysis", type="primary")
-    if run_clicked:
+    auto_run_analysis = st.checkbox(
+        "Auto-run after parameter changes",
+        value=True,
+        help="When enabled, B2/B4 reruns automatically after you change analysis parameters.",
+    )
+    run_button_label = (
+        "Run B4 Analysis"
+        if str(indexing_mode) in {"b4_mvp", "b4_strict"}
+        else "Run B2 Analysis"
+    )
+    run_clicked = st.button(run_button_label, type="primary")
+    auto_run_b4 = str(indexing_mode) in {"b4_mvp", "b4_strict"}
+    if auto_run_b4:
+        st.info("B4 auto-run is enabled. No click needed after switching to B4 mode.")
+
+    if use_demo:
+        input_fingerprint = "demo_builtin"
+    elif uploaded is not None:
+        input_fingerprint = f"upload::{uploaded.name}::{getattr(uploaded, 'size', 0)}"
+    else:
+        input_fingerprint = f"path::{input_path}"
+    run_signature_payload = {
+        "input_fingerprint": input_fingerprint,
+        "auto_scale": bool(auto_scale),
+        "pixel_size_nm_manual": float(pixel_size_nm_manual),
+        "voltage_kv": float(voltage_kv),
+        "recipe": str(recipe),
+        "use_clip": bool(use_clip),
+        "clip_low": float(clip_low),
+        "clip_high": float(clip_high),
+        "top_k_peaks": int(top_k_peaks),
+        "max_peaks": int(max_peaks),
+        "min_peak_distance": float(min_peak_distance),
+        "high_recall_mode": bool(high_recall_mode),
+        "min_snr": float(min_snr),
+        "center_exclusion_radius": float(center_exclusion_radius),
+        "center_reject_margin": float(center_reject_margin),
+        "center_keep_snr": float(center_keep_snr),
+        "min_radius_px_hard": float(min_radius_px_hard),
+        "axis_streak_mask_width": float(axis_streak_mask_width),
+        "dedup_distance_px": float(dedup_distance_px),
+        "dedup_radial_tol_px": float(dedup_radial_tol_px),
+        "dedup_angle_tol_deg": float(dedup_angle_tol_deg),
+        "max_radius_ratio": float(max_radius_ratio),
+        "max_candidates_for_refine": int(max_candidates_for_refine),
+        "max_gaussian_refine_count": int(max_gaussian_refine_count),
+        "return_peak_debug": bool(return_peak_debug),
+        "rescue_on_empty": bool(rescue_on_empty),
+        "rescue_min_snr": float(rescue_min_snr),
+        "allow_relaxed_fallback": bool(allow_relaxed_fallback),
+        "enable_inner_pair_recovery": bool(enable_inner_pair_recovery),
+        "inner_pair_min_snr": float(inner_pair_min_snr),
+        "inner_pair_recover_radius_px": float(inner_pair_recover_radius_px),
+        "inner_pair_max_pairs": int(inner_pair_max_pairs),
+        "ensure_multiring_coverage": bool(ensure_multiring_coverage),
+        "inner_ring_recover_pairs": int(inner_ring_recover_pairs),
+        "inner_ring_recover_min_snr": float(inner_ring_recover_min_snr),
+        "enable_lattice_consistency_filter": bool(enable_lattice_consistency_filter),
+        "auto_center_cluster_filter": bool(auto_center_cluster_filter),
+        "lattice_coeff_tol": float(lattice_coeff_tol),
+        "lattice_recon_tol_px": float(lattice_recon_tol_px),
+        "lattice_filter_min_keep": int(lattice_filter_min_keep),
+        "origin_g_norm_threshold": float(origin_g_norm_threshold),
+        "origin_hkl_g_max": float(origin_hkl_g_max),
+        "origin_filter_max_radius_px": float(origin_filter_max_radius_px),
+        "border_mask": float(border_mask),
+        "radial_bin_width": float(radial_bin_width),
+        "peak_threshold_strategy": str(peak_threshold_strategy),
+        "peak_threshold_value": float(peak_threshold_value),
+        "fft_window": str(fft_window),
+        "fft_window_tukey_alpha": float(fft_window_tukey_alpha),
+        "fft_compression": str(fft_compression),
+        "background_subtraction_method": str(bg_sub_method),
+        "gaussian_background_sigma": float(gaussian_background_sigma),
+        "clip_low_percentile": float(clip_low_percentile),
+        "clip_high_percentile": float(clip_high_percentile),
+        "pair_tolerance_px": float(pair_tolerance_px),
+        "min_pair_count_for_strict": int(min_pair_count_for_strict),
+        "indexing_mode": str(indexing_mode),
+        "max_hkl": int(max_hkl),
+        "d_spacing_tolerance_rel": float(d_spacing_tolerance_rel),
+        "angle_tolerance_deg": float(angle_tolerance_deg),
+        "phase_top_n": int(phase_top_n),
+        "candidate_phases": sorted([str(v) for v in list(candidate_phases)]),
+        "candidate_phase_params_text": str(candidate_phase_params_text),
+        "cif_candidates_dir": str(cif_candidates_dir).strip(),
+        "mvp_zone_axis_text": str(mvp_zone_axis_text),
+        "mvp_max_hkl": int(mvp_max_hkl),
+        "mvp_d_tol_rel": float(mvp_d_tol_rel),
+        "mvp_angle_tol_deg": float(mvp_angle_tol_deg),
+        "show_peak_indices": bool(show_peak_indices),
+    }
+    run_signature = json.dumps(run_signature_payload, sort_keys=True, ensure_ascii=False)
+    prev_run_signature = str(st.session_state.get("b2_last_run_signature", ""))
+    has_existing_context = "b2_context" in st.session_state
+    auto_run_by_change = bool(auto_run_analysis) and (
+        (not has_existing_context) or run_signature != prev_run_signature
+    )
+    if auto_run_by_change and not run_clicked:
+        st.caption("Parameters changed; auto-running analysis.")
+    run_requested = run_clicked or auto_run_b4 or auto_run_by_change
+    if run_requested:
         try:
             dataset, original_image, npy_path = _build_dataset_for_b2(input_path)
         except Exception as exc:  # noqa: BLE001
@@ -707,19 +1770,113 @@ def main() -> None:
                 parameters=preprocess_params,
             )
 
+            candidate_phase_params_payload: list[dict[str, Any]] = []
+            raw_phase_text = str(candidate_phase_params_text).strip()
+            if raw_phase_text:
+                decoded = json.loads(raw_phase_text)
+                if not isinstance(decoded, list):
+                    raise ValueError("candidate_phase_params JSON must be a list.")
+                candidate_phase_params_payload = [row for row in decoded if isinstance(row, dict)]
+            b4_phase_names = [
+                str(row.get("name")).strip()
+                for row in candidate_phase_params_payload
+                if str(row.get("name", "")).strip()
+            ]
+            if not b4_phase_names:
+                b4_phase_names = [
+                    str(name).strip()
+                    for name in st.session_state.get("b4_candidate_phase_names", [])
+                    if str(name).strip()
+                ]
+            effective_candidate_phases = list(candidate_phases)
+            if indexing_mode in {"b4_mvp", "b4_strict"} and b4_phase_names:
+                effective_candidate_phases = b4_phase_names
+
             diffraction_params = {
                 "top_k_peaks": int(top_k_peaks),
+                "max_peaks": int(max_peaks),
                 "min_peak_distance": float(min_peak_distance),
+                "high_recall_mode": bool(high_recall_mode),
                 "center_exclusion_radius": float(center_exclusion_radius),
+                "center_mask_radius": float(center_exclusion_radius),
+                "center_reject_margin": float(center_reject_margin),
+                "center_keep_snr": float(center_keep_snr),
+                "min_radius_px_hard": float(min_radius_px_hard),
+                "axis_streak_mask_width": float(axis_streak_mask_width),
+                "border_mask": float(border_mask),
+                "radial_bin_width": float(radial_bin_width),
+                "dedup_distance_px": float(dedup_distance_px),
+                "dedup_radial_tol_px": float(dedup_radial_tol_px),
+                "dedup_angle_tol_deg": float(dedup_angle_tol_deg),
+                "max_radius_ratio": float(max_radius_ratio),
+                "max_candidates_for_refine": int(max_candidates_for_refine),
+                "max_gaussian_refine_count": int(max_gaussian_refine_count),
+                "rescue_on_empty": bool(rescue_on_empty),
+                "rescue_min_snr": float(rescue_min_snr),
+                "allow_relaxed_fallback": bool(allow_relaxed_fallback),
+                "enable_inner_pair_recovery": bool(enable_inner_pair_recovery),
+                "inner_pair_min_snr": float(inner_pair_min_snr),
+                "inner_pair_recover_radius_px": float(inner_pair_recover_radius_px),
+                "inner_pair_max_pairs": int(inner_pair_max_pairs),
+                "ensure_multiring_coverage": bool(ensure_multiring_coverage),
+                "inner_ring_recover_pairs": int(inner_ring_recover_pairs),
+                "inner_ring_recover_min_snr": float(inner_ring_recover_min_snr),
+                "enable_lattice_consistency_filter": bool(enable_lattice_consistency_filter),
+                "auto_center_cluster_filter": bool(auto_center_cluster_filter),
+                "lattice_coeff_tol": float(lattice_coeff_tol),
+                "lattice_recon_tol_px": float(lattice_recon_tol_px),
+                "lattice_filter_min_keep": int(lattice_filter_min_keep),
+                "origin_g_norm_threshold": float(origin_g_norm_threshold),
+                "origin_hkl_g_max": float(origin_hkl_g_max),
+                "origin_filter_max_radius_px": float(origin_filter_max_radius_px),
+                "min_snr": float(min_snr),
+                "peak_threshold_strategy": str(peak_threshold_strategy),
+                "peak_threshold_value": float(peak_threshold_value),
+                "fft_window": str(fft_window),
+                "fft_window_tukey_alpha": float(fft_window_tukey_alpha),
+                "fft_compression": str(fft_compression),
+                "background_subtraction_method": str(bg_sub_method),
+                "gaussian_background_sigma": float(gaussian_background_sigma),
+                "clip_low_percentile": float(clip_low_percentile),
+                "clip_high_percentile": float(clip_high_percentile),
+                "pair_tolerance_px": float(pair_tolerance_px),
+                "min_pair_count_for_strict": int(min_pair_count_for_strict),
+                "return_peak_debug": bool(return_peak_debug),
                 "indexing_mode": str(indexing_mode),
+                "max_hkl": int(max_hkl),
+                "d_spacing_tolerance_rel": float(d_spacing_tolerance_rel),
+                "angle_tolerance_deg": float(angle_tolerance_deg),
                 "phase_top_n": int(phase_top_n),
-                "candidate_phases": list(candidate_phases),
+                "candidate_phases": effective_candidate_phases,
+                "candidate_phase_params": candidate_phase_params_payload,
+                "cif_candidates_dir": str(cif_candidates_dir).strip() or None,
             }
             diffraction = run_diffraction_analysis(
                 preprocessing,
                 calibration,
                 parameters=diffraction_params,
             )
+
+            core_phase_rows: list[dict[str, Any]] = []
+            for candidate in list(diffraction.phase_candidates):
+                mean_d_err = getattr(candidate, "mean_d_error", None)
+                mean_d_value = None if mean_d_err is None else getattr(mean_d_err, "value", None)
+                core_phase_rows.append(
+                    {
+                        "name": str(candidate.name),
+                        "formula": candidate.formula,
+                        "score": (
+                            None if candidate.score is None else round(float(candidate.score), 6)
+                        ),
+                        "matched_spot_count": candidate.matched_spot_count,
+                        "mean_d_error": (
+                            None if mean_d_value is None else round(float(mean_d_value), 6)
+                        ),
+                        "zone_axis": candidate.zone_axis,
+                        "source": candidate.source,
+                        "identifier": candidate.identifier,
+                    }
+                )
         except Exception as exc:  # noqa: BLE001
             st.error(f"B2 analysis failed: {exc}")
             return
@@ -730,6 +1887,15 @@ def main() -> None:
         fft_img = _fft_preview(processed_image)
 
         auto_points_xy = [(float(peak.x), float(peak.y)) for peak in diffraction.peaks]
+        core_peak_rows, core_residuals = _build_core_peak_rows(
+            diffraction,
+            pixel_size_nm=float(effective_pixel_size_nm),
+        )
+        peak_detection_debug = {}
+        if isinstance(diffraction.provenance, dict):
+            maybe_debug = diffraction.provenance.get("peak_detection", {})
+            if isinstance(maybe_debug, dict):
+                peak_detection_debug = maybe_debug
         if "b2_canvas_nonce" not in st.session_state:
             st.session_state["b2_canvas_nonce"] = 0
         st.session_state["b2_context"] = {
@@ -740,7 +1906,14 @@ def main() -> None:
             "auto_points_xy": auto_points_xy,
             "effective_pixel_size_nm": float(effective_pixel_size_nm),
             "phase_top_n": int(phase_top_n),
-            "candidate_phases": list(candidate_phases),
+            "candidate_phases": list(effective_candidate_phases),
+            "core_phase_rows": core_phase_rows,
+            "candidate_phase_params": list(candidate_phase_params_payload),
+            "diffraction_provenance": diffraction.provenance,
+            "core_peak_rows": core_peak_rows,
+            "core_residuals": core_residuals,
+            "peak_detection_debug": peak_detection_debug,
+            "peak_debug_enabled": bool(return_peak_debug),
             "dataset_warnings": list(dataset.warnings),
             "quality_warnings": list(quality.warnings),
             "calibration_warnings": list(calibration.warnings),
@@ -748,6 +1921,8 @@ def main() -> None:
             "diffraction_warnings": list(diffraction.warnings),
             "scale_note": scale_note,
         }
+        st.session_state.pop("b2_phase_mvp", None)
+        st.session_state["b2_last_run_signature"] = run_signature
 
     context = st.session_state.get("b2_context")
     if context is None:
@@ -773,7 +1948,8 @@ def main() -> None:
 
     st.subheader("Manual Basis Selection On FFT")
     st.caption(
-        "直接在 FFT 图上点击两个基点 g1/g2。其余斑点将按矢量叠加自动生成。"
+        "Click two basis points directly on the FFT image (g1/g2). "
+        "Other lattice spots will be generated from vector synthesis."
     )
     selection_mode = st.radio(
         "Spot source mode",
@@ -812,15 +1988,20 @@ def main() -> None:
             st.session_state["b2_canvas_nonce"] = int(
                 st.session_state.get("b2_canvas_nonce", 0)
             ) + 1
+            st.session_state.pop("b2_last_clicked_points_xy", None)
             st.rerun()
 
     clicked_points_xy = _extract_canvas_points_xy(canvas_result, sx=sx, sy=sy)
+    if clicked_points_xy:
+        st.session_state["b2_last_clicked_points_xy"] = list(clicked_points_xy)
+    cached_clicked_points_xy = list(st.session_state.get("b2_last_clicked_points_xy", []))
     with canvas_col2:
-        st.write(f"Clicked points: {len(clicked_points_xy)}")
-        if clicked_points_xy:
+        show_points = clicked_points_xy if clicked_points_xy else cached_clicked_points_xy
+        st.write(f"Clicked points: {len(show_points)}")
+        if show_points:
             clicked_text = "\n".join(
                 f"{idx+1}: x={x:.2f}, y={y:.2f}"
-                for idx, (x, y) in enumerate(clicked_points_xy)
+                for idx, (x, y) in enumerate(show_points)
             )
             st.code(
                 clicked_text,
@@ -831,14 +2012,17 @@ def main() -> None:
     if selection_mode == "Auto peaks":
         selected_points_xy = list(auto_points_xy)
     else:
-        if len(clicked_points_xy) < 2:
-            st.warning("请在 FFT 图上至少点击两个点作为基矢 g1/g2。")
+        points_for_synthesis = (
+            clicked_points_xy if len(clicked_points_xy) >= 2 else cached_clicked_points_xy
+        )
+        if len(points_for_synthesis) < 2:
+            st.warning("Please click at least two FFT points as basis vectors g1/g2.")
             selected_points_xy = []
         else:
-            if len(clicked_points_xy) > 2:
-                st.warning("检测到超过两个点，当前仅使用前两个点作为基矢。")
-            basis1 = clicked_points_xy[0]
-            basis2 = clicked_points_xy[1]
+            if len(points_for_synthesis) > 2:
+                st.warning("More than two points detected; only the first two are used as basis.")
+            basis1 = points_for_synthesis[0]
+            basis2 = points_for_synthesis[1]
             h, w = fft_magnitude.shape
             center_xy = (w / 2.0, h / 2.0)
             selected_points_xy = _generate_lattice_points_from_two_basis(
@@ -870,13 +2054,77 @@ def main() -> None:
         candidate_phases=list(context["candidate_phases"]),
         indexing_mode=str(indexing_mode),
     )
+    if selection_mode == "Auto peaks":
+        core_peak_rows = list(context.get("core_peak_rows", []))
+        core_residuals = list(context.get("core_residuals", []))
+        if core_peak_rows:
+            peak_rows = core_peak_rows
+            if core_residuals:
+                residuals_lattice = [float(v) for v in core_residuals]
+    core_phase_rows_for_display = list(context.get("core_phase_rows", []))
+    if str(indexing_mode) in {"b4_mvp", "b4_strict"} and core_phase_rows_for_display:
+        phase_rows = core_phase_rows_for_display
+    elif str(indexing_mode) in {"b4_mvp", "b4_strict"}:
+        fallback_rows = _phase_rows_from_candidate_params(
+            list(context.get("candidate_phase_params", []))
+        )
+        if fallback_rows:
+            phase_rows = fallback_rows
 
     st.success("B2 analysis finished.")
+    provenance_obj = context.get("diffraction_provenance", {})
+    provenance_dict = provenance_obj if isinstance(provenance_obj, dict) else {}
+    method_text = str(provenance_dict.get("method", "unknown"))
+    st.caption(f"Current core method: `{method_text}`")
+    if selection_mode == "Auto peaks" and peak_rows:
+        snr_vals: list[float] = []
+        near_center_000 = 0
+        for row in peak_rows:
+            try:
+                snr_vals.append(float(row.get("snr", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                pass
+            try:
+                r_val = float(row.get("r_px", 0.0) or 0.0)
+                h_val = int(row.get("h", 0))
+                k_val = int(row.get("k", 0))
+                l_val = int(row.get("l", 0))
+            except (TypeError, ValueError):
+                continue
+            if r_val < 20.0 and h_val == 0 and k_val == 0 and l_val == 0:
+                near_center_000 += 1
+        if snr_vals and max(snr_vals) <= 0.0:
+            st.error(
+                "Detected SNR values are all zero. This usually means stale/legacy "
+                "results or fallback-only output; please hard refresh and rerun."
+            )
+        if near_center_000 > 0:
+            st.warning(
+                f"Found {near_center_000} near-center 000-like spots (<20 px). "
+                "Please tighten center cutoff or verify the run is using the latest settings."
+            )
     metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
     metric_col1.metric("Detected Peaks", len(peak_rows))
-    metric_col2.metric("Indexed Spots", sum(1 for row in peak_rows if float(row["d_nm"]) > 0))
+    metric_col2.metric(
+        "Indexed Spots",
+        sum(
+            1
+            for row in peak_rows
+            if float(row.get("d_nm", row.get("d_spacing", 0.0)) or 0.0) > 0
+        ),
+    )
     metric_col3.metric("Phase Candidates", len(phase_rows))
     metric_col4.metric("Confidence", f"{selected_confidence:.3f}")
+    st.info(
+        "How to read: Detected Peaks = number of detected diffraction points; "
+        "Indexed Spots = spots with assigned h,k,l; "
+        "Phase Candidates = candidate phases passing current criteria; "
+        "Confidence = overall reliability score (0~1, higher is better)."
+    )
+    st.caption(
+        "Rule of thumb: mean_d_error < 0.08 is usually good; 0.08~0.15 needs caution; "
+        "> 0.15 suggests re-checking scale, selected spots, or phase candidates."
+    )
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 5), dpi=150)
     ax1.imshow(np.asarray(context["original_image"], dtype=np.float32), cmap="gray")
@@ -894,12 +2142,127 @@ def main() -> None:
             linewidths=0.3,
             edgecolors="black",
         )
+        show_idx = bool(show_peak_indices)
+        if show_idx:
+            for idx, (px, py) in enumerate(selected_points_xy):
+                ax2.text(
+                    float(px) + 4.0,
+                    float(py) + 3.0,
+                    str(idx),
+                    fontsize=6,
+                    color="yellow",
+                    ha="left",
+                    va="bottom",
+                    bbox={
+                        "facecolor": "black",
+                        "alpha": 0.35,
+                        "pad": 0.6,
+                        "edgecolor": "none",
+                    },
+                )
     ax2.set_title("FFT + Detected Peaks")
     ax2.axis("off")
     fig.tight_layout()
     st.pyplot(fig, clear_figure=True)
 
+    peak_debug_enabled = bool(context.get("peak_debug_enabled", False))
+    peak_debug = context.get("peak_detection_debug", {})
+    if peak_debug_enabled:
+        st.subheader("FFT Peak Detection Debug (v2)")
+    if peak_debug_enabled and isinstance(peak_debug, dict):
+        raw_fft = _as_array_from_debug(peak_debug.get("raw_fft_magnitude"))
+        log_fft = _as_array_from_debug(peak_debug.get("log_fft"))
+        bg_sub = _as_array_from_debug(peak_debug.get("background_subtracted_fft"))
+        radial_z = _as_array_from_debug(peak_debug.get("radial_z_score_map"))
+        masks_obj = peak_debug.get("masks")
+        masks_debug = masks_obj if isinstance(masks_obj, dict) else {}
+        center_mask_arr = _as_array_from_debug(masks_debug.get("center_mask"))
+        axis_mask_arr = _as_array_from_debug(masks_debug.get("axis_mask"))
+        border_mask_arr = _as_array_from_debug(masks_debug.get("border_mask"))
+
+        cands_xy = peak_debug.get("candidate_peaks_xy", [])
+        accepts_xy = peak_debug.get("accepted_peaks_xy", [])
+        rejects_xy = peak_debug.get("rejected_peaks_xy", [])
+        paired_segments = peak_debug.get("paired_segments", [])
+        residual_values = peak_debug.get("residual_distribution", [])
+
+        fig_dbg, axes = plt.subplots(3, 3, figsize=(13, 12), dpi=140)
+        ax = axes.ravel()
+        ax[0].imshow(raw_fft if raw_fft is not None else fft_magnitude, cmap="gray")
+        ax[0].set_title("1) Raw FFT Magnitude")
+        ax[0].axis("off")
+        ax[1].imshow(log_fft if log_fft is not None else fft_img_display, cmap="gray")
+        ax[1].set_title("2) Log FFT")
+        ax[1].axis("off")
+        ax[2].imshow(bg_sub if bg_sub is not None else fft_img_display, cmap="gray")
+        ax[2].set_title("3) Background-Subtracted FFT")
+        ax[2].axis("off")
+        ax[3].imshow(radial_z if radial_z is not None else fft_img_display, cmap="gray")
+        ax[3].set_title("4) Radial Z-Score Map")
+        ax[3].axis("off")
+
+        if (
+            center_mask_arr is not None
+            and axis_mask_arr is not None
+            and border_mask_arr is not None
+        ):
+            merged_mask = np.clip(center_mask_arr + axis_mask_arr + border_mask_arr, 0, 1)
+        else:
+            merged_mask = np.zeros_like(fft_img_display)
+        ax[4].imshow(merged_mask, cmap="gray")
+        ax[4].set_title("5) Masks (Center/Axis/Border)")
+        ax[4].axis("off")
+
+        ax[5].imshow(fft_img_display, cmap="gray")
+        if isinstance(cands_xy, list) and cands_xy:
+            xs = [float(item.get("x", 0.0)) for item in cands_xy if isinstance(item, dict)]
+            ys = [float(item.get("y", 0.0)) for item in cands_xy if isinstance(item, dict)]
+            ax[5].scatter(xs, ys, s=10, c="yellow")
+        ax[5].set_title("6) Candidate Peaks")
+        ax[5].axis("off")
+
+        ax[6].imshow(fft_img_display, cmap="gray")
+        if isinstance(accepts_xy, list) and accepts_xy:
+            xs = [float(item.get("x", 0.0)) for item in accepts_xy if isinstance(item, dict)]
+            ys = [float(item.get("y", 0.0)) for item in accepts_xy if isinstance(item, dict)]
+            ax[6].scatter(xs, ys, s=18, c="cyan", edgecolors="black", linewidths=0.3)
+        ax[6].set_title("7) Accepted Peaks")
+        ax[6].axis("off")
+
+        ax[7].imshow(fft_img_display, cmap="gray")
+        if isinstance(rejects_xy, list) and rejects_xy:
+            xs = [float(item.get("x", 0.0)) for item in rejects_xy if isinstance(item, dict)]
+            ys = [float(item.get("y", 0.0)) for item in rejects_xy if isinstance(item, dict)]
+            ax[7].scatter(xs, ys, s=14, c="red", marker="x")
+        if isinstance(paired_segments, list):
+            for seg in paired_segments:
+                if not isinstance(seg, dict):
+                    continue
+                ax[7].plot(
+                    [float(seg.get("x1", 0.0)), float(seg.get("x2", 0.0))],
+                    [float(seg.get("y1", 0.0)), float(seg.get("y2", 0.0))],
+                    c="lime",
+                    linewidth=0.8,
+                )
+        ax[7].set_title("8/9) Rejected + ±g Paired Peaks")
+        ax[7].axis("off")
+
+        if isinstance(residual_values, list) and residual_values:
+            vals = [float(v) for v in residual_values]
+            ax[8].hist(vals, bins=min(20, max(5, len(vals) // 2)))
+        ax[8].set_title("10) Residual Distribution")
+        ax[8].set_xlabel("pair error (px)")
+        ax[8].set_ylabel("count")
+        fig_dbg.tight_layout()
+        st.pyplot(fig_dbg, clear_figure=True)
+    elif not peak_debug_enabled:
+        st.caption("FFT peak debug maps are hidden for speed. Enable them from sidebar if needed.")
+
     st.subheader("Peaks / g-vectors / d-spacing / hkl")
+    st.caption(
+        "Key fields: h,k,l are indexing results; d_spacing is measured spacing; "
+        "residual_error lower is better; confidence higher is better."
+    )
     st.dataframe(peak_rows, use_container_width=True)
 
     st.subheader("Baseline vs Lattice-Fit Comparison")
@@ -919,7 +2282,277 @@ def main() -> None:
         st.info("No lattice-fit residuals available for the current selection.")
 
     st.subheader("Phase Candidates")
+    st.caption(
+        "Ranking rule: higher score is better; more matched_spot_count is better; "
+        "lower mean_d_error is better. Strict mode also adds consistency checks."
+    )
+    if str(indexing_mode) in {"b4_mvp", "b4_strict"} and not core_phase_rows_for_display:
+        st.warning(
+            "B4 candidates were loaded, but current diffraction points "
+            "did not produce a valid match yet. "
+            "Check scale, selected spots, and tolerance settings."
+        )
     st.dataframe(phase_rows, use_container_width=True)
+    if str(indexing_mode) in {"b4_mvp", "b4_strict"}:
+        st.subheader("B4 Match Diagnostics")
+        provenance_obj = context.get("diffraction_provenance", {})
+        provenance_dict = provenance_obj if isinstance(provenance_obj, dict) else {}
+        diag_rows = _build_b4_diagnostic_rows(
+            diffraction_provenance=provenance_dict
+        )
+        diag_summary = _build_b4_diagnostic_summary(
+            diffraction_provenance=provenance_dict
+        )
+        if diag_rows:
+            st.caption(
+                "Why not matched: check d_pass_count and angle_pass_count. "
+                "If d_pass is low, d error exceeds threshold; "
+                "if angle_pass is low, angle constraint failed."
+            )
+            st.dataframe(diag_rows, use_container_width=True)
+        else:
+            st.info("No per-phase diagnostics returned in this run.")
+        for text in diag_summary:
+            st.caption(f"- {text}")
+
+    st.subheader("Run Phase Match (MVP)")
+    mvp_zone_axis = _parse_zone_axis_text(mvp_zone_axis_text)
+    cif_dir_effective = str(cif_candidates_dir).strip()
+    mvp_mode_enabled = str(indexing_mode) in {"b4_mvp", "b4_strict"}
+    core_has_ranked_phase = any(
+        float(item.get("score", 0.0) or 0.0) > 0.0
+        for item in phase_rows
+        if isinstance(item, dict)
+    )
+    mvp_signature = json.dumps(
+        {
+            "run_signature": run_signature,
+            "zone_axis": list(mvp_zone_axis),
+            "mvp_max_hkl": int(mvp_max_hkl),
+            "mvp_d_tol_rel": float(mvp_d_tol_rel),
+            "mvp_angle_tol_deg": float(mvp_angle_tol_deg),
+            "cif_dir": cif_dir_effective,
+            "candidate_phases": [str(v) for v in candidate_phases],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    prev_mvp_state = st.session_state.get("b2_phase_mvp", {})
+    prev_mvp_signature = (
+        str(prev_mvp_state.get("signature", ""))
+        if isinstance(prev_mvp_state, dict)
+        else ""
+    )
+    auto_run_mvp = (
+        mvp_mode_enabled
+        and core_has_ranked_phase
+        and bool(peak_rows)
+        and not run_phase_match_clicked
+        and mvp_signature != prev_mvp_signature
+    )
+    if run_phase_match_clicked or auto_run_mvp:
+        mvp_warnings: list[str] = []
+        selected_names = {str(v) for v in candidate_phases} if candidate_phases else None
+        entries: list[PhaseEntry] = []
+
+        if cif_dir_effective:
+            cif_entries, load_warnings = load_cif_phase_entries(
+                cif_dir_effective,
+                selected_names=selected_names,
+            )
+            entries.extend(cif_entries)
+            mvp_warnings.extend(load_warnings)
+
+        if not entries:
+            candidate_params = list(context.get("candidate_phase_params", []))
+            param_entries, param_warnings = _phase_entries_from_candidate_params(
+                candidate_params,
+                selected_names=selected_names,
+            )
+            entries.extend(param_entries)
+            mvp_warnings.extend(param_warnings)
+            if param_entries:
+                mvp_warnings.append(
+                    "No CIF loaded: using candidate_phase_params for phase match."
+                )
+
+        if not entries:
+            fallback_entries = _fallback_phase_entries(selected_names=selected_names)
+            entries.extend(fallback_entries)
+            if fallback_entries:
+                mvp_warnings.append(
+                    "No CIF/candidate params available: using built-in fallback phases."
+                )
+
+        ranking_rows, detail_map, match_warnings = match_candidates(
+            peak_rows,
+            entries,
+            max_hkl=int(mvp_max_hkl),
+            zone_axis=mvp_zone_axis,
+            d_tol_rel=float(mvp_d_tol_rel),
+            angle_tol_deg=float(mvp_angle_tol_deg),
+        )
+        mvp_warnings.extend(match_warnings)
+        st.session_state["b2_phase_mvp"] = {
+            "zone_axis": mvp_zone_axis,
+            "ranking_rows": ranking_rows,
+            "detail_map": detail_map,
+            "warnings": mvp_warnings,
+            "cif_dir": cif_dir_effective,
+            "signature": mvp_signature,
+        }
+
+    mvp_state = st.session_state.get("b2_phase_mvp", {})
+    if isinstance(mvp_state, dict) and mvp_state.get("ranking_rows"):
+        ranking_rows = list(mvp_state.get("ranking_rows", []))
+        detail_map = mvp_state.get("detail_map", {})
+        warnings_mvp = list(mvp_state.get("warnings", []))
+        phase_names = [str(row.get("name", "")) for row in ranking_rows if str(row.get("name", ""))]
+        default_name = phase_names[0] if phase_names else ""
+        prev_selected = str(st.session_state.get("b2_mvp_selected_phase", default_name))
+        if prev_selected not in phase_names:
+            prev_selected = default_name
+        selected_name = st.selectbox(
+            "Choose candidate phase result",
+            options=phase_names,
+            index=(phase_names.index(prev_selected) if prev_selected in phase_names else 0),
+            key="b2_mvp_selected_phase",
+        ) if phase_names else ""
+        top_name = str(selected_name or default_name)
+        top_detail = detail_map.get(top_name, {})
+        assignments = list(top_detail.get("assignments", []))
+        sim_rows = list(top_detail.get("simulated_rows", []))
+        entry = top_detail.get("entry")
+        st.success(f"Current phase candidate: {top_name}")
+        st.dataframe(ranking_rows, use_container_width=True)
+
+        fig_ann = plot_annotated_fft(fft_img_display, peak_rows, assignments)
+        ann_png = _fig_to_bytes(fig_ann, fmt="png")
+        ann_svg = _fig_to_bytes(fig_ann, fmt="svg")
+        st.subheader("Annotated FFT")
+        st.pyplot(fig_ann, clear_figure=False)
+
+        fig_sim = plot_simulated_diffraction(
+            sim_rows,
+            title=(
+                f"Simulated Diffraction: {top_name} "
+                f"[{mvp_zone_axis[0]} {mvp_zone_axis[1]} {mvp_zone_axis[2]}]"
+            ),
+        )
+        sim_png = _fig_to_bytes(fig_sim, fmt="png")
+        st.subheader("Simulated Diffraction Pattern")
+        st.pyplot(fig_sim, clear_figure=False)
+
+        fig_overlay = plot_experimental_vs_simulated_overlay(peak_rows, assignments, sim_rows)
+        overlay_png = _fig_to_bytes(fig_overlay, fmt="png")
+        st.subheader("Experimental vs Simulated Overlay")
+        st.pyplot(fig_overlay, clear_figure=False)
+
+        if entry is not None:
+            fig_atoms = plot_atom_projection(entry, zone_axis=mvp_zone_axis)
+            atoms_png = _fig_to_bytes(fig_atoms, fmt="png")
+            st.subheader("Atomic Projection")
+            st.pyplot(fig_atoms, clear_figure=False)
+        else:
+            fig_atoms = None
+            atoms_png = b""
+            st.info("Atomic projection unavailable for top phase entry.")
+
+        assign_map = {int(row.get("peak_id", -1)): row for row in assignments}
+        peaks_out: list[dict[str, Any]] = []
+        for row in peak_rows:
+            pid = int(row.get("peak_id", -1))
+            merged = dict(row)
+            rec = assign_map.get(pid, {})
+            merged["matched"] = bool(rec.get("matched", False))
+            merged["matched_h"] = int(rec.get("h", 0))
+            merged["matched_k"] = int(rec.get("k", 0))
+            merged["matched_l"] = int(rec.get("l", 0))
+            merged["matched_d_nm"] = rec.get("d_nm")
+            merged["match_d_error"] = rec.get("d_error")
+            merged["match_angle_error_deg"] = rec.get("angle_error_deg")
+            peaks_out.append(merged)
+
+        report_json = {
+            "cif_dir": str(mvp_state.get("cif_dir", "")),
+            "zone_axis": list(mvp_zone_axis),
+            "top_phase": ranking_rows[0],
+            "ranking": ranking_rows,
+            "warnings": warnings_mvp,
+            "match_count": {
+                "matched": int(
+                    sum(1 for row in assignments if bool(row.get("matched", False)))
+                ),
+                "unmatched": int(
+                    sum(1 for row in assignments if not bool(row.get("matched", False)))
+                ),
+            },
+        }
+
+        st.subheader("Export")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.download_button(
+                "annotated_fft.png",
+                data=ann_png,
+                file_name="annotated_fft.png",
+                mime="image/png",
+            )
+            st.download_button(
+                "simulated_diffraction.png",
+                data=sim_png,
+                file_name="simulated_diffraction.png",
+                mime="image/png",
+            )
+        with c2:
+            st.download_button(
+                "experimental_vs_simulated_overlay.png",
+                data=overlay_png,
+                file_name="experimental_vs_simulated_overlay.png",
+                mime="image/png",
+            )
+            if fig_atoms is not None:
+                st.download_button(
+                    "atom_projection.png",
+                    data=atoms_png,
+                    file_name="atom_projection.png",
+                    mime="image/png",
+                )
+        with c3:
+            st.download_button(
+                "annotated_fft.svg",
+                data=ann_svg,
+                file_name="annotated_fft.svg",
+                mime="image/svg+xml",
+            )
+            st.download_button(
+                "peaks_table.csv",
+                data=_to_csv(peaks_out),
+                file_name="peaks_table.csv",
+                mime="text/csv",
+            )
+            st.download_button(
+                "phase_match_report.json",
+                data=json.dumps(report_json, ensure_ascii=False, indent=2),
+                file_name="phase_match_report.json",
+                mime="application/json",
+            )
+
+        if warnings_mvp:
+            st.subheader("MVP Match Warnings")
+            for text in dict.fromkeys(warnings_mvp):
+                st.warning(str(text))
+    else:
+        if mvp_mode_enabled and core_has_ranked_phase:
+            st.info(
+                "Core B4 ranking is available. If plots are not shown yet, "
+                "click `Run Phase Match` once to refresh MVP visuals."
+            )
+        else:
+            st.info(
+                "Select CIF folder and click `Run Phase Match` to generate "
+                "phase ranking and visual outputs."
+            )
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -953,3 +2586,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

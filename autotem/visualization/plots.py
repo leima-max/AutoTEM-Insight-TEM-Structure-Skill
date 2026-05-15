@@ -14,6 +14,8 @@ try:
 except ImportError:  # pragma: no cover
     iio = None
 
+plt.switch_backend("Agg")
+
 
 def _load_array(uri: str | None) -> np.ndarray | None:
     if not uri:
