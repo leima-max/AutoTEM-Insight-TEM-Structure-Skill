@@ -413,6 +413,48 @@ def test_workflow_recipe_rejects_invalid_indexing_mode(tmp_path: Path) -> None:
         load_workflow_recipe(workflow_path)
 
 
+def test_workflow_recipe_rejects_invalid_b4_tolerances(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "invalid_b4_tolerance.yaml"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: invalid_b4_tolerance",
+                "  steps: [load, assess_quality, calibrate, preprocess, analyze, report]",
+                "  parameters:",
+                "    diffraction:",
+                "      indexing_mode: b4_mvp",
+                "      max_hkl: 0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_workflow_recipe(workflow_path)
+
+
+def test_workflow_recipe_rejects_non_list_candidate_phase_params(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "invalid_b4_phase_params.yaml"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: invalid_b4_phase_params",
+                "  steps: [load, assess_quality, calibrate, preprocess, analyze, report]",
+                "  parameters:",
+                "    diffraction:",
+                "      indexing_mode: b4_mvp",
+                "      candidate_phase_params: bad_payload",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_workflow_recipe(workflow_path)
+
+
 def test_workflow_recipe_accepts_b1_calibration_parameters(tmp_path: Path) -> None:
     workflow_path = tmp_path / "b1_calibration_params.yaml"
     workflow_path.write_text(

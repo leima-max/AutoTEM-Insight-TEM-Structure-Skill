@@ -102,14 +102,27 @@ workflow:
       top_k_peaks: 24
       min_peak_distance: 3.0
       center_exclusion_radius: 3.0
-      indexing_mode: auto
+      indexing_mode: auto  # auto | baseline | lattice_fit | b4_mvp | b4_strict
       peak_threshold_strategy: auto
       peak_threshold_value: 0.995
       subpixel_refine: true
       subpixel_window_radius: 2
       subpixel_max_shift: 1.5
+      max_hkl: 4
+      d_spacing_tolerance_rel: 0.08
+      angle_tolerance_deg: 12.0
       phase_top_n: 3
       candidate_phases: [Gold, Silicon]
+      candidate_phase_params:
+        - name: Silicon_like
+          a: 0.543
+          b: 0.543
+          c: 0.543
+          alpha: 90
+          beta: 90
+          gamma: 90
+          space_group: Fd-3m
+      # cif_candidates_dir: ./cif_candidates  # Used when indexing_mode=b4_strict
 outputs:
   formats: [json, csv, html]
   save_intermediates: true
