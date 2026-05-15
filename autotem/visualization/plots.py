@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -15,6 +13,8 @@ try:
     import imageio.v3 as iio
 except ImportError:  # pragma: no cover
     iio = None
+
+plt.switch_backend("Agg")
 
 
 def _load_array(uri: str | None) -> np.ndarray | None:
