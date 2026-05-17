@@ -16,6 +16,7 @@ from autotem.calibration.open_source_adapters import (
 from autotem.calibration.pixel_calibration import (
     coerce_length_to_nm,
     convert_length,
+    infer_pixel_size_from_scalebar,
     manual_pixel_size_from_reference,
     resolve_pixel_size_measurement,
     resolve_voltage_kv,
@@ -28,6 +29,7 @@ __all__ = [
     "diffraction_scale_from_known_d_spacing",
     "electron_wavelength_nm",
     "estimate_camera_length_mm",
+    "infer_pixel_size_from_scalebar",
     "manual_pixel_size_from_reference",
     "reciprocal_scale_from_pixel_size",
     "resolve_diffraction_calibration",

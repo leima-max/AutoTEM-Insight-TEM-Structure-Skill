@@ -148,6 +148,7 @@ WARNING_SEVERITY_BY_CODE: dict[str, str] = {
     "META_INVALID_PIXEL_SIZE": "warning",
     "META_INVALID_XRES": "warning",
     "META_UNKNOWN_RESOLUTION_UNIT": "warning",
+    "META_IMPLAUSIBLE_TIFF_SCALE": "warning",
     "META_MISSING_VOLTAGE": "warning",
     "META_INVALID_VOLTAGE": "warning",
     "META_MISSING_CAMERA_LENGTH": "warning",
@@ -167,6 +168,9 @@ METADATA_WARNING_CATALOG: dict[str, str] = {
     "META_UNKNOWN_RESOLUTION_UNIT": (
         "TIFF resolution unit is missing/unknown so pixel size is ambiguous."
     ),
+    "META_IMPLAUSIBLE_TIFF_SCALE": (
+        "TIFF DPI-derived pixel size is outside plausible TEM range and is ignored."
+    ),
     "META_MISSING_VOLTAGE": "Accelerating voltage metadata is not found.",
     "META_INVALID_VOLTAGE": (
         "Accelerating voltage metadata exists but cannot be parsed or converted."
@@ -184,6 +188,11 @@ METADATA_WARNING_CATALOG: dict[str, str] = {
         "Detector angle metadata exists but cannot be parsed or converted."
     ),
 }
+
+# Guardrails for TIFF DPI-derived scale only (XResolution/ResolutionUnit).
+# TIFF DPI is often display metadata rather than microscope calibration.
+_TIFF_DPI_PIXEL_SIZE_MIN_NM = 0.001
+_TIFF_DPI_PIXEL_SIZE_MAX_NM = 5_000.0
 
 
 def _mk_warning(
@@ -356,19 +365,35 @@ def _pixel_size_from_tiff_tags(
     unit_float = _as_float(resolution_unit)
     unit_numeric = int(unit_float) if unit_float is not None else None
 
+    inferred_nm_per_px: float | None = None
     if unit_numeric == 2:
-        return 25_400_000.0 / dpi, warnings
-    if unit_numeric == 3:
-        return 10_000_000.0 / dpi, warnings
-
-    warnings.append(
-        _mk_warning(
-            "META_UNKNOWN_RESOLUTION_UNIT",
-            "TIFF resolution unit is missing/unknown; cannot safely infer pixel size.",
-            field="pixel_size_nm",
+        inferred_nm_per_px = 25_400_000.0 / dpi
+    elif unit_numeric == 3:
+        inferred_nm_per_px = 10_000_000.0 / dpi
+    else:
+        warnings.append(
+            _mk_warning(
+                "META_UNKNOWN_RESOLUTION_UNIT",
+                "TIFF resolution unit is missing/unknown; cannot safely infer pixel size.",
+                field="pixel_size_nm",
+            )
         )
-    )
-    return None, warnings
+        return None, warnings
+
+    if not (_TIFF_DPI_PIXEL_SIZE_MIN_NM <= inferred_nm_per_px <= _TIFF_DPI_PIXEL_SIZE_MAX_NM):
+        warnings.append(
+            _mk_warning(
+                "META_IMPLAUSIBLE_TIFF_SCALE",
+                (
+                    "TIFF DPI-derived pixel size looks implausible for TEM calibration "
+                    f"({inferred_nm_per_px:.6g} nm/pixel); ignored."
+                ),
+                field="pixel_size_nm",
+            )
+        )
+        return None, warnings
+
+    return inferred_nm_per_px, warnings
 
 
 def _normalize_detector_angles_mrad(

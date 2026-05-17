@@ -171,14 +171,16 @@ def test_tiff_resolution_unit_parsing() -> None:
         {"XResolution": 1000.0, "ResolutionUnit": 2},
         source_format=".tiff",
     )
-    assert normalized["pixel_size_nm"] == pytest.approx(25_400.0)
-    assert not any(w["code"] == "META_MISSING_PIXEL_SIZE" for w in warnings)
+    assert normalized["pixel_size_nm"] is None
+    assert any(w["code"] == "META_IMPLAUSIBLE_TIFF_SCALE" for w in warnings)
+    assert any(w["code"] == "META_MISSING_PIXEL_SIZE" for w in warnings)
 
-    normalized_cm, _ = normalize_metadata(
+    normalized_cm, warnings_cm = normalize_metadata(
         {"XResolution": 1000.0, "ResolutionUnit": 3},
         source_format=".tiff",
     )
-    assert normalized_cm["pixel_size_nm"] == pytest.approx(10_000.0)
+    assert normalized_cm["pixel_size_nm"] is None
+    assert any(w["code"] == "META_IMPLAUSIBLE_TIFF_SCALE" for w in warnings_cm)
 
     normalized_unknown, warnings_unknown = normalize_metadata(
         {"XResolution": 1000.0, "ResolutionUnit": 1},
