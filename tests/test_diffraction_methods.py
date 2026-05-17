@@ -136,6 +136,44 @@ def test_lattice_fit_indexing_emits_residual_and_basis_metadata(tmp_path: Path) 
     assert indexing_meta.get("indexing_method") in {"lattice_fit", "lattice_fit_fallback"}
 
 
+def test_non_square_fft_uses_axis_specific_gvector_scaling(tmp_path: Path) -> None:
+    h, w = 96, 160
+    yy, xx = np.mgrid[0:h, 0:w]
+    fx = 9.0 / w
+    fy = 7.0 / h
+    image = (
+        np.cos(2.0 * np.pi * fx * xx)
+        + 0.9 * np.cos(2.0 * np.pi * fy * yy)
+    ).astype(np.float32)
+
+    preprocessing, calibration = _build_inputs(tmp_path, image)
+    result = run_diffraction_analysis(
+        preprocessing,
+        calibration,
+        parameters={
+            "top_k_peaks": 20,
+            "peak_threshold_strategy": "relative_max",
+            "peak_threshold_value": 0.10,
+            "subpixel_refine": True,
+            "center_mask_radius": 2.0,
+            "center_exclusion_radius": 2.0,
+            "axis_streak_mask_width": 0.0,
+            "allow_relaxed_fallback": True,
+        },
+    )
+
+    assert result.g_vectors
+    cx, cy = result.center
+    pixel_nm = 0.1
+    for peak, gv in zip(result.peaks[:6], result.g_vectors[:6], strict=False):
+        gx = float(gv.gx.value or 0.0)
+        gy = float(gv.gy.value or 0.0)
+        dx = float(peak.x - cx)
+        dy = float(peak.y - cy)
+        assert abs(gx * w * pixel_nm - dx) < 0.35
+        assert abs(gy * h * pixel_nm - dy) < 0.35
+
+
 def test_b4_mvp_indexing_mode_emits_phase_rank_and_hkl_assignments(tmp_path: Path) -> None:
     size = 128
     yy, xx = np.mgrid[0:size, 0:size]

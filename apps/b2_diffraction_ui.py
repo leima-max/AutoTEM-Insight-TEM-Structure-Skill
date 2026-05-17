@@ -4,6 +4,7 @@ import io
 import json
 import tempfile
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -13,7 +14,8 @@ import streamlit.elements.image as st_image
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 
-from autotem.calibration import calibrate_dataset
+from autotem.calibration.basic import calibrate_dataset
+from autotem.calibration.pixel_calibration import infer_pixel_size_from_scalebar
 from autotem.diffraction import run_diffraction_analysis
 from autotem.diffraction.phase_lookup import lookup_phase_candidates
 from autotem.diffraction.phase_mvp import (
@@ -27,6 +29,7 @@ from autotem.diffraction.phase_mvp import (
 )
 from autotem.io import load_tem_dataset, read_image
 from autotem.preprocessing import assess_quality, preprocess_dataset
+from autotem.strain import run_gpa
 
 # Compatibility patch for streamlit-drawable-canvas on newer Streamlit.
 if not hasattr(st_image, "image_to_url"):
@@ -49,6 +52,10 @@ if not hasattr(st_image, "image_to_url"):
 
 PHASE_OPTIONS = ["Silicon", "Gold", "Graphite", "Titanium Dioxide"]
 FFT_DETECTOR_BUILD_TAG = "b2_fft_peak_v2_2026-05-15"
+# Guardrail for B2 diffraction: if auto-scale is far outside this range,
+# treat metadata scale as suspicious and fallback to manual input.
+_B2_AUTO_SCALE_MIN_NM_PER_PX = 0.001
+_B2_AUTO_SCALE_MAX_NM_PER_PX = 5.0
 PHASE_REFERENCE_DB: list[tuple[str, str, str, tuple[float, ...]]] = [
     ("Silicon", "Si", "mp-149", (0.313, 0.192, 0.163, 0.136)),
     ("Gold", "Au", "mp-81", (0.235, 0.204, 0.144, 0.123)),
@@ -315,6 +322,421 @@ def _fig_to_bytes(fig: plt.Figure, *, fmt: str) -> bytes:
     return buf.getvalue()
 
 
+def _extract_inline_map(array_ref: Any) -> np.ndarray | None:
+    if array_ref is None:
+        return None
+    inline = getattr(array_ref, "inline", None)
+    if inline is None:
+        return None
+    try:
+        arr = np.asarray(inline, dtype=np.float32)
+    except Exception:  # noqa: BLE001
+        return None
+    if arr.ndim != 2 or arr.size == 0:
+        return None
+    return arr
+
+
+def _plot_gpa_maps(
+    strain_result: Any,
+    *,
+    strain_unit_mode: str = "fraction",
+    rotation_unit_mode: str = "rad",
+    auto_range: bool = True,
+    disp_abs: float = 2.0,
+    strain_abs: float = 0.05,
+    rotation_abs: float = 0.05,
+    border_crop_px: int = 0,
+) -> plt.Figure:
+    strain_scale = 100.0 if strain_unit_mode == "%" else 1.0
+    strain_unit = "%" if strain_unit_mode == "%" else "fraction"
+    rot_scale = float(180.0 / np.pi) if rotation_unit_mode == "deg" else 1.0
+    rot_unit = "deg" if rotation_unit_mode == "deg" else "rad"
+
+    fields = [
+        ("displacement_x", "ux displacement", "coolwarm", 1.0, "px", disp_abs),
+        ("displacement_y", "uy displacement", "coolwarm", 1.0, "px", disp_abs),
+        ("strain_xx", "exx strain", "coolwarm", strain_scale, strain_unit, strain_abs),
+        ("strain_yy", "eyy strain", "coolwarm", strain_scale, strain_unit, strain_abs),
+        ("strain_xy", "exy strain", "coolwarm", strain_scale, strain_unit, strain_abs),
+        ("rotation_xy", "rotation (wxy)", "coolwarm", rot_scale, rot_unit, rotation_abs),
+    ]
+    fig, axes = plt.subplots(2, 3, figsize=(10.5, 6.4), dpi=140)
+    for ax, (field, title, cmap, scale, unit, abs_range) in zip(
+        axes.flatten(),
+        fields,
+        strict=False,
+    ):
+        arr = _extract_inline_map(getattr(strain_result, field, None))
+        if arr is None:
+            ax.set_title(f"{title} (missing)")
+            ax.axis("off")
+            continue
+        data = arr.astype(np.float32, copy=True) * float(scale)
+        if border_crop_px > 0:
+            crop = int(border_crop_px)
+            if crop * 2 < data.shape[0] and crop * 2 < data.shape[1]:
+                data[:crop, :] = np.nan
+                data[-crop:, :] = np.nan
+                data[:, :crop] = np.nan
+                data[:, -crop:] = np.nan
+        if auto_range:
+            vmin = float(np.nanpercentile(data, 2.0))
+            vmax = float(np.nanpercentile(data, 98.0))
+            if np.isclose(vmin, vmax):
+                vmax = vmin + 1e-6
+        else:
+            vmin = -float(abs_range)
+            vmax = float(abs_range)
+        im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax)
+        ax.set_title(f"{title} [{unit}]")
+        ax.axis("off")
+        cbar = fig.colorbar(im, ax=ax, shrink=0.72, pad=0.02)
+        cbar.set_label(unit)
+    fig.tight_layout()
+    return fig
+
+
+def _plot_gpa_debug_maps(
+    strain_result: Any,
+    *,
+    phase_unit_mode: str = "rad",
+) -> plt.Figure | None:
+    prov = getattr(strain_result, "provenance", {})
+    if not isinstance(prov, dict):
+        return None
+    method_meta = prov.get("method_metadata", {})
+    if not isinstance(method_meta, dict):
+        return None
+    debug_maps = method_meta.get("debug_maps", {})
+    if not isinstance(debug_maps, dict):
+        return None
+
+    def _arr(name: str) -> np.ndarray | None:
+        value = debug_maps.get(name)
+        if value is None:
+            return None
+        try:
+            arr = np.asarray(value, dtype=np.float32)
+        except Exception:  # noqa: BLE001
+            return None
+        if arr.ndim != 2:
+            return None
+        return arr
+
+    phase1 = _arr("phase1_unwrapped_rad")
+    phase2 = _arr("phase2_unwrapped_rad")
+    mask1 = _arr("mask1")
+    mask2 = _arr("mask2")
+    if phase1 is None or phase2 is None or mask1 is None or mask2 is None:
+        return None
+
+    phase_scale = float(180.0 / np.pi) if phase_unit_mode == "deg" else 1.0
+    phase_unit = "deg" if phase_unit_mode == "deg" else "rad"
+    phase1_show = phase1 * phase_scale
+    phase2_show = phase2 * phase_scale
+
+    fig, axes = plt.subplots(2, 2, figsize=(9.2, 7.2), dpi=140)
+    items = [
+        (phase1_show, f"Phase 1 [{phase_unit}]", "twilight"),
+        (phase2_show, f"Phase 2 [{phase_unit}]", "twilight"),
+        (mask1, "Mask 1 [a.u.]", "magma"),
+        (mask2, "Mask 2 [a.u.]", "magma"),
+    ]
+    for ax, (arr, title, cmap) in zip(axes.flatten(), items, strict=False):
+        im = ax.imshow(arr, cmap=cmap)
+        ax.set_title(title)
+        ax.axis("off")
+        fig.colorbar(im, ax=ax, shrink=0.74, pad=0.02)
+    fig.tight_layout()
+    return fig
+
+
+def _compute_gpa_phase_mask_fallback(
+    image: np.ndarray,
+    *,
+    g_vectors_nm: list[tuple[float, float]],
+    pixel_size_nm: float,
+    mask_sigma_px: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    if len(g_vectors_nm) < 2 or pixel_size_nm <= 0 or mask_sigma_px <= 0:
+        return None
+    arr = np.asarray(image, dtype=np.float64)
+    arr = arr - float(np.mean(arr))
+    std = float(np.std(arr))
+    if std > 1e-12:
+        arr = arr / std
+
+    h, w = arr.shape
+    fft = np.fft.fftshift(np.fft.fft2(arr))
+    yy, xx = np.indices((h, w), dtype=np.float64)
+
+    def _phase_and_mask(g_nm: tuple[float, float]) -> tuple[np.ndarray, np.ndarray]:
+        gx_px = float(g_nm[0]) * float(pixel_size_nm)
+        gy_px = float(g_nm[1]) * float(pixel_size_nm)
+        px = (w / 2.0) + gx_px * w
+        py = (h / 2.0) + gy_px * h
+        mask = np.exp(-(((yy - py) ** 2 + (xx - px) ** 2) / (2.0 * mask_sigma_px**2)))
+        filtered = np.fft.ifft2(np.fft.ifftshift(fft * mask))
+        phase = np.angle(filtered)
+        phase = phase - (2.0 * np.pi * (gx_px * xx + gy_px * yy))
+        phase = np.unwrap(np.unwrap(phase, axis=0), axis=1)
+        return phase.astype(np.float32), mask.astype(np.float32)
+
+    phase1, mask1 = _phase_and_mask(g_vectors_nm[0])
+    phase2, mask2 = _phase_and_mask(g_vectors_nm[1])
+    return phase1, phase2, mask1, mask2
+
+
+def _plot_phase_mask_arrays(
+    *,
+    phase1: np.ndarray,
+    phase2: np.ndarray,
+    mask1: np.ndarray,
+    mask2: np.ndarray,
+    phase_unit_mode: str = "rad",
+) -> plt.Figure:
+    phase_scale = float(180.0 / np.pi) if phase_unit_mode == "deg" else 1.0
+    phase_unit = "deg" if phase_unit_mode == "deg" else "rad"
+    p1 = np.asarray(phase1, dtype=np.float32) * phase_scale
+    p2 = np.asarray(phase2, dtype=np.float32) * phase_scale
+    m1 = np.asarray(mask1, dtype=np.float32)
+    m2 = np.asarray(mask2, dtype=np.float32)
+
+    fig, axes = plt.subplots(2, 2, figsize=(9.2, 7.2), dpi=140)
+    items = [
+        (p1, f"Phase 1 [{phase_unit}]", "twilight"),
+        (p2, f"Phase 2 [{phase_unit}]", "twilight"),
+        (m1, "Mask 1 [a.u.]", "magma"),
+        (m2, "Mask 2 [a.u.]", "magma"),
+    ]
+    for ax, (arr, title, cmap) in zip(axes.flatten(), items, strict=False):
+        im = ax.imshow(arr, cmap=cmap)
+        ax.set_title(title)
+        ax.axis("off")
+        fig.colorbar(im, ax=ax, shrink=0.74, pad=0.02)
+    fig.tight_layout()
+    return fig
+
+
+def _select_g_vectors_from_peak_rows(
+    peak_rows: list[dict[str, Any]],
+) -> tuple[list[tuple[float, float]], tuple[int, int] | None]:
+    candidates: list[tuple[int, float, float, float]] = []
+    for i, row in enumerate(peak_rows):
+        try:
+            gx = float(row.get("gx_1_per_nm", row.get("g_x", 0.0)) or 0.0)
+            gy = float(row.get("gy_1_per_nm", row.get("g_y", 0.0)) or 0.0)
+            inten = float(row.get("intensity", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        gnorm = float(np.hypot(gx, gy))
+        if gnorm <= 1e-8:
+            continue
+        candidates.append((i, gx, gy, inten))
+
+    if len(candidates) < 2:
+        return [], None
+
+    ranked = sorted(candidates, key=lambda item: item[3], reverse=True)[: min(12, len(candidates))]
+    best_pair: tuple[int, int] | None = None
+    best_score = -np.inf
+    for i in range(len(ranked)):
+        for j in range(i + 1, len(ranked)):
+            idx1, gx1, gy1, inten1 = ranked[i]
+            idx2, gx2, gy2, inten2 = ranked[j]
+            v1 = np.array([gx1, gy1], dtype=np.float64)
+            v2 = np.array([gx2, gy2], dtype=np.float64)
+            n1 = float(np.linalg.norm(v1))
+            n2 = float(np.linalg.norm(v2))
+            if n1 <= 1e-9 or n2 <= 1e-9:
+                continue
+            cross = float(abs(v1[0] * v2[1] - v1[1] * v2[0]))
+            if cross <= 1e-8:
+                continue
+            cosang = float(np.dot(v1, v2) / (n1 * n2))
+            cosang = max(-1.0, min(1.0, cosang))
+            angle = float(np.arccos(cosang))
+            if angle < np.deg2rad(10.0) or angle > np.deg2rad(170.0):
+                continue
+            score = cross * np.sqrt(max(inten1, 0.0) * max(inten2, 0.0))
+            if score > best_score:
+                best_score = score
+                best_pair = (idx1, idx2)
+
+    if best_pair is None:
+        idx1, gx1, gy1, _ = ranked[0]
+        idx2, gx2, gy2, _ = ranked[1]
+        return [(gx1, gy1), (gx2, gy2)], (idx1, idx2)
+
+    idx1, idx2 = best_pair
+    row1 = peak_rows[idx1]
+    row2 = peak_rows[idx2]
+    g1 = (
+        float(row1.get("gx_1_per_nm", row1.get("g_x", 0.0)) or 0.0),
+        float(row1.get("gy_1_per_nm", row1.get("g_y", 0.0)) or 0.0),
+    )
+    g2 = (
+        float(row2.get("gx_1_per_nm", row2.get("g_x", 0.0)) or 0.0),
+        float(row2.get("gy_1_per_nm", row2.get("g_y", 0.0)) or 0.0),
+    )
+    return [g1, g2], best_pair
+
+
+def _auto_gpa_mask_sigma_from_nm_vectors(
+    g_vectors_nm: list[tuple[float, float]],
+    pixel_size_nm: float,
+    image_shape: tuple[int, int],
+    factor: float,
+) -> float:
+    if len(g_vectors_nm) < 2 or pixel_size_nm <= 0:
+        return 8.0
+    gv_px = [(gx * pixel_size_nm, gy * pixel_size_nm) for gx, gy in g_vectors_nm]
+    min_hw = float(min(image_shape))
+    r_vals = [float(np.hypot(gx, gy) * min_hw) for gx, gy in gv_px]
+    if not r_vals:
+        return 8.0
+    sigma = factor * max(min(r_vals), 1.0)
+    return float(np.clip(sigma, 2.0, min(image_shape) / 4.0))
+
+
+def _infer_pixel_size_nm_from_peak_row(
+    row: dict[str, Any],
+    image_shape: tuple[int, int],
+) -> float | None:
+    h, w = image_shape
+    cx = float(w) / 2.0
+    cy = float(h) / 2.0
+    try:
+        x = float(row.get("x", row.get("refined_x", 0.0)) or 0.0)
+        y = float(row.get("y", row.get("refined_y", 0.0)) or 0.0)
+        gx = float(row.get("gx_1_per_nm", row.get("g_x", 0.0)) or 0.0)
+        gy = float(row.get("gy_1_per_nm", row.get("g_y", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        return None
+    dx = x - cx
+    dy = y - cy
+    candidates: list[float] = []
+    if abs(gx) > 1e-12 and abs(dx) > 1e-6:
+        candidates.append(dx / (gx * float(w)))
+    if abs(gy) > 1e-12 and abs(dy) > 1e-6:
+        candidates.append(dy / (gy * float(h)))
+    positive = [float(val) for val in candidates if float(val) > 0]
+    if not positive:
+        return None
+    return float(np.median(np.asarray(positive, dtype=np.float64)))
+
+
+def _infer_pixel_size_nm_from_peak_rows(
+    rows: list[dict[str, Any]],
+    image_shape: tuple[int, int],
+) -> float | None:
+    values = [
+        inferred
+        for inferred in (
+            _infer_pixel_size_nm_from_peak_row(row, image_shape)
+            for row in rows
+        )
+        if inferred is not None and inferred > 0
+    ]
+    if not values:
+        return None
+    return float(np.median(np.asarray(values, dtype=np.float64)))
+
+
+def _peak_xy_from_row(row: dict[str, Any]) -> tuple[float, float] | None:
+    try:
+        x = float(row.get("refined_x", row.get("x", 0.0)) or 0.0)
+        y = float(row.get("refined_y", row.get("y", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return x, y
+
+
+def _mask_target_xy_from_g_vector(
+    row: dict[str, Any],
+    *,
+    pixel_size_nm: float,
+    image_shape: tuple[int, int],
+) -> tuple[float, float] | None:
+    if pixel_size_nm <= 0:
+        return None
+    h, w = image_shape
+    try:
+        gx = float(row.get("gx_1_per_nm", row.get("g_x", 0.0)) or 0.0)
+        gy = float(row.get("gy_1_per_nm", row.get("g_y", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        return None
+    x = (float(w) / 2.0) + gx * float(w) * float(pixel_size_nm)
+    y = (float(h) / 2.0) + gy * float(h) * float(pixel_size_nm)
+    return x, y
+
+
+def _build_mask_vs_peak_rows(
+    rows: list[dict[str, Any]],
+    *,
+    image_shape: tuple[int, int],
+    pixel_size_nm_b2: float,
+    pixel_size_nm_forced: float,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        actual_xy = _peak_xy_from_row(row)
+        if actual_xy is None:
+            continue
+        actual_x, actual_y = actual_xy
+        b2_xy = _mask_target_xy_from_g_vector(
+            row,
+            pixel_size_nm=pixel_size_nm_b2,
+            image_shape=image_shape,
+        )
+        forced_xy = _mask_target_xy_from_g_vector(
+            row,
+            pixel_size_nm=pixel_size_nm_forced,
+            image_shape=image_shape,
+        )
+        out.append(
+            {
+                "peak": int(row.get("peak_id", row.get("peak_index", -1)) or -1),
+                "actual_x": round(actual_x, 4),
+                "actual_y": round(actual_y, 4),
+                "b2_target_x": None if b2_xy is None else round(float(b2_xy[0]), 4),
+                "b2_target_y": None if b2_xy is None else round(float(b2_xy[1]), 4),
+                "b2_delta_r_px": (
+                    None
+                    if b2_xy is None
+                    else round(float(np.hypot(b2_xy[0] - actual_x, b2_xy[1] - actual_y)), 4)
+                ),
+                "forced_target_x": None if forced_xy is None else round(float(forced_xy[0]), 4),
+                "forced_target_y": None if forced_xy is None else round(float(forced_xy[1]), 4),
+                "forced_delta_r_px": (
+                    None
+                    if forced_xy is None
+                    else round(
+                        float(np.hypot(forced_xy[0] - actual_x, forced_xy[1] - actual_y)),
+                        4,
+                    )
+                ),
+            }
+        )
+    return out
+
+
+def _run_gpa_compat(**kwargs: Any):
+    """
+    Compatibility wrapper:
+    older runtime may still have `run_gpa` without `include_debug_maps`.
+    """
+    try:
+        return run_gpa(**kwargs)
+    except TypeError as exc:
+        if "include_debug_maps" not in str(exc):
+            raise
+        fallback = dict(kwargs)
+        fallback.pop("include_debug_maps", None)
+        return run_gpa(**fallback)
+
+
 def _as_array_from_debug(value: Any) -> np.ndarray | None:
     if value is None:
         return None
@@ -401,13 +823,13 @@ def _build_core_peak_rows(
                 "dy": round(float(detail.get("dy", y - cy)), 4),
                 "r_px": round(float(detail.get("r_px", np.hypot(x - cx, y - cy))), 4),
                 "theta_deg": round(float(detail.get("theta_deg", theta_fallback)), 3),
-                "g_x": round(gx, 6),
-                "g_y": round(gy, 6),
-                "g_norm": round(g_norm, 6),
+                "g_x": round(gx, 9),
+                "g_y": round(gy, 9),
+                "g_norm": round(g_norm, 9),
                 "d_spacing": round(d_nm, 6),
-                "gx_1_per_nm": round(gx, 6),
-                "gy_1_per_nm": round(gy, 6),
-                "g_mag_1_per_nm": round(g_norm, 6),
+                "gx_1_per_nm": round(gx, 9),
+                "gy_1_per_nm": round(gy, 9),
+                "g_mag_1_per_nm": round(g_norm, 9),
                 "d_nm": round(d_nm, 6),
                 "h": h_val,
                 "k": k_val,
@@ -465,6 +887,71 @@ def _extract_auto_pixel_size_nm(dataset) -> tuple[float | None, str]:
             pass
 
     return None, "not found"
+
+
+def _is_reasonable_b2_fft_pixel_scale(pixel_size_nm: float) -> bool:
+    return _B2_AUTO_SCALE_MIN_NM_PER_PX <= pixel_size_nm <= _B2_AUTO_SCALE_MAX_NM_PER_PX
+
+
+def _resolve_auto_pixel_scale_for_b2(
+    dataset,
+    image: np.ndarray,
+    *,
+    input_path: Path,
+) -> tuple[float | None, str, list[str]]:
+    notes: list[str] = []
+    metadata_nm, metadata_source = _extract_auto_pixel_size_nm(dataset)
+    if metadata_nm is not None and _is_reasonable_b2_fft_pixel_scale(float(metadata_nm)):
+        return float(metadata_nm), metadata_source, notes
+
+    if metadata_nm is not None:
+        notes.append(
+            "Metadata scale is implausible for FFT diffraction "
+            f"({float(metadata_nm):.6f} nm/pixel from {metadata_source})."
+        )
+
+    inferred_nm, infer_source, infer_warnings = infer_pixel_size_from_scalebar(
+        image,
+        metadata=(dataset.metadata if isinstance(dataset.metadata, dict) else None),
+        file_hint=input_path.name,
+    )
+    notes.extend(infer_warnings)
+    if inferred_nm is not None and _is_reasonable_b2_fft_pixel_scale(float(inferred_nm)):
+        return float(inferred_nm), f"auto scale-bar ({infer_source})", notes
+
+    return None, "not found", notes
+
+
+@st.cache_data(show_spinner=False)
+def _load_cif_phase_entries_cached(
+    cif_dir: str,
+    selected_names: tuple[str, ...],
+) -> tuple[list[PhaseEntry], list[str]]:
+    selected = set(selected_names) if selected_names else None
+    return load_cif_phase_entries(cif_dir, selected_names=selected)
+
+
+@st.cache_data(show_spinner=False)
+def _match_candidates_cached(
+    peak_rows_json: str,
+    entries_json: str,
+    *,
+    max_hkl: int,
+    zone_axis: tuple[int, int, int],
+    d_tol_rel: float,
+    angle_tol_deg: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
+    peak_rows = json.loads(peak_rows_json)
+    entry_payloads = json.loads(entries_json)
+    entries = [PhaseEntry(**payload) for payload in entry_payloads]
+    return match_candidates(
+        peak_rows,
+        entries,
+        max_hkl=max_hkl,
+        zone_axis=zone_axis,
+        d_tol_rel=d_tol_rel,
+        angle_tol_deg=angle_tol_deg,
+    )
 
 
 def _apply_fft_display_adjustments(
@@ -629,7 +1116,8 @@ def _analyze_selected_spots(
 ]:
     h, w = fft_magnitude.shape
     cy, cx = h / 2.0, w / 2.0
-    reciprocal_scale = 1.0 / (min(h, w) * max(pixel_size_nm, 1e-9))
+    reciprocal_scale_x = 1.0 / (float(w) * max(pixel_size_nm, 1e-9))
+    reciprocal_scale_y = 1.0 / (float(h) * max(pixel_size_nm, 1e-9))
 
     base_rows: list[dict[str, Any]] = []
     d_values_nm: list[float] = []
@@ -644,8 +1132,8 @@ def _analyze_selected_spots(
 
         dx = float(x - cx)
         dy = float(y - cy)
-        gx = dx * reciprocal_scale
-        gy = dy * reciprocal_scale
+        gx = dx * reciprocal_scale_x
+        gy = dy * reciprocal_scale_y
         gxy.append((gx, gy))
         g_mag = float(np.hypot(gx, gy))
         d_nm = 0.0 if g_mag <= 1e-8 else 1.0 / g_mag
@@ -658,9 +1146,9 @@ def _analyze_selected_spots(
                 "x": round(float(x), 4),
                 "y": round(float(y), 4),
                 "intensity": round(intensity, 6),
-                "gx_1_per_nm": round(gx, 6),
-                "gy_1_per_nm": round(gy, 6),
-                "g_mag_1_per_nm": round(g_mag, 6),
+                "gx_1_per_nm": round(gx, 9),
+                "gy_1_per_nm": round(gy, 9),
+                "g_mag_1_per_nm": round(g_mag, 9),
                 "d_nm": round(d_nm, 6),
                 "h_baseline": hkl[0],
                 "k_baseline": hkl[1],
@@ -774,6 +1262,55 @@ def _to_fft_display_image(
     return img, sx, sy
 
 
+def _normalize_for_display(image: np.ndarray) -> np.ndarray:
+    arr = np.asarray(image, dtype=np.float32)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return np.zeros_like(arr, dtype=np.float32)
+    if not finite.all():
+        fill = float(np.nanmedian(arr[finite]))
+        arr = np.where(finite, arr, fill)
+    p1, p99 = np.percentile(arr, [1.0, 99.0])
+    span = max(float(p99 - p1), 1e-12)
+    out = (arr - float(p1)) / span
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+def _prepare_gpa_input_image(
+    image: np.ndarray,
+    *,
+    subtract_row_mean: bool = False,
+    apply_hann_window: bool = False,
+) -> np.ndarray:
+    arr = np.asarray(image, dtype=np.float32).copy()
+    if subtract_row_mean:
+        arr -= np.mean(arr, axis=1, keepdims=True, dtype=np.float32)
+    if apply_hann_window:
+        wy = np.hanning(arr.shape[0]).astype(np.float32)
+        wx = np.hanning(arr.shape[1]).astype(np.float32)
+        window = np.outer(wy, wx).astype(np.float32)
+        arr *= window
+    return arr
+
+
+def _load_preprocessing_image_or_original(
+    preprocessing: Any,
+    original_image: np.ndarray,
+) -> np.ndarray:
+    image_ref = getattr(preprocessing, "image", None)
+    uri = getattr(image_ref, "uri", None)
+    if isinstance(uri, str) and uri:
+        path = Path(uri)
+        try:
+            if path.exists() and path.suffix.lower() == ".npy":
+                arr = np.load(path, allow_pickle=False).astype(np.float32)
+                if arr.ndim == 2 and arr.size > 0:
+                    return arr
+        except Exception:  # noqa: BLE001
+            pass
+    return np.asarray(original_image, dtype=np.float32)
+
+
 def _extract_canvas_points_xy(
     canvas_result: Any,
     *,
@@ -825,6 +1362,53 @@ def _extract_canvas_points_xy(
 
         points.append((disp_x * sx, disp_y * sy))
     return points
+
+
+def _extract_canvas_rect_roi(
+    canvas_result: Any,
+    *,
+    sx: float,
+    sy: float,
+    shape_hw: tuple[int, int],
+) -> tuple[int, int, int, int] | None:
+    json_data = getattr(canvas_result, "json_data", None)
+    if not isinstance(json_data, dict):
+        return None
+    objects = json_data.get("objects")
+    if not isinstance(objects, list) or not objects:
+        return None
+
+    rect_obj = None
+    for obj in reversed(objects):
+        if isinstance(obj, dict) and str(obj.get("type", "")).lower() == "rect":
+            rect_obj = obj
+            break
+    if rect_obj is None:
+        return None
+
+    try:
+        left = float(rect_obj.get("left", 0.0))
+        top = float(rect_obj.get("top", 0.0))
+        width = float(rect_obj.get("width", 0.0))
+        height = float(rect_obj.get("height", 0.0))
+        scale_x = float(rect_obj.get("scaleX", 1.0))
+        scale_y = float(rect_obj.get("scaleY", 1.0))
+    except (TypeError, ValueError):
+        return None
+
+    x0 = left
+    y0 = top
+    x1 = left + width * scale_x
+    y1 = top + height * scale_y
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    h, w = shape_hw
+    rx0 = int(np.clip(np.floor(x0 * sx), 0, w - 1))
+    rx1 = int(np.clip(np.ceil(x1 * sx), rx0 + 1, w))
+    ry0 = int(np.clip(np.floor(y0 * sy), 0, h - 1))
+    ry1 = int(np.clip(np.ceil(y1 * sy), ry0 + 1, h))
+    return (ry0, ry1, rx0, rx1)
 
 
 def _generate_lattice_points_from_two_basis(
@@ -1732,19 +2316,43 @@ def main() -> None:
             st.error(f"Failed to load input: {exc}")
             return
 
-        auto_pixel_size_nm, auto_scale_source = _extract_auto_pixel_size_nm(dataset)
+        auto_scale_notes: list[str] = []
+        auto_pixel_size_nm: float | None = None
+        auto_scale_source = "not found"
+        if auto_scale:
+            (
+                auto_pixel_size_nm,
+                auto_scale_source,
+                auto_scale_notes,
+            ) = _resolve_auto_pixel_scale_for_b2(
+                dataset,
+                original_image,
+                input_path=input_path,
+            )
+
         if auto_scale and auto_pixel_size_nm is not None:
-            effective_pixel_size_nm = auto_pixel_size_nm
+            effective_pixel_size_nm = float(auto_pixel_size_nm)
+            note_suffix = (
+                f" Details: {'; '.join(auto_scale_notes)}"
+                if auto_scale_notes
+                else ""
+            )
             scale_note = (
                 f"Scale auto-calibrated: {effective_pixel_size_nm:.6f} nm/pixel "
-                f"(source: {auto_scale_source})."
+                f"(source: {auto_scale_source}).{note_suffix}"
             )
         else:
             effective_pixel_size_nm = float(pixel_size_nm_manual)
             if auto_scale:
+                note_suffix = (
+                    f" Details: {'; '.join(auto_scale_notes)}"
+                    if auto_scale_notes
+                    else ""
+                )
                 scale_note = (
                     "Auto scale was requested but metadata scale was not found; "
                     f"fallback to manual {effective_pixel_size_nm:.6f} nm/pixel."
+                    f"{note_suffix}"
                 )
             else:
                 scale_note = f"Using manual scale: {effective_pixel_size_nm:.6f} nm/pixel."
@@ -1881,7 +2489,10 @@ def main() -> None:
             st.error(f"B2 analysis failed: {exc}")
             return
 
-        processed_image = np.load(npy_path, allow_pickle=False).astype(np.float32)
+        processed_image = _load_preprocessing_image_or_original(
+            preprocessing,
+            original_image,
+        )
         fft_complex = np.fft.fftshift(np.fft.fft2(processed_image))
         fft_magnitude = np.abs(fft_complex).astype(np.float32)
         fft_img = _fft_preview(processed_image)
@@ -2315,6 +2926,473 @@ def main() -> None:
         for text in diag_summary:
             st.caption(f"- {text}")
 
+    st.subheader("C2 GPA Panel")
+    st.caption(
+        "Run strain mapping directly from current B3/B2 g-vectors. "
+        "No need to wait for B4."
+    )
+    g_auto, g_auto_pair = _select_g_vectors_from_peak_rows(peak_rows)
+    h_img, w_img = processed_image.shape
+    px_nm_for_gpa = float(context.get("effective_pixel_size_nm", 0.02))
+    if px_nm_for_gpa <= 0:
+        px_nm_for_gpa = 0.02
+    gpa_scale_sync_sig = f"{run_signature}|{px_nm_for_gpa:.9f}"
+    if st.session_state.get("b2_gpa_pixel_size_sync_sig") != gpa_scale_sync_sig:
+        st.session_state["b2_gpa_pixel_size_nm"] = float(px_nm_for_gpa)
+        st.session_state["b2_gpa_pixel_size_sync_sig"] = gpa_scale_sync_sig
+
+    with st.expander("Configure GPA / PPA", expanded=False):
+        st.caption(
+            "B2 current reciprocal calibration uses pixel size "
+            f"{float(px_nm_for_gpa):.6f} nm/pixel."
+        )
+        gpa_method = st.selectbox(
+            "Strain method",
+            options=["gpa_b3", "ppa_ai_stem"],
+            index=0,
+            key="b2_gpa_method",
+        )
+        gpa_show_phase_mask = st.checkbox(
+            "Show phase + mask maps (GPA only)",
+            value=True,
+            key="b2_gpa_show_phase_mask",
+        )
+        gpa_subtract_row_mean = st.checkbox(
+            "Subtract row mean before GPA (diagnostic)",
+            value=False,
+            key="b2_gpa_subtract_row_mean",
+        )
+        gpa_apply_hann = st.checkbox(
+            "Apply Hann window before GPA (diagnostic)",
+            value=False,
+            key="b2_gpa_apply_hann",
+        )
+        phase_unit_mode = st.selectbox(
+            "Phase unit",
+            options=["rad", "deg"],
+            index=0,
+            key="b2_gpa_phase_unit_mode",
+            disabled=not gpa_show_phase_mask,
+        )
+        strain_unit_mode = st.selectbox(
+            "Strain display unit",
+            options=["fraction", "%"],
+            index=0,
+            key="b2_gpa_strain_unit_mode",
+        )
+        rotation_unit_mode = st.selectbox(
+            "Rotation display unit",
+            options=["rad", "deg"],
+            index=0,
+            key="b2_gpa_rotation_unit_mode",
+        )
+        auto_color_range = st.checkbox(
+            "Auto color range (2-98 percentile)",
+            value=True,
+            key="b2_gpa_auto_color_range",
+        )
+        border_crop_px = st.slider(
+            "Display border crop (px)",
+            min_value=0,
+            max_value=32,
+            value=4,
+            step=1,
+            key="b2_gpa_border_crop_px",
+            help="Hide a thin edge band in plots to suppress boundary-difference artifacts.",
+        )
+        if auto_color_range:
+            disp_abs = 2.0
+            strain_abs = 0.05 if strain_unit_mode == "fraction" else 5.0
+            rotation_abs = 0.05 if rotation_unit_mode == "rad" else 3.0
+        else:
+            disp_abs = st.number_input(
+                "Displacement range abs (px)",
+                min_value=1e-4,
+                value=2.0,
+                step=0.1,
+                key="b2_gpa_disp_abs",
+            )
+            strain_abs = st.number_input(
+                f"Strain range abs ({'fraction' if strain_unit_mode == 'fraction' else '%'})",
+                min_value=1e-6,
+                value=(0.05 if strain_unit_mode == "fraction" else 5.0),
+                step=(0.001 if strain_unit_mode == "fraction" else 0.1),
+                key="b2_gpa_strain_abs",
+            )
+            rotation_abs = st.number_input(
+                f"Rotation range abs ({rotation_unit_mode})",
+                min_value=1e-6,
+                value=(0.05 if rotation_unit_mode == "rad" else 3.0),
+                step=(0.001 if rotation_unit_mode == "rad" else 0.1),
+                key="b2_gpa_rotation_abs",
+            )
+
+        gpa_px_nm = st.number_input(
+            "Fallback/manual pixel size for strain (nm/pixel)",
+            min_value=1e-6,
+            value=float(px_nm_for_gpa),
+            step=0.001,
+            format="%.6f",
+            key="b2_gpa_pixel_size_nm",
+            help=(
+                "Used for manual g-vectors and PPA. "
+                "When `Use current peak table` is selected, GPA is forced to use "
+                "the pixel size implied by the selected FFT peaks."
+            ),
+        )
+        roi_mode = st.radio(
+            "Reference ROI selection",
+            options=["Canvas on original image", "Numeric input"],
+            index=0,
+            key="b2_gpa_roi_mode",
+            horizontal=True,
+        )
+        prev_roi_mode = st.session_state.get("b2_gpa_prev_roi_mode")
+        if prev_roi_mode != roi_mode:
+            st.session_state["b2_gpa_prev_roi_mode"] = roi_mode
+            if roi_mode == "Canvas on original image":
+                st.session_state["b2_gpa_roi_canvas_nonce"] = int(
+                    st.session_state.get("b2_gpa_roi_canvas_nonce", 0)
+                ) + 1
+                st.rerun()
+        default_roi = (h_img // 4, (3 * h_img) // 4, w_img // 4, (3 * w_img) // 4)
+        ref_roi = st.session_state.get("b2_gpa_ref_roi", default_roi)
+        if not isinstance(ref_roi, tuple) or len(ref_roi) != 4:
+            ref_roi = default_roi
+
+        if roi_mode == "Canvas on original image":
+            st.caption("Draw rectangle on original image and click `Apply ROI`.")
+            if "b2_gpa_roi_canvas_nonce" not in st.session_state:
+                st.session_state["b2_gpa_roi_canvas_nonce"] = 0
+            roi_img = _normalize_for_display(
+                np.asarray(context["original_image"], dtype=np.float32)
+            )
+            roi_canvas_img, roi_sx, roi_sy = _to_fft_display_image(roi_img, max_side=780)
+            canvas_key = f"b2-gpa-roi-canvas-{int(st.session_state['b2_gpa_roi_canvas_nonce'])}"
+            roi_canvas = st_canvas(
+                fill_color="rgba(255, 128, 0, 0.18)",
+                stroke_width=2,
+                stroke_color="#ff8800",
+                background_image=roi_canvas_img,
+                drawing_mode="rect",
+                display_toolbar=True,
+                update_streamlit=True,
+                height=roi_canvas_img.height,
+                width=roi_canvas_img.width,
+                key=canvas_key,
+            )
+            roi_col1, roi_col2 = st.columns([1, 1])
+            apply_roi_clicked = roi_col1.button("Apply ROI", key="b2_apply_gpa_roi_btn")
+            clear_roi_clicked = roi_col2.button("Clear ROI Canvas", key="b2_clear_gpa_roi_btn")
+            if clear_roi_clicked:
+                st.session_state["b2_gpa_roi_canvas_nonce"] = int(
+                    st.session_state["b2_gpa_roi_canvas_nonce"]
+                ) + 1
+                st.rerun()
+            if apply_roi_clicked:
+                roi_from_canvas = _extract_canvas_rect_roi(
+                    roi_canvas,
+                    sx=roi_sx,
+                    sy=roi_sy,
+                    shape_hw=processed_image.shape,
+                )
+                if roi_from_canvas is None:
+                    st.warning("No valid ROI rectangle found on canvas.")
+                else:
+                    st.session_state["b2_gpa_ref_roi"] = roi_from_canvas
+                    ref_roi = roi_from_canvas
+                    st.success(
+                        f"ROI applied: y[{ref_roi[0]}:{ref_roi[1]}], "
+                        f"x[{ref_roi[2]}:{ref_roi[3]}]"
+                    )
+            ref_roi = st.session_state.get("b2_gpa_ref_roi", ref_roi)
+            st.caption(f"Current ROI: y[{ref_roi[0]}:{ref_roi[1]}], x[{ref_roi[2]}:{ref_roi[3]}]")
+        else:
+            ry0 = st.slider("ROI y0", 0, max(0, h_img - 2), int(ref_roi[0]), key="b2_gpa_roi_y0")
+            ry1 = st.slider("ROI y1", ry0 + 1, h_img, int(ref_roi[1]), key="b2_gpa_roi_y1")
+            rx0 = st.slider("ROI x0", 0, max(0, w_img - 2), int(ref_roi[2]), key="b2_gpa_roi_x0")
+            rx1 = st.slider("ROI x1", rx0 + 1, w_img, int(ref_roi[3]), key="b2_gpa_roi_x1")
+            ref_roi = (int(ry0), int(ry1), int(rx0), int(rx1))
+            st.session_state["b2_gpa_ref_roi"] = ref_roi
+
+        g_vectors_nm: list[tuple[float, float]] | None = None
+        gpa_mask_sigma_px = 8.0
+        ppa_window_radius = 8
+        ppa_grid_step = 6
+        effective_gpa_px_nm = float(gpa_px_nm)
+
+        if gpa_method == "gpa_b3":
+            g_source = st.radio(
+                "g-vector source",
+                options=["Use current peak table", "Manual g1/g2"],
+                index=0,
+                key="b2_gpa_g_source",
+            )
+
+            if g_source == "Use current peak table":
+                if g_auto_pair is None:
+                    st.warning("No valid g-vector pair found in current peak table.")
+                else:
+                    st.caption(
+                        "Auto suggested pair from current peaks: "
+                        f"idx={g_auto_pair[0]} and idx={g_auto_pair[1]}"
+                    )
+                max_idx = max(0, len(peak_rows) - 1)
+                idx1_default = int(g_auto_pair[0]) if g_auto_pair is not None else 0
+                idx2_default = int(g_auto_pair[1]) if g_auto_pair is not None else min(1, max_idx)
+                idx1 = st.number_input(
+                    "g1 row index",
+                    min_value=0,
+                    max_value=max_idx,
+                    value=idx1_default,
+                    step=1,
+                    key="b2_gpa_idx1",
+                )
+                idx2 = st.number_input(
+                    "g2 row index",
+                    min_value=0,
+                    max_value=max_idx,
+                    value=idx2_default,
+                    step=1,
+                    key="b2_gpa_idx2",
+                )
+                if len(peak_rows) >= 2:
+                    row1 = peak_rows[int(idx1)]
+                    row2 = peak_rows[int(idx2)]
+                    selected_rows = [row1, row2]
+                    g1 = (
+                        float(row1.get("gx_1_per_nm", row1.get("g_x", 0.0)) or 0.0),
+                        float(row1.get("gy_1_per_nm", row1.get("g_y", 0.0)) or 0.0),
+                    )
+                    g2 = (
+                        float(row2.get("gx_1_per_nm", row2.get("g_x", 0.0)) or 0.0),
+                        float(row2.get("gy_1_per_nm", row2.get("g_y", 0.0)) or 0.0),
+                    )
+                    g_vectors_nm = [g1, g2]
+                    st.caption(
+                        f"g1=({g1[0]:.5f}, {g1[1]:.5f})  "
+                        f"g2=({g2[0]:.5f}, {g2[1]:.5f})  [1/nm]"
+                    )
+                    implied_px_nm = _infer_pixel_size_nm_from_peak_rows(
+                        selected_rows,
+                        processed_image.shape,
+                    )
+                    if implied_px_nm is not None:
+                        effective_gpa_px_nm = float(implied_px_nm)
+                        st.caption(
+                            "Implied pixel size from selected FFT peaks: "
+                            f"{implied_px_nm:.6f} nm/pixel"
+                        )
+                        rel_err = abs(float(px_nm_for_gpa) - implied_px_nm) / max(
+                            implied_px_nm,
+                            1e-12,
+                        )
+                        st.info(
+                            "GPA is forced to use the selected-peak implied pixel size: "
+                            f"{effective_gpa_px_nm:.6f} nm/pixel."
+                        )
+                        if rel_err > 0.05:
+                            st.warning(
+                                "Current B2 calibration differs from the selected peak-table "
+                                f"geometry by {rel_err * 100.0:.1f}%. "
+                                "If GPA used the stale scale, Bragg masks would be placed on "
+                                "the wrong FFT coordinates."
+                            )
+                        mask_diag_rows = _build_mask_vs_peak_rows(
+                            selected_rows,
+                            image_shape=processed_image.shape,
+                            pixel_size_nm_b2=float(px_nm_for_gpa),
+                            pixel_size_nm_forced=float(effective_gpa_px_nm),
+                        )
+                        if mask_diag_rows:
+                            st.caption(
+                                "Mask target coordinates vs actual selected peak coordinates."
+                            )
+                            st.dataframe(mask_diag_rows, use_container_width=True)
+                            worst_b2 = max(
+                                float(row.get("b2_delta_r_px") or 0.0) for row in mask_diag_rows
+                            )
+                            worst_forced = max(
+                                float(row.get("forced_delta_r_px") or 0.0)
+                                for row in mask_diag_rows
+                            )
+                            st.caption(
+                                f"B2-scale worst target mismatch: {worst_b2:.3f}px; "
+                                f"forced-scale worst target mismatch: {worst_forced:.3f}px."
+                            )
+            else:
+                g1x = st.number_input("g1x (1/nm)", value=0.85, format="%.6f", key="b2_gpa_g1x")
+                g1y = st.number_input("g1y (1/nm)", value=0.00, format="%.6f", key="b2_gpa_g1y")
+                g2x = st.number_input("g2x (1/nm)", value=0.00, format="%.6f", key="b2_gpa_g2x")
+                g2y = st.number_input("g2y (1/nm)", value=0.82, format="%.6f", key="b2_gpa_g2y")
+                g_vectors_nm = [(float(g1x), float(g1y)), (float(g2x), float(g2y))]
+                effective_gpa_px_nm = float(gpa_px_nm)
+
+            sigma_mode = st.radio(
+                "Bragg mask sigma mode",
+                options=["Auto (Strain++ style)", "Manual sigma (px)"],
+                index=0,
+                key="b2_gpa_sigma_mode",
+                horizontal=True,
+            )
+            sigma_factor = st.slider(
+                "Auto sigma factor",
+                min_value=0.05,
+                max_value=0.35,
+                value=0.16,
+                step=0.01,
+                key="b2_gpa_sigma_factor",
+                disabled=sigma_mode != "Auto (Strain++ style)",
+            )
+            sigma_manual = st.slider(
+                "Bragg mask sigma (px)",
+                min_value=2.0,
+                max_value=32.0,
+                value=8.0,
+                step=0.5,
+                key="b2_gpa_sigma_manual",
+                disabled=sigma_mode != "Manual sigma (px)",
+            )
+            if sigma_mode == "Auto (Strain++ style)" and g_vectors_nm is not None:
+                gpa_mask_sigma_px = _auto_gpa_mask_sigma_from_nm_vectors(
+                    g_vectors_nm=g_vectors_nm,
+                    pixel_size_nm=float(effective_gpa_px_nm),
+                    image_shape=processed_image.shape,
+                    factor=float(sigma_factor),
+                )
+                st.caption(
+                    "Current sigma is auto-derived from g-vector radius: "
+                    f"{gpa_mask_sigma_px:.2f}px"
+                )
+            else:
+                gpa_mask_sigma_px = float(sigma_manual)
+                st.caption(f"Current manual sigma: {gpa_mask_sigma_px:.2f}px")
+        else:
+            effective_gpa_px_nm = float(gpa_px_nm)
+            ppa_window_radius = st.slider(
+                "PPA window radius",
+                min_value=4,
+                max_value=24,
+                value=8,
+                key="b2_gpa_ppa_window_radius",
+            )
+            ppa_grid_step = st.slider(
+                "PPA grid step",
+                min_value=2,
+                max_value=16,
+                value=6,
+                key="b2_gpa_ppa_grid_step",
+            )
+
+        run_gpa_clicked = st.button("Run C2 GPA", type="primary", key="b2_run_gpa_btn")
+        if run_gpa_clicked:
+            try:
+                gpa_input_image = _prepare_gpa_input_image(
+                    processed_image,
+                    subtract_row_mean=bool(gpa_subtract_row_mean),
+                    apply_hann_window=bool(gpa_apply_hann),
+                )
+                strain_result = _run_gpa_compat(
+                    image=gpa_input_image,
+                    method=str(gpa_method),
+                    g_vectors=g_vectors_nm,
+                    g_vector_unit="1/nm",
+                    pixel_size_nm=float(effective_gpa_px_nm),
+                    reference_region=ref_roi,
+                    gpa_mask_sigma_px=float(gpa_mask_sigma_px),
+                    ppa_window_radius=int(ppa_window_radius),
+                    ppa_grid_step=int(ppa_grid_step),
+                    map_inline_mode="full",
+                    include_debug_maps=bool(gpa_show_phase_mask and gpa_method == "gpa_b3"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"C2 GPA failed: {exc}")
+            else:
+                st.session_state["b2_gpa_result"] = strain_result
+                st.session_state["b2_gpa_result_signature"] = str(run_signature)
+                st.session_state["b2_gpa_last_inputs"] = {
+                    "method": str(gpa_method),
+                    "g_vectors_nm": list(g_vectors_nm or []),
+                    "pixel_size_nm": float(effective_gpa_px_nm),
+                    "pixel_size_nm_b2": float(px_nm_for_gpa),
+                    "pixel_size_nm_manual": float(gpa_px_nm),
+                    "mask_sigma_px": float(gpa_mask_sigma_px),
+                    "phase_unit_mode": str(phase_unit_mode),
+                    "subtract_row_mean": bool(gpa_subtract_row_mean),
+                    "apply_hann_window": bool(gpa_apply_hann),
+                }
+                st.success("C2 GPA finished.")
+
+    gpa_result = st.session_state.get("b2_gpa_result")
+    gpa_sig = str(st.session_state.get("b2_gpa_result_signature", ""))
+    if gpa_result is not None and gpa_sig == str(run_signature):
+        gpa_col1, gpa_col2 = st.columns([1.6, 1.0])
+        with gpa_col1:
+            fig_gpa = _plot_gpa_maps(
+                gpa_result,
+                strain_unit_mode=str(strain_unit_mode),
+                rotation_unit_mode=str(rotation_unit_mode),
+                auto_range=bool(auto_color_range),
+                disp_abs=float(disp_abs),
+                strain_abs=float(strain_abs),
+                rotation_abs=float(rotation_abs),
+                border_crop_px=int(border_crop_px),
+            )
+            st.pyplot(fig_gpa, clear_figure=True)
+            if gpa_show_phase_mask:
+                fig_dbg = _plot_gpa_debug_maps(
+                    gpa_result,
+                    phase_unit_mode=str(phase_unit_mode),
+                )
+                if fig_dbg is not None:
+                    st.subheader("GPA Phase + Mask Maps")
+                    st.pyplot(fig_dbg, clear_figure=True)
+                else:
+                    last_inputs = st.session_state.get("b2_gpa_last_inputs", {})
+                    if (
+                        isinstance(last_inputs, dict)
+                        and str(last_inputs.get("method", "")) == "gpa_b3"
+                    ):
+                        fallback_input = _prepare_gpa_input_image(
+                            np.asarray(processed_image, dtype=np.float32),
+                            subtract_row_mean=bool(last_inputs.get("subtract_row_mean", False)),
+                            apply_hann_window=bool(last_inputs.get("apply_hann_window", False)),
+                        )
+                        fallback = _compute_gpa_phase_mask_fallback(
+                            fallback_input,
+                            g_vectors_nm=list(last_inputs.get("g_vectors_nm", [])),
+                            pixel_size_nm=float(last_inputs.get("pixel_size_nm", 0.0)),
+                            mask_sigma_px=float(last_inputs.get("mask_sigma_px", 8.0)),
+                        )
+                        if fallback is not None:
+                            st.subheader("GPA Phase + Mask Maps")
+                            fig_dbg2 = _plot_phase_mask_arrays(
+                                phase1=fallback[0],
+                                phase2=fallback[1],
+                                mask1=fallback[2],
+                                mask2=fallback[3],
+                                phase_unit_mode=str(phase_unit_mode),
+                            )
+                            st.pyplot(fig_dbg2, clear_figure=True)
+                            st.info(
+                                "Phase/mask shown via UI fallback path "
+                                "(runtime run_gpa does not expose debug maps)."
+                            )
+        with gpa_col2:
+            st.write("Method:", gpa_result.provenance.get("method"))
+            st.write("Reference ROI:", gpa_result.reference_region)
+            st.metric("Confidence", f"{float(gpa_result.confidence or 0.0):.3f}")
+            st.write("Map stats:", gpa_result.provenance.get("map_stats", {}))
+            if gpa_result.warnings:
+                for item in gpa_result.warnings[:8]:
+                    st.warning(str(item))
+            st.download_button(
+                "Download C2 GPA JSON",
+                data=gpa_result.model_dump_json(indent=2),
+                file_name="c2_gpa_result.json",
+                mime="application/json",
+            )
+
     st.subheader("Run Phase Match (MVP)")
     mvp_zone_axis = _parse_zone_axis_text(mvp_zone_axis_text)
     cif_dir_effective = str(cif_candidates_dir).strip()
@@ -2351,56 +3429,81 @@ def main() -> None:
         and mvp_signature != prev_mvp_signature
     )
     if run_phase_match_clicked or auto_run_mvp:
-        mvp_warnings: list[str] = []
-        selected_names = {str(v) for v in candidate_phases} if candidate_phases else None
-        entries: list[PhaseEntry] = []
+        with st.spinner("Running phase match and generating simulated outputs..."):
+            phase_t0 = perf_counter()
+            mvp_warnings: list[str] = []
+            selected_names = {str(v) for v in candidate_phases} if candidate_phases else None
+            entries: list[PhaseEntry] = []
 
-        if cif_dir_effective:
-            cif_entries, load_warnings = load_cif_phase_entries(
-                cif_dir_effective,
-                selected_names=selected_names,
-            )
-            entries.extend(cif_entries)
-            mvp_warnings.extend(load_warnings)
-
-        if not entries:
-            candidate_params = list(context.get("candidate_phase_params", []))
-            param_entries, param_warnings = _phase_entries_from_candidate_params(
-                candidate_params,
-                selected_names=selected_names,
-            )
-            entries.extend(param_entries)
-            mvp_warnings.extend(param_warnings)
-            if param_entries:
-                mvp_warnings.append(
-                    "No CIF loaded: using candidate_phase_params for phase match."
+            if cif_dir_effective:
+                cif_entries, load_warnings = _load_cif_phase_entries_cached(
+                    cif_dir_effective,
+                    tuple(sorted(selected_names or set())),
                 )
+                entries.extend(cif_entries)
+                mvp_warnings.extend(load_warnings)
 
-        if not entries:
-            fallback_entries = _fallback_phase_entries(selected_names=selected_names)
-            entries.extend(fallback_entries)
-            if fallback_entries:
-                mvp_warnings.append(
-                    "No CIF/candidate params available: using built-in fallback phases."
+            if not entries:
+                candidate_params = list(context.get("candidate_phase_params", []))
+                param_entries, param_warnings = _phase_entries_from_candidate_params(
+                    candidate_params,
+                    selected_names=selected_names,
                 )
+                entries.extend(param_entries)
+                mvp_warnings.extend(param_warnings)
+                if param_entries:
+                    mvp_warnings.append(
+                        "No CIF loaded: using candidate_phase_params for phase match."
+                    )
 
-        ranking_rows, detail_map, match_warnings = match_candidates(
-            peak_rows,
-            entries,
-            max_hkl=int(mvp_max_hkl),
-            zone_axis=mvp_zone_axis,
-            d_tol_rel=float(mvp_d_tol_rel),
-            angle_tol_deg=float(mvp_angle_tol_deg),
-        )
-        mvp_warnings.extend(match_warnings)
-        st.session_state["b2_phase_mvp"] = {
-            "zone_axis": mvp_zone_axis,
-            "ranking_rows": ranking_rows,
-            "detail_map": detail_map,
-            "warnings": mvp_warnings,
-            "cif_dir": cif_dir_effective,
-            "signature": mvp_signature,
-        }
+            if not entries:
+                fallback_entries = _fallback_phase_entries(selected_names=selected_names)
+                entries.extend(fallback_entries)
+                if fallback_entries:
+                    mvp_warnings.append(
+                        "No CIF/candidate params available: using built-in fallback phases."
+                    )
+
+            peak_rows_json = json.dumps(peak_rows, ensure_ascii=False, sort_keys=True)
+            entries_json = json.dumps(
+                [
+                    {
+                        "name": entry.name,
+                        "path": entry.path,
+                        "a": entry.a,
+                        "b": entry.b,
+                        "c": entry.c,
+                        "alpha_deg": entry.alpha_deg,
+                        "beta_deg": entry.beta_deg,
+                        "gamma_deg": entry.gamma_deg,
+                        "space_group": entry.space_group,
+                        "formula": entry.formula,
+                        "atoms": entry.atoms,
+                    }
+                    for entry in entries
+                ],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            ranking_rows, detail_map, match_warnings = _match_candidates_cached(
+                peak_rows_json,
+                entries_json,
+                max_hkl=int(mvp_max_hkl),
+                zone_axis=mvp_zone_axis,
+                d_tol_rel=float(mvp_d_tol_rel),
+                angle_tol_deg=float(mvp_angle_tol_deg),
+            )
+            mvp_warnings.extend(match_warnings)
+            phase_elapsed_s = perf_counter() - phase_t0
+            st.session_state["b2_phase_mvp"] = {
+                "zone_axis": mvp_zone_axis,
+                "ranking_rows": ranking_rows,
+                "detail_map": detail_map,
+                "warnings": mvp_warnings,
+                "cif_dir": cif_dir_effective,
+                "signature": mvp_signature,
+                "phase_elapsed_s": round(float(phase_elapsed_s), 3),
+            }
 
     mvp_state = st.session_state.get("b2_phase_mvp", {})
     if isinstance(mvp_state, dict) and mvp_state.get("ranking_rows"):
@@ -2424,6 +3527,9 @@ def main() -> None:
         sim_rows = list(top_detail.get("simulated_rows", []))
         entry = top_detail.get("entry")
         st.success(f"Current phase candidate: {top_name}")
+        elapsed = mvp_state.get("phase_elapsed_s")
+        if elapsed is not None:
+            st.caption(f"Phase match finished in {float(elapsed):.2f} s.")
         st.dataframe(ranking_rows, use_container_width=True)
 
         fig_ann = plot_annotated_fft(fft_img_display, peak_rows, assignments)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tempfile
 from typing import Any
 
 import numpy as np
@@ -18,6 +19,31 @@ from autotem.preprocessing.quality import assess_image_quality, load_dataset_arr
 
 def _load_array(dataset: TEMDataset) -> np.ndarray | None:
     return load_dataset_array(dataset)
+
+
+def _persist_array_reference(
+    array: np.ndarray,
+    *,
+    description: str,
+) -> ArrayReference:
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".npy",
+        prefix="autotem_preproc_",
+    )
+    tmp.close()
+    np.save(tmp.name, np.asarray(array, dtype=np.float32), allow_pickle=False)
+    preview = np.asarray(array, dtype=np.float32)[
+        : min(8, array.shape[0]),
+        : min(8, array.shape[1]),
+    ]
+    return ArrayReference(
+        shape=tuple(int(axis) for axis in array.shape),
+        dtype="float32",
+        uri=tmp.name,
+        inline=preview.tolist(),
+        description=description,
+    )
 
 
 def assess_quality(
@@ -106,13 +132,9 @@ def preprocess_dataset(
         normalized = ((working - lo) / (hi - lo)).astype(np.float32)
     operations.append("min_max_normalize")
 
-    preview = normalized[: min(8, normalized.shape[0]), : min(8, normalized.shape[1])]
-    data_ref = ArrayReference(
-        shape=tuple(int(axis) for axis in normalized.shape),
-        dtype=str(normalized.dtype),
-        uri=dataset.data.uri,
-        inline=preview.tolist(),
-        description="Min-max normalized image preview",
+    data_ref = _persist_array_reference(
+        normalized,
+        description="Min-max normalized image",
     )
 
     return PreprocessingResult(

@@ -3,6 +3,7 @@ import pytest
 
 from autotem.core import DiffractionResult, GVector, Measurement
 from autotem.strain import run_gpa
+from autotem.strain.gpa import _strain_from_displacement
 
 
 def _synthetic_lattice_with_linear_strain(
@@ -10,12 +11,14 @@ def _synthetic_lattice_with_linear_strain(
     g1: tuple[float, float] = (0.085, 0.0),
     g2: tuple[float, float] = (0.0, 0.082),
     exx: float = 0.012,
+    eyy: float = 0.0,
 ) -> np.ndarray:
     yy, xx = np.indices(shape, dtype=np.float64)
     cx = shape[1] / 2.0
+    cy = shape[0] / 2.0
 
     ux = exx * (xx - cx)
-    uy = np.zeros_like(ux)
+    uy = eyy * (yy - cy)
 
     phase1 = 2.0 * np.pi * (g1[0] * (xx - ux) + g1[1] * (yy - uy))
     phase2 = 2.0 * np.pi * (g2[0] * (xx - ux) + g2[1] * (yy - uy))
@@ -107,3 +110,49 @@ def test_run_gpa_invalid_method_raises() -> None:
     image = np.ones((32, 32), dtype=np.float32)
     with pytest.raises(ValueError):
         run_gpa(image=image, method="unknown")
+
+
+def test_strain_tensor_axis_convention_direct() -> None:
+    yy, xx = np.indices((80, 96), dtype=np.float32)
+    ux = 0.02 * xx + 0.01 * yy
+    uy = -0.03 * xx + 0.04 * yy
+
+    exx, eyy, exy, wxy = _strain_from_displacement(ux, uy)
+
+    assert float(np.mean(exx)) == pytest.approx(0.02, abs=1e-6)
+    assert float(np.mean(eyy)) == pytest.approx(0.04, abs=1e-6)
+    assert float(np.mean(exy)) == pytest.approx(-0.01, abs=1e-6)
+    assert float(np.mean(wxy)) == pytest.approx(-0.02, abs=1e-6)
+
+
+def test_run_gpa_requires_pixel_size_for_inverse_nm_vectors() -> None:
+    image = _synthetic_lattice_with_linear_strain(exx=0.008)
+    with pytest.raises(ValueError, match="pixel_size_nm"):
+        run_gpa(
+            image=image,
+            method="gpa_b3",
+            g_vectors=[(4.25, 0.0), (0.0, 4.10)],
+            g_vector_unit="1/nm",
+        )
+
+
+def test_run_gpa_b3_eyy_response_stays_on_y_channel() -> None:
+    pixel_size_nm = 0.02
+    g1 = (0.085, 0.0)
+    g2 = (0.0, 0.082)
+    image = _synthetic_lattice_with_linear_strain(g1=g1, g2=g2, exx=0.0, eyy=0.012)
+    diffraction = _make_diffraction_with_gvectors_nm(g1, g2, pixel_size_nm=pixel_size_nm)
+
+    out = run_gpa(
+        image=image,
+        method="gpa_b3",
+        diffraction_result=diffraction,
+        pixel_size_nm=pixel_size_nm,
+        reference_region=(32, 96, 32, 96),
+    )
+
+    mean_exx = float(out.provenance["map_stats"]["mean_exx"])
+    mean_eyy = float(out.provenance["map_stats"]["mean_eyy"])
+
+    # This is a coarse regression guard for axis mixing, not a strict GPA accuracy test.
+    assert abs(mean_eyy) >= abs(mean_exx)

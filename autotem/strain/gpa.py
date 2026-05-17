@@ -34,6 +34,8 @@ def run_gpa(
     gpa_mask_sigma_px: float = 8.0,
     ppa_window_radius: int = 8,
     ppa_grid_step: int = 6,
+    map_inline_mode: str = "preview",
+    include_debug_maps: bool = False,
 ) -> StrainResult:
     """
     Run strain analysis with two selectable methods.
@@ -46,6 +48,9 @@ def run_gpa(
     method = method.lower().strip()
     if method not in {"gpa_b3", "ppa_ai_stem"}:
         raise ValueError("method must be one of {'gpa_b3', 'ppa_ai_stem'}.")
+    map_inline_mode = map_inline_mode.lower().strip()
+    if map_inline_mode not in {"preview", "full"}:
+        raise ValueError("map_inline_mode must be one of {'preview', 'full'}.")
 
     warnings: list[str] = []
     arr = _load_image_2d(image, warnings=warnings)
@@ -61,6 +66,7 @@ def run_gpa(
             reference_region=ref,
             mask_sigma_px=gpa_mask_sigma_px,
             warnings=warnings,
+            include_debug_maps=include_debug_maps,
         )
     else:
         ux, uy, used_g_vectors, method_meta = _run_ppa_ai_stem(
@@ -94,30 +100,37 @@ def run_gpa(
         displacement_x=_to_array_ref(
             ux,
             description=f"Displacement ux map from method={method}.",
+            inline_mode=map_inline_mode,
         ),
         displacement_y=_to_array_ref(
             uy,
             description=f"Displacement uy map from method={method}.",
+            inline_mode=map_inline_mode,
         ),
         strain_xx=_to_array_ref(
             strain_xx,
             description=f"Strain exx map from method={method}.",
+            inline_mode=map_inline_mode,
         ),
         strain_yy=_to_array_ref(
             strain_yy,
             description=f"Strain eyy map from method={method}.",
+            inline_mode=map_inline_mode,
         ),
         strain_xy=_to_array_ref(
             strain_xy,
             description=f"Strain exy map from method={method}.",
+            inline_mode=map_inline_mode,
         ),
         rotation_xy=_to_array_ref(
             rotation_xy,
             description=f"Rotation wxy map from method={method}.",
+            inline_mode=map_inline_mode,
         ),
         uncertainty=_to_array_ref(
             np.sqrt(strain_xx**2 + strain_yy**2 + 2.0 * strain_xy**2).astype(np.float32),
             description="Heuristic strain-magnitude uncertainty proxy.",
+            inline_mode=map_inline_mode,
         ),
         reference_region=ref,
         g_vectors=used_g_vectors,
@@ -131,6 +144,8 @@ def run_gpa(
                 "gpa_mask_sigma_px": gpa_mask_sigma_px,
                 "ppa_window_radius": ppa_window_radius,
                 "ppa_grid_step": ppa_grid_step,
+                "map_inline_mode": map_inline_mode,
+                "include_debug_maps": include_debug_maps,
             },
             "method_metadata": method_meta,
             "map_stats": map_stats,
@@ -204,6 +219,7 @@ def _run_gpa_b3(
     reference_region: tuple[int, int, int, int],
     mask_sigma_px: float,
     warnings: list[str],
+    include_debug_maps: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[GVector], dict[str, Any]]:
     if mask_sigma_px <= 0:
         raise ValueError("gpa_mask_sigma_px must be > 0.")
@@ -217,8 +233,10 @@ def _run_gpa_b3(
     )
     g1, g2 = g_vecs_px
 
-    phi1 = _extract_phase_map(image, g1, mask_sigma_px=mask_sigma_px)
-    phi2 = _extract_phase_map(image, g2, mask_sigma_px=mask_sigma_px)
+    phi1_raw, mask1 = _extract_phase_map(image, g1, mask_sigma_px=mask_sigma_px)
+    phi2_raw, mask2 = _extract_phase_map(image, g2, mask_sigma_px=mask_sigma_px)
+    phi1 = phi1_raw.copy()
+    phi2 = phi2_raw.copy()
     yy, xx = np.indices(image.shape, dtype=np.float64)
     phi1 = phi1 - (2.0 * np.pi * (g1[0] * xx + g1[1] * yy))
     phi2 = phi2 - (2.0 * np.pi * (g2[0] * xx + g2[1] * yy))
@@ -239,18 +257,29 @@ def _run_gpa_b3(
     ux = coef * (inv_g[0, 0] * phi1 + inv_g[0, 1] * phi2)
     uy = coef * (inv_g[1, 0] * phi1 + inv_g[1, 1] * phi2)
 
+    method_meta: dict[str, Any] = {
+        "selected_g_vectors_pixel": [
+            {"gx": float(g1[0]), "gy": float(g1[1])},
+            {"gx": float(g2[0]), "gy": float(g2[1])},
+        ],
+        "determinant": det,
+        "solver": "phase_unwrap + linear_inversion",
+    }
+    if include_debug_maps:
+        method_meta["debug_maps"] = {
+            "phase1_raw_rad": phi1_raw.astype(np.float32).tolist(),
+            "phase2_raw_rad": phi2_raw.astype(np.float32).tolist(),
+            "phase1_unwrapped_rad": phi1.astype(np.float32).tolist(),
+            "phase2_unwrapped_rad": phi2.astype(np.float32).tolist(),
+            "mask1": mask1.astype(np.float32).tolist(),
+            "mask2": mask2.astype(np.float32).tolist(),
+        }
+
     return (
         ux.astype(np.float32),
         uy.astype(np.float32),
         used_g_objects,
-        {
-            "selected_g_vectors_pixel": [
-                {"gx": float(g1[0]), "gy": float(g1[1])},
-                {"gx": float(g2[0]), "gy": float(g2[1])},
-            ],
-            "determinant": det,
-            "solver": "phase_unwrap + linear_inversion",
-        },
+        method_meta,
     )
 
 
@@ -459,10 +488,10 @@ def _to_cycles_per_pixel(
         return gx, gy
     if unit_norm in {"1/nm", "nm^-1"}:
         if pixel_size_nm is None or pixel_size_nm <= 0:
-            warnings.append(
-                "g-vectors are in 1/nm but pixel_size_nm is missing; treating them as 1/pixel."
+            raise ValueError(
+                "g-vectors are in 1/nm but pixel_size_nm is missing or invalid. "
+                "Provide a positive pixel_size_nm for GPA."
             )
-            return gx, gy
         return gx * pixel_size_nm, gy * pixel_size_nm
     warnings.append(f"Unsupported g-vector unit {unit!r}; treating as 1/pixel.")
     return gx, gy
@@ -472,7 +501,7 @@ def _extract_phase_map(
     image: np.ndarray,
     g_vec: tuple[float, float],
     mask_sigma_px: float,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     h, w = image.shape
     gy, gx = float(g_vec[1]), float(g_vec[0])
     fft = np.fft.fftshift(np.fft.fft2(image))
@@ -481,7 +510,7 @@ def _extract_phase_map(
     px = (w / 2.0) + gx * w
     mask = np.exp(-(((yy - py) ** 2 + (xx - px) ** 2) / (2.0 * mask_sigma_px**2)))
     filtered = np.fft.ifft2(np.fft.ifftshift(fft * mask))
-    return np.angle(filtered)
+    return np.angle(filtered), mask
 
 
 def _unwrap_phase_2d(phase: np.ndarray) -> np.ndarray:
@@ -501,14 +530,22 @@ def _strain_from_displacement(
     return strain_xx, strain_yy, strain_xy, rotation_xy
 
 
-def _to_array_ref(arr: np.ndarray, *, description: str) -> ArrayReference:
+def _to_array_ref(
+    arr: np.ndarray,
+    *,
+    description: str,
+    inline_mode: str = "preview",
+) -> ArrayReference:
     arr = np.asarray(arr, dtype=np.float32)
-    preview = arr[: min(8, arr.shape[0]), : min(8, arr.shape[1])]
+    if inline_mode == "full":
+        inline = arr.tolist()
+    else:
+        inline = arr[: min(8, arr.shape[0]), : min(8, arr.shape[1])].tolist()
     return ArrayReference(
         shape=tuple(int(v) for v in arr.shape),
         dtype=str(arr.dtype),
         uri=None,
-        inline=preview.tolist(),
+        inline=inline,
         description=description,
     )
 

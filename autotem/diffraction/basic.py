@@ -2130,11 +2130,11 @@ def run_diffraction_analysis(
 
     h, w = magnitude.shape
     cy, cx = h / 2.0, w / 2.0
-    fft_min_dim = float(min(h, w))
     pixel_nm = 0.1
     if calibration.pixel_size is not None and calibration.pixel_size.unit == "nm":
         pixel_nm = float(calibration.pixel_size.value)
-    reciprocal_scale = 1.0 / (fft_min_dim * max(pixel_nm, 1e-9))
+    reciprocal_scale_x = 1.0 / (float(w) * max(pixel_nm, 1e-9))
+    reciprocal_scale_y = 1.0 / (float(h) * max(pixel_nm, 1e-9))
     reciprocal_scale_source = "derived_from_pixel_size"
     if calibration.diffraction_scale is not None:
         scale_value = calibration.diffraction_scale.value
@@ -2152,21 +2152,32 @@ def run_diffraction_analysis(
             else:
                 scale_method = calibration.diffraction_scale.method or ""
                 if scale_method == "reciprocal_pixel_size":
-                    reciprocal_scale = candidate_scale / fft_min_dim
+                    reciprocal_scale_x = candidate_scale / float(w)
+                    reciprocal_scale_y = candidate_scale / float(h)
                     reciprocal_scale_source = (
                         "calibration.diffraction_scale.reciprocal_pixel_size_normalized"
                     )
                 else:
-                    reciprocal_scale = candidate_scale
+                    reciprocal_scale_x = candidate_scale
+                    reciprocal_scale_y = candidate_scale
                     reciprocal_scale_source = "calibration.diffraction_scale"
 
-    reciprocal_scale_uncertainty = None
+    reciprocal_scale_uncertainty_x = None
+    reciprocal_scale_uncertainty_y = None
     if calibration.diffraction_scale is not None:
         try:
             if calibration.diffraction_scale.uncertainty is not None:
                 reciprocal_scale_uncertainty = float(calibration.diffraction_scale.uncertainty)
+                scale_method = calibration.diffraction_scale.method or ""
+                if scale_method == "reciprocal_pixel_size":
+                    reciprocal_scale_uncertainty_x = reciprocal_scale_uncertainty / float(w)
+                    reciprocal_scale_uncertainty_y = reciprocal_scale_uncertainty / float(h)
+                else:
+                    reciprocal_scale_uncertainty_x = reciprocal_scale_uncertainty
+                    reciprocal_scale_uncertainty_y = reciprocal_scale_uncertainty
         except (TypeError, ValueError):
-            reciprocal_scale_uncertainty = None
+            reciprocal_scale_uncertainty_x = None
+            reciprocal_scale_uncertainty_y = None
 
     peaks: list[DiffractionPeak] = []
     g_vectors: list[GVector] = []
@@ -2200,17 +2211,21 @@ def run_diffraction_analysis(
         peak_intensities.append(float(detail["intensity"]))
         dx = float(x_refined - cx)
         dy = float(y_refined - cy)
-        gx_val = dx * reciprocal_scale
-        gy_val = dy * reciprocal_scale
+        gx_val = dx * reciprocal_scale_x
+        gy_val = dy * reciprocal_scale_y
         detail["g_x"] = gx_val
         detail["g_y"] = gy_val
         gxy.append((gx_val, gy_val))
         g_mag = float(np.hypot(gx_val, gy_val))
         detail["g_norm"] = g_mag
         g_mag_uncertainty = None
-        if reciprocal_scale_uncertainty is not None:
-            pixel_radius = float(np.hypot(dx, dy))
-            g_mag_uncertainty = pixel_radius * reciprocal_scale_uncertainty
+        if (
+            reciprocal_scale_uncertainty_x is not None
+            and reciprocal_scale_uncertainty_y is not None
+        ):
+            g_mag_uncertainty = float(
+                np.hypot(dx * reciprocal_scale_uncertainty_x, dy * reciprocal_scale_uncertainty_y)
+            )
         angle_deg = float(np.degrees(np.arctan2(gy_val, gx_val)))
         g_vectors.append(
             GVector(
@@ -2447,10 +2462,14 @@ def run_diffraction_analysis(
                 "candidate_phase_params_count": (
                     len(candidate_phase_params) if isinstance(candidate_phase_params, list) else 0
                 ),
+                },
+                "calibration_scale_source": reciprocal_scale_source,
+                "calibration_scale_inv_nm_per_px": float(
+                    0.5 * (reciprocal_scale_x + reciprocal_scale_y)
+                ),
+                "calibration_scale_inv_nm_per_px_x": float(reciprocal_scale_x),
+                "calibration_scale_inv_nm_per_px_y": float(reciprocal_scale_y),
+                "indexing": indexing_meta,
+                "peak_detection": peak_debug,
             },
-            "calibration_scale_source": reciprocal_scale_source,
-            "calibration_scale_inv_nm_per_px": reciprocal_scale,
-            "indexing": indexing_meta,
-            "peak_detection": peak_debug,
-        },
-    )
+        )
