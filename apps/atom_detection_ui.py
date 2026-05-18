@@ -19,6 +19,7 @@ from autotem.atomic.gaussian_refinement import refine_atom_coordinates
 from autotem.atomic.lattice_constraint import apply_lattice_constraint
 from autotem.io import load_tem_dataset
 from autotem.io.metadata import normalize_metadata
+from autotem.strain.atom_strain import AtomStrainFieldResult, compute_atom_strain_fields
 
 # Compatibility patch:
 # streamlit-drawable-canvas currently expects `streamlit.elements.image.image_to_url`
@@ -200,6 +201,169 @@ def _distance_csv(
     return buffer.getvalue()
 
 
+def _atom_strain_csv(
+    coords: np.ndarray,
+    fields: AtomStrainFieldResult,
+    displacement_scale: float,
+    displacement_unit: str,
+    strain_scale: float,
+    strain_unit: str,
+) -> str:
+    buffer = io.StringIO()
+    buffer.write(f"displacement_unit,{displacement_unit}\n")
+    buffer.write(f"strain_unit,{strain_unit}\n")
+    buffer.write("atom_index,y,x,ux,uy,exx,eyy,exy,rotation,uncertainty,valid_fit\n")
+    for idx, (coord, disp_xy, exx, eyy, exy, rot, unc, valid) in enumerate(
+        zip(
+            coords,
+            fields.atom_displacement_xy,
+            fields.atom_strain_xx,
+            fields.atom_strain_yy,
+            fields.atom_strain_xy,
+            fields.atom_rotation_xy,
+            fields.atom_uncertainty,
+            fields.valid_atom_mask,
+            strict=False,
+        )
+    ):
+        y, x = coord
+        ux = float(disp_xy[0]) * displacement_scale
+        uy = float(disp_xy[1]) * displacement_scale
+        exx_scaled = float(exx) * strain_scale
+        eyy_scaled = float(eyy) * strain_scale
+        exy_scaled = float(exy) * strain_scale
+        buffer.write(
+            f"{idx},{float(y):.6f},{float(x):.6f},{ux:.6f},{uy:.6f},"
+            f"{exx_scaled:.6f},{eyy_scaled:.6f},{exy_scaled:.6f},"
+            f"{float(rot):.6f},{float(unc):.6f},{int(bool(valid))}\n"
+        )
+    return buffer.getvalue()
+
+
+def _symmetric_limit(arr: np.ndarray, percentile: float = 98.0, fallback: float = 1.0) -> float:
+    finite = np.asarray(arr, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return fallback
+    lim = float(np.percentile(np.abs(finite), percentile))
+    if not np.isfinite(lim) or lim <= 1e-12:
+        lim = fallback
+    return lim
+
+
+def _render_atom_strain_maps(
+    fields: AtomStrainFieldResult,
+    *,
+    displacement_scale: float,
+    displacement_unit: str,
+    strain_scale: float,
+    strain_unit: str,
+    auto_color_range: bool,
+    displacement_abs_limit: float,
+    strain_abs_limit: float,
+    rotation_abs_limit: float,
+) -> plt.Figure:
+    ux = np.asarray(fields.displacement_x_map, dtype=np.float64) * displacement_scale
+    uy = np.asarray(fields.displacement_y_map, dtype=np.float64) * displacement_scale
+    exx = np.asarray(fields.strain_xx_map, dtype=np.float64) * strain_scale
+    eyy = np.asarray(fields.strain_yy_map, dtype=np.float64) * strain_scale
+    exy = np.asarray(fields.strain_xy_map, dtype=np.float64) * strain_scale
+    rot = np.asarray(fields.rotation_xy_map, dtype=np.float64)
+
+    if auto_color_range:
+        disp_lim = max(_symmetric_limit(ux), _symmetric_limit(uy), 1e-6)
+        strain_lim = max(
+            _symmetric_limit(exx),
+            _symmetric_limit(eyy),
+            _symmetric_limit(exy),
+            1e-6,
+        )
+        rot_lim = max(_symmetric_limit(rot), 1e-6)
+    else:
+        disp_lim = max(float(displacement_abs_limit), 1e-6)
+        strain_lim = max(float(strain_abs_limit), 1e-6)
+        rot_lim = max(float(rotation_abs_limit), 1e-6)
+
+    fig, axes = plt.subplots(2, 3, figsize=(11.8, 7.9), dpi=150)
+    panels = [
+        (ux, f"ux displacement [{displacement_unit}]", displacement_unit, disp_lim),
+        (uy, f"uy displacement [{displacement_unit}]", displacement_unit, disp_lim),
+        (exx, f"exx strain [{strain_unit}]", strain_unit, strain_lim),
+        (eyy, f"eyy strain [{strain_unit}]", strain_unit, strain_lim),
+        (exy, f"exy strain [{strain_unit}]", strain_unit, strain_lim),
+        (rot, "rotation [rad]", "rad", rot_lim),
+    ]
+
+    for ax, (arr, title, cbar_label, lim) in zip(axes.flat, panels, strict=False):
+        im = ax.imshow(arr, cmap="coolwarm", vmin=-lim, vmax=lim)
+        ax.set_title(title, fontsize=10)
+        ax.axis("off")
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+        cbar.set_label(cbar_label, rotation=90)
+
+    fig.tight_layout()
+    return fig
+
+
+def _render_atom_strain_overlay(
+    image_norm: np.ndarray,
+    coords: np.ndarray,
+    values: np.ndarray,
+    *,
+    title: str,
+    colorbar_label: str,
+    vmin: float,
+    vmax: float,
+    cmap: str = "jet",
+    marker_size: float = 36.0,
+    invalid_mask: np.ndarray | None = None,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(7.0, 7.0), dpi=180)
+    ax.imshow(image_norm, cmap="gray")
+    valid = np.isfinite(values)
+    if invalid_mask is not None:
+        valid &= ~invalid_mask
+    if np.any(valid):
+        sc = ax.scatter(
+            coords[valid, 1],
+            coords[valid, 0],
+            c=values[valid],
+            s=marker_size,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            edgecolors="white",
+            linewidths=0.25,
+        )
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.03)
+        cbar.set_label(colorbar_label, rotation=90)
+    if invalid_mask is not None and np.any(invalid_mask):
+        ax.scatter(
+            coords[invalid_mask, 1],
+            coords[invalid_mask, 0],
+            s=max(marker_size * 0.55, 10.0),
+            c="#9e9e9e",
+            marker="x",
+            linewidths=0.7,
+        )
+    ax.set_title(title)
+    ax.axis("off")
+    fig.tight_layout()
+    return fig
+
+
+def _figure_png_bytes(fig: plt.Figure) -> bytes:
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", bbox_inches="tight", dpi=180)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _invalidate_atom_strain_state() -> None:
+    st.session_state.atom_strain_fields = None
+    st.session_state.atom_strain_meta = None
+
+
 def _to_display_image(
     image_norm: np.ndarray,
     coords: np.ndarray,
@@ -302,6 +466,8 @@ for key, default in [
     ("refinement_info", None),
     ("lattice_info", None),
     ("last_run_summary", None),
+    ("atom_strain_fields", None),
+    ("atom_strain_meta", None),
     ("distance_pixel_size", 0.02),
     ("distance_unit", "nm"),
     ("pixel_size_auto_nm", None),
@@ -334,6 +500,7 @@ if st.session_state.uploaded_sig != current_file_sig:
     st.session_state.canvas_nonce = 0
     st.session_state.refinement_info = None
     st.session_state.lattice_info = None
+    _invalidate_atom_strain_state()
     auto_nm, auto_source, auto_messages = _cached_infer_pixel_size_nm(
         st.session_state.uploaded_temp_path,
         file_size=uploaded.size,
@@ -458,6 +625,95 @@ with st.sidebar:
             with st.expander("Auto-read details"):
                 st.code("\n".join(st.session_state.pixel_size_auto_messages), language="text")
 
+    st.divider()
+    st.subheader("Atom-Position Strain")
+    atom_strain_reference_mode = st.selectbox(
+        "Reference source",
+        ["Whole edited atom set", "Current ROI mask"],
+        index=0,
+        help=(
+            "AI-STEM-inspired atom-column strain uses the current edited coordinates. "
+            "Use ROI mask when you want one local region to define the reference lattice."
+        ),
+    )
+    atom_strain_neighbor_k = st.slider(
+        "Atom strain neighbors", min_value=6, max_value=20, value=10, step=1
+    )
+    atom_strain_tolerance_deg = st.slider(
+        "Direction tolerance (deg)",
+        min_value=10.0,
+        max_value=35.0,
+        value=18.0,
+        step=1.0,
+    )
+    atom_strain_grid_step = st.slider(
+        "Interpolation grid step", min_value=1, max_value=6, value=2, step=1
+    )
+    atom_strain_display_unit = st.selectbox(
+        "Strain display unit",
+        ["fraction", "%"],
+        index=0,
+        help="Controls how exx / eyy / exy are shown in maps, summary, and CSV export.",
+    )
+    atom_strain_auto_color_range = st.checkbox(
+        "Atom-strain auto color range",
+        value=True,
+        help="If OFF, use the manual symmetric ranges below for the atom-strain maps.",
+    )
+    atom_strain_displacement_abs = st.number_input(
+        "Displacement range abs",
+        min_value=0.001,
+        value=5.0,
+        step=0.1,
+        disabled=atom_strain_auto_color_range,
+    )
+    atom_strain_strain_abs = st.number_input(
+        "Strain range abs",
+        min_value=0.001,
+        value=1.0,
+        step=0.01,
+        format="%.3f",
+        disabled=atom_strain_auto_color_range,
+        help="Applies to exx / eyy / exy together, shown as symmetric [-range, +range].",
+    )
+    atom_strain_rotation_abs = st.number_input(
+        "Rotation range abs (rad)",
+        min_value=0.001,
+        value=0.5,
+        step=0.01,
+        format="%.3f",
+        disabled=atom_strain_auto_color_range,
+    )
+    st.caption("Overlay strain map on original image")
+    atom_strain_overlay_metric = st.selectbox(
+        "Overlay metric",
+        ["exx", "eyy", "exy"],
+        index=0,
+        help="Color atom-column positions on the original image by the selected strain component.",
+    )
+    atom_strain_overlay_auto_range = st.checkbox(
+        "Overlay auto range",
+        value=True,
+        help="If OFF, use manual min/max for the atom-position strain overlay.",
+    )
+    atom_strain_overlay_min = st.number_input(
+        "Overlay min",
+        value=-1.0,
+        step=0.01,
+        format="%.3f",
+        disabled=atom_strain_overlay_auto_range,
+    )
+    atom_strain_overlay_max = st.number_input(
+        "Overlay max",
+        value=1.0,
+        step=0.01,
+        format="%.3f",
+        disabled=atom_strain_overlay_auto_range,
+    )
+    atom_strain_overlay_marker_size = st.slider(
+        "Overlay marker size", min_value=8.0, max_value=80.0, value=28.0, step=2.0
+    )
+
 params = {
     "mode": mode,
     "gaussian_sigma": None if gaussian_sigma == 0 else float(gaussian_sigma),
@@ -478,6 +734,20 @@ params = {
     "use_physical_unit": bool(use_physical_unit),
     "pixel_size": float(pixel_size),
     "distance_unit": str(distance_unit),
+    "atom_strain_reference_mode": str(atom_strain_reference_mode),
+    "atom_strain_neighbor_k": int(atom_strain_neighbor_k),
+    "atom_strain_tolerance_deg": float(atom_strain_tolerance_deg),
+    "atom_strain_grid_step": int(atom_strain_grid_step),
+    "atom_strain_display_unit": str(atom_strain_display_unit),
+    "atom_strain_auto_color_range": bool(atom_strain_auto_color_range),
+    "atom_strain_displacement_abs": float(atom_strain_displacement_abs),
+    "atom_strain_strain_abs": float(atom_strain_strain_abs),
+    "atom_strain_rotation_abs": float(atom_strain_rotation_abs),
+    "atom_strain_overlay_metric": str(atom_strain_overlay_metric),
+    "atom_strain_overlay_auto_range": bool(atom_strain_overlay_auto_range),
+    "atom_strain_overlay_min": float(atom_strain_overlay_min),
+    "atom_strain_overlay_max": float(atom_strain_overlay_max),
+    "atom_strain_overlay_marker_size": float(atom_strain_overlay_marker_size),
 }
 
 sig = _signature(current_file_sig, params)
@@ -593,6 +863,7 @@ if should_run:
             st.session_state.roi_mask = None
             st.session_state.refinement_info = refinement_info
             st.session_state.lattice_info = lattice_info
+            _invalidate_atom_strain_state()
             st.session_state.last_run_summary = {
                 "atom_count": int(len(constrained_coords)),
                 "mode": params["mode"],
@@ -670,6 +941,7 @@ if reset_auto:
         st.session_state.edited_coords = result.coordinates.copy()
         st.session_state.edited_intensities = result.intensities.copy()
     st.session_state.roi_mask = None
+    _invalidate_atom_strain_state()
     coords = st.session_state.edited_coords
     intensities = st.session_state.edited_intensities
     roi_mask = None
@@ -699,6 +971,7 @@ if apply_action:
                     intensities = np.append(intensities, _sample_intensity(raw, y, x))
                 st.session_state.edited_coords = coords
                 st.session_state.edited_intensities = intensities
+                _invalidate_atom_strain_state()
                 st.success(f"Added {len(raw_points)} points.")
 
         elif tool == "Delete atom by click":
@@ -722,6 +995,7 @@ if apply_action:
                         removed += 1
                 st.session_state.edited_coords = coords
                 st.session_state.edited_intensities = intensities
+                _invalidate_atom_strain_state()
                 st.success(f"Removed {removed} points.")
 
         else:
@@ -729,6 +1003,7 @@ if apply_action:
             roi_disp = ndi.binary_fill_holes(draw_mask_disp)
             mask = _resize_mask_to_raw(roi_disp, raw.shape)
             st.session_state.roi_mask = mask
+            _invalidate_atom_strain_state()
             roi_mask = mask
             st.success("ROI updated.")
 
@@ -753,6 +1028,7 @@ if keep_inside or remove_inside:
             roi_disp = ndi.binary_fill_holes(draw_mask_disp)
             effective_roi_mask = _resize_mask_to_raw(roi_disp, raw.shape)
             st.session_state.roi_mask = effective_roi_mask
+            _invalidate_atom_strain_state()
             roi_mask = effective_roi_mask
             st.info("ROI auto-applied from current drawing.")
 
@@ -773,6 +1049,7 @@ if keep_inside or remove_inside:
 
         st.session_state.edited_coords = coords[select_mask]
         st.session_state.edited_intensities = intensities[select_mask]
+        _invalidate_atom_strain_state()
         st.success(msg)
         st.rerun()
 
@@ -855,6 +1132,252 @@ with right:
             st.code("\n".join(result.warnings), language="text")
     else:
         st.success("No warnings.")
+
+st.subheader("Atom-Position Strain (AI-STEM inspired)")
+st.caption(
+    "Alternative strain path from the current edited atom-column coordinates. "
+    "This is separate from B2 g-vector GPA and is intended for C0/C1-based testing."
+)
+atom_strain_button_col, atom_strain_info_col = st.columns([0.34, 0.66])
+run_atom_strain_button = atom_strain_button_col.button(
+    "Run Atom-Position Strain",
+    type="primary",
+    use_container_width=True,
+)
+atom_strain_info_col.caption(
+    "Reference source: "
+    f"{params['atom_strain_reference_mode']} | "
+    f"k={params['atom_strain_neighbor_k']} | "
+    f"tol={params['atom_strain_tolerance_deg']:.1f} deg | "
+    f"grid step={params['atom_strain_grid_step']}"
+)
+
+if run_atom_strain_button:
+    if len(coords) < 6:
+        st.warning("Need at least 6 edited atom points before running atom-position strain.")
+    elif (
+        params["atom_strain_reference_mode"] == "Current ROI mask"
+        and roi_mask is None
+    ):
+        st.warning("Current ROI mask is not available yet. Draw/apply ROI first.")
+    else:
+        reference_mask = (
+            roi_mask if params["atom_strain_reference_mode"] == "Current ROI mask" else None
+        )
+        with st.spinner("Running atom-position strain..."):
+            try:
+                fields = compute_atom_strain_fields(
+                    coordinates=coords,
+                    image_shape=raw.shape,
+                    reference_mask=reference_mask,
+                    neighbor_k=params["atom_strain_neighbor_k"],
+                    direction_tolerance_deg=params["atom_strain_tolerance_deg"],
+                    interpolation_grid_step=params["atom_strain_grid_step"],
+                )
+            except Exception as exc:
+                st.error(f"Atom-position strain failed: {exc}")
+            else:
+                st.session_state.atom_strain_fields = fields
+                st.session_state.atom_strain_meta = {
+                    "reference_source": params["atom_strain_reference_mode"],
+                    "neighbor_k": params["atom_strain_neighbor_k"],
+                    "direction_tolerance_deg": params["atom_strain_tolerance_deg"],
+                    "grid_step": params["atom_strain_grid_step"],
+                }
+                st.success("Atom-position strain finished.")
+
+atom_strain_fields = st.session_state.atom_strain_fields
+atom_strain_meta = st.session_state.atom_strain_meta
+if atom_strain_fields is None:
+    st.info("Run atom-position strain to visualize displacement/strain from edited atom columns.")
+else:
+    displacement_scale = params["pixel_size"] if params["use_physical_unit"] else 1.0
+    displacement_unit = params["distance_unit"] if params["use_physical_unit"] else "px"
+    strain_scale = 100.0 if params["atom_strain_display_unit"] == "%" else 1.0
+    strain_unit = "%" if params["atom_strain_display_unit"] == "%" else "fraction"
+    valid_count = int(np.sum(atom_strain_fields.valid_atom_mask))
+    fit_stats = atom_strain_fields.provenance.get("fit_statistics", {})
+    strain_left, strain_right = st.columns([1.55, 1.0])
+    with strain_left:
+        strain_fig = _render_atom_strain_maps(
+            atom_strain_fields,
+            displacement_scale=displacement_scale,
+            displacement_unit=displacement_unit,
+            strain_scale=strain_scale,
+            strain_unit=strain_unit,
+            auto_color_range=params["atom_strain_auto_color_range"],
+            displacement_abs_limit=params["atom_strain_displacement_abs"],
+            strain_abs_limit=params["atom_strain_strain_abs"],
+            rotation_abs_limit=params["atom_strain_rotation_abs"],
+        )
+        st.pyplot(strain_fig)
+    with strain_right:
+        st.metric("Atom-strain confidence", f"{atom_strain_fields.confidence:.3f}")
+        st.metric("Valid local fits", f"{valid_count}/{len(coords)}")
+        if atom_strain_meta is not None:
+            st.write("Run settings:", atom_strain_meta)
+        st.write(
+            "Reference region:",
+            (
+                atom_strain_fields.reference_region
+                if atom_strain_fields.reference_region
+                else "full set"
+            ),
+        )
+        st.write(
+            "Reference vectors (x, y):",
+            np.round(atom_strain_fields.reference_vectors_xy, 4).tolist(),
+        )
+        st.write(
+            "Fit statistics:",
+            {
+                "valid_atom_ratio": fit_stats.get("valid_atom_ratio"),
+                "median_local_residual_px": fit_stats.get("median_local_residual_px"),
+                "median_condition_number": fit_stats.get("median_condition_number"),
+            },
+        )
+        atom_summary = {
+            "mean_ux": float(np.mean(atom_strain_fields.atom_displacement_xy[:, 0]))
+            * displacement_scale,
+            "mean_uy": float(np.mean(atom_strain_fields.atom_displacement_xy[:, 1]))
+            * displacement_scale,
+            "mean_exx": float(np.mean(atom_strain_fields.atom_strain_xx)) * strain_scale,
+            "mean_eyy": float(np.mean(atom_strain_fields.atom_strain_yy)) * strain_scale,
+            "mean_exy": float(np.mean(atom_strain_fields.atom_strain_xy)) * strain_scale,
+            "mean_rotation": float(np.mean(atom_strain_fields.atom_rotation_xy)),
+            "strain_unit": strain_unit,
+        }
+        st.write("Atom summary:", atom_summary)
+        if params["lattice_constraint_enable"]:
+            st.warning(
+                "Lattice constraint is ON. For defect-sensitive atom strain, "
+                "OFF is often safer."
+            )
+        if atom_strain_fields.warnings:
+            summary = _warning_summary_lines(atom_strain_fields.warnings)
+            st.warning("\n".join(summary))
+            with st.expander("Show full atom-strain warnings"):
+                st.code("\n".join(atom_strain_fields.warnings), language="text")
+        else:
+            st.success("No atom-strain warnings.")
+
+    overlay_metric = params["atom_strain_overlay_metric"]
+    overlay_values_lookup = {
+        "exx": atom_strain_fields.atom_strain_xx * strain_scale,
+        "eyy": atom_strain_fields.atom_strain_yy * strain_scale,
+        "exy": atom_strain_fields.atom_strain_xy * strain_scale,
+    }
+    overlay_values = np.asarray(overlay_values_lookup[overlay_metric], dtype=np.float64)
+    if params["atom_strain_overlay_auto_range"]:
+        overlay_vmin = -_symmetric_limit(overlay_values, fallback=1.0)
+        overlay_vmax = _symmetric_limit(overlay_values, fallback=1.0)
+    else:
+        overlay_vmin = float(params["atom_strain_overlay_min"])
+        overlay_vmax = float(params["atom_strain_overlay_max"])
+        if overlay_vmax <= overlay_vmin:
+            overlay_vmax = overlay_vmin + 1e-6
+            st.warning("Overlay max must be larger than min; adjusted slightly for display.")
+
+    st.subheader("Atom-Position Strain Overlay on Original Image")
+    st.caption(
+        "Jet-style colormap on the original image. "
+        "Points with failed local fits are marked as gray x."
+    )
+    overlay_left, overlay_right = st.columns([1.45, 1.0])
+    with overlay_left:
+        overlay_fig = _render_atom_strain_overlay(
+            norm,
+            coords,
+            overlay_values,
+            title=f"{overlay_metric} overlay on original image [{strain_unit}]",
+            colorbar_label=f"{overlay_metric} [{strain_unit}]",
+            vmin=overlay_vmin,
+            vmax=overlay_vmax,
+            cmap="jet",
+            marker_size=params["atom_strain_overlay_marker_size"],
+            invalid_mask=~atom_strain_fields.valid_atom_mask,
+        )
+        st.pyplot(overlay_fig)
+        overlay_png = _figure_png_bytes(overlay_fig)
+        st.download_button(
+            label="Download atom-position strain overlay PNG",
+            data=overlay_png,
+            file_name=(
+                f"{Path(uploaded.name).stem}_atom_position_{overlay_metric}_overlay.png"
+            ),
+            mime="image/png",
+        )
+        plt.close(overlay_fig)
+    with overlay_right:
+        overlay_valid = overlay_values[np.asarray(atom_strain_fields.valid_atom_mask, dtype=bool)]
+        st.write(
+            "Overlay settings:",
+            {
+                "metric": overlay_metric,
+                "unit": strain_unit,
+                "range_min": overlay_vmin,
+                "range_max": overlay_vmax,
+                "marker_size": params["atom_strain_overlay_marker_size"],
+                "colormap": "jet",
+            },
+        )
+        st.write(
+            "Valid-point value summary:",
+            {
+                "min": float(np.nanmin(overlay_valid[np.isfinite(overlay_valid)]))
+                if np.any(np.isfinite(overlay_valid))
+                else None,
+                "max": float(np.nanmax(overlay_valid[np.isfinite(overlay_valid)]))
+                if np.any(np.isfinite(overlay_valid))
+                else None,
+                "mean": float(np.nanmean(overlay_valid[np.isfinite(overlay_valid)]))
+                if np.any(np.isfinite(overlay_valid))
+                else None,
+            },
+        )
+
+    st.subheader("Atom-Position Strain Preview")
+    atom_preview_count = min(len(coords), 500)
+    if atom_preview_count > 0:
+        atom_preview = {
+            "y": coords[:atom_preview_count, 0],
+            "x": coords[:atom_preview_count, 1],
+            f"ux [{displacement_unit}]": (
+                atom_strain_fields.atom_displacement_xy[:atom_preview_count, 0]
+                * displacement_scale
+            ),
+            f"uy [{displacement_unit}]": (
+                atom_strain_fields.atom_displacement_xy[:atom_preview_count, 1]
+                * displacement_scale
+            ),
+            f"exx [{strain_unit}]": (
+                atom_strain_fields.atom_strain_xx[:atom_preview_count] * strain_scale
+            ),
+            f"eyy [{strain_unit}]": (
+                atom_strain_fields.atom_strain_yy[:atom_preview_count] * strain_scale
+            ),
+            f"exy [{strain_unit}]": (
+                atom_strain_fields.atom_strain_xy[:atom_preview_count] * strain_scale
+            ),
+            "rotation [rad]": atom_strain_fields.atom_rotation_xy[:atom_preview_count],
+            "uncertainty": atom_strain_fields.atom_uncertainty[:atom_preview_count],
+            "valid_fit": atom_strain_fields.valid_atom_mask[:atom_preview_count].astype(np.int32),
+        }
+        st.dataframe(atom_preview, use_container_width=True)
+    atom_strain_csv_text = _atom_strain_csv(
+        coords=coords,
+        fields=atom_strain_fields,
+        displacement_scale=displacement_scale,
+        displacement_unit=displacement_unit,
+        strain_scale=strain_scale,
+        strain_unit=strain_unit,
+    )
+    st.download_button(
+        label="Download atom-position strain CSV",
+        data=atom_strain_csv_text.encode("utf-8"),
+        file_name=f"{Path(uploaded.name).stem}_atom_position_strain.csv",
+        mime="text/csv",
+    )
 
 st.subheader("Edited Coordinates Preview")
 preview_count = min(len(coords), 500)
