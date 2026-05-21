@@ -34,12 +34,9 @@ reports/
 !.env.example
 
 # Local assistant / coordination state (do not publish to GitHub)
-AGENTS.md
-MEMORY.md
 memory/
 configs/openclaw-feishu-project-agent-identity.md
 configs/team-responsibility-task-board.md
-configs/three-person-module-distribution.md
 .openclaw/
 
 # IDE / OS
