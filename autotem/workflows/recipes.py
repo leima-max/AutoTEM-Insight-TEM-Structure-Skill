@@ -28,7 +28,7 @@ STEP_ALIASES: dict[str, tuple[str, ...]] = {
 }
 _SUPPORTED_OUTPUT_FORMATS = {"json", "csv", "html", "svg", "pdf"}
 _SUPPORTED_CALIBRATION_METHODS = {"auto", "metadata", "manual", "reference"}
-_SUPPORTED_PREPROCESS_RECIPES = {"auto", "min_max", "b2_fft"}
+_SUPPORTED_PREPROCESS_RECIPES = {"auto", "min_max"}
 _SUPPORTED_PEAK_THRESHOLD_STRATEGIES = {"auto", "quantile", "std", "relative_max", "mad"}
 _SUPPORTED_INDEXING_MODES = {"auto", "baseline", "lattice_fit"}
 _SUPPORTED_ACCEPTANCE_OPS = {">=", "<=", ">", "<", "=="}
