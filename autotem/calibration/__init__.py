@@ -3,6 +3,7 @@
 from autotem.calibration.basic import calibrate_dataset
 from autotem.calibration.diffraction_calibration import (
     diffraction_scale_from_known_d_spacing,
+    diffraction_scale_from_reference_pairs,
     electron_wavelength_nm,
     estimate_camera_length_mm,
     reciprocal_scale_from_pixel_size,
@@ -18,6 +19,7 @@ from autotem.calibration.pixel_calibration import (
     convert_length,
     infer_pixel_size_from_scalebar,
     manual_pixel_size_from_reference,
+    register_scalebar_ocr_reader,
     resolve_pixel_size_measurement,
     resolve_voltage_kv,
 )
@@ -27,10 +29,12 @@ __all__ = [
     "coerce_length_to_nm",
     "convert_length",
     "diffraction_scale_from_known_d_spacing",
+    "diffraction_scale_from_reference_pairs",
     "electron_wavelength_nm",
     "estimate_camera_length_mm",
     "infer_pixel_size_from_scalebar",
     "manual_pixel_size_from_reference",
+    "register_scalebar_ocr_reader",
     "reciprocal_scale_from_pixel_size",
     "resolve_diffraction_calibration",
     "resolve_diffraction_calibration_engine",

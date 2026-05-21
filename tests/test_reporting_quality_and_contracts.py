@@ -125,6 +125,49 @@ def test_quality_gate_interface_required_items_can_be_configured(tmp_path: Path)
     assert "C.AtomLattice" in interface_gate.get("missing_items", [])
 
 
+def test_quality_gate_diffraction_thresholds_can_be_configured(tmp_path: Path) -> None:
+    image = np.zeros((48, 48), dtype=np.float32)
+    image[24, 18] = 4.0
+    image[24, 30] = 4.0
+    input_path = tmp_path / "diffraction_gate.npy"
+    np.save(input_path, image)
+    workflow_path = tmp_path / "diffraction_gate.yaml"
+    workflow_path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: diffraction_gate_custom",
+                "  steps: [load, assess_quality, calibrate, preprocess, analyze, report]",
+                "  parameters:",
+                "    reporting:",
+                "      diffraction_gates:",
+                "        min_peak_count: 999",
+                "outputs:",
+                "  formats: [json]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = TEMAnalysisSkill().run(
+        input_path=input_path,
+        workflow_path=workflow_path,
+        output_dir=tmp_path / "outputs",
+    )
+    report = read_json(Path(result["report_path"]), AnalysisReport)
+    assert any(
+        warning.startswith("BLOCKING: Diffraction peak count is below gate threshold")
+        for warning in report.warnings
+    )
+    quality_gates = report.provenance.get("quality_gates", {})
+    assert isinstance(quality_gates, dict)
+    gates = quality_gates.get("gates", {})
+    assert isinstance(gates, dict)
+    peak_gate = gates.get("diffraction_peak_count_minimum", {})
+    assert isinstance(peak_gate, dict)
+    assert peak_gate.get("passed") is False
+
+
 def test_large_array_layering_metadata_present(tmp_path: Path) -> None:
     image = np.zeros((2048, 2048), dtype=np.float32)
     image[1024, 1000] = 8.0

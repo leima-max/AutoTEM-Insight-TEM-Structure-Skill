@@ -3,7 +3,10 @@ from __future__ import annotations
 import numpy as np
 
 import autotem.calibration.pixel_calibration as pixel_calibration
-from autotem.calibration.pixel_calibration import infer_pixel_size_from_scalebar
+from autotem.calibration.pixel_calibration import (
+    infer_pixel_size_from_scalebar,
+    register_scalebar_ocr_reader,
+)
 
 
 def _synthetic_scalebar_image(
@@ -90,4 +93,43 @@ def test_infer_pixel_size_from_scalebar_ocr_fallback(monkeypatch) -> None:
     assert pixel_nm is not None
     assert abs(pixel_nm - (5.0 / 100.0)) < 0.02
     assert "scalebar.text (ocr:" in source
+    assert warnings == []
+
+
+def test_infer_pixel_size_from_dark_vertical_scalebar() -> None:
+    h, w = 260, 320
+    image = np.full((h, w), 0.85, dtype=np.float32)
+    x = 24
+    y0, y1 = h - 140, h - 20
+    image[y0:y1, x] = 0.05
+    image[y0:y1, x + 1] = 0.10
+    pixel_nm, source, warnings = infer_pixel_size_from_scalebar(
+        image,
+        metadata={"ImageDescription": "Scale bar 12 nm"},
+    )
+    assert pixel_nm is not None
+    assert abs(pixel_nm - (12.0 / (y1 - y0))) < 0.1
+    assert "scalebar.bar" in source
+    assert warnings == []
+
+
+def test_register_scalebar_ocr_reader_hook() -> None:
+    image = _synthetic_scalebar_image(bar_x0=30, bar_x1=150)
+
+    def _reader(_image):
+        return [("6 nm", 0.90, 32.0, float(_image.shape[0] - 10))]
+
+    register_scalebar_ocr_reader(_reader)
+    try:
+        pixel_nm, source, warnings = infer_pixel_size_from_scalebar(
+            image,
+            metadata={"ImageDescription": "no metadata scale text"},
+            file_hint="no_hint.tiff",
+        )
+    finally:
+        register_scalebar_ocr_reader(None)
+
+    assert pixel_nm is not None
+    assert abs(pixel_nm - (6.0 / 120.0)) < 0.03
+    assert "ocr" in source
     assert warnings == []

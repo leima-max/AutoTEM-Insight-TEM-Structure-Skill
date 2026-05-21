@@ -253,6 +253,19 @@ def _evaluate_quality_gates(
     gate_warnings: list[str] = []
     gate_results: dict[str, dict[str, object]] = {}
     step_names = {step.name for step in workflow.steps}
+    reporting_parameters = reporting_parameters or {}
+
+    def _cfg_float(value: Any, *, default: float) -> float:
+        if isinstance(value, bool):
+            return float(default)
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                return float(default)
+        return float(default)
 
     any_failed_step = any(step.status == "failed" for step in workflow.steps)
     gate_results["workflow_no_failed_steps"] = {
@@ -295,6 +308,150 @@ def _evaluate_quality_gates(
             gate_warnings.append(
                 "BLOCKING: Diffraction step requested but d-spacing table is empty."
             )
+        if has_diffraction and has_peaks and has_d_spacings:
+            diffraction_gate_cfg_raw = reporting_parameters.get("diffraction_gates")
+            diffraction_gate_cfg = (
+                dict(diffraction_gate_cfg_raw)
+                if isinstance(diffraction_gate_cfg_raw, dict)
+                else {}
+            )
+            min_peak_count = int(
+                max(1, _cfg_float(diffraction_gate_cfg.get("min_peak_count"), default=4.0))
+            )
+            min_unc_coverage = _cfg_float(
+                diffraction_gate_cfg.get("min_uncertainty_coverage"),
+                default=0.80,
+            )
+            max_mean_rel_unc = _cfg_float(
+                diffraction_gate_cfg.get("max_mean_relative_uncertainty"),
+                default=0.35,
+            )
+
+            peak_count = len(report.diffraction.peaks)
+            peak_count_pass = peak_count >= min_peak_count
+            gate_results["diffraction_peak_count_minimum"] = {
+                "passed": peak_count_pass,
+                "required": True,
+                "observed": peak_count,
+                "threshold": min_peak_count,
+            }
+            if not peak_count_pass:
+                gate_warnings.append(
+                    "BLOCKING: Diffraction peak count is below gate threshold "
+                    f"({peak_count} < {min_peak_count})."
+                )
+
+            center_offset = None
+            center_offset_pass = True
+            max_center_offset_override = diffraction_gate_cfg.get("max_center_offset_px")
+            max_center_offset = _cfg_float(max_center_offset_override, default=-1.0)
+            fft_payload = report.diffraction.provenance.get("fft", {})
+            if isinstance(fft_payload, dict):
+                center_payload = fft_payload.get("center", {})
+                if isinstance(center_payload, dict):
+                    raw_offset = center_payload.get("offset_px")
+                    if isinstance(raw_offset, (int, float)):
+                        center_offset = float(raw_offset)
+                    image_shape = fft_payload.get("image_shape", [])
+                    if (
+                        max_center_offset < 0
+                        and isinstance(image_shape, list)
+                        and len(image_shape) >= 2
+                    ):
+                        try:
+                            h = int(image_shape[0])
+                            w = int(image_shape[1])
+                        except (TypeError, ValueError):
+                            h = 0
+                            w = 0
+                        if h > 0 and w > 0:
+                            max_center_offset = float(max(6.0, 0.20 * min(h, w)))
+            if center_offset is not None and max_center_offset >= 0:
+                center_offset_pass = center_offset <= max_center_offset
+            gate_results["diffraction_center_offset_in_range"] = {
+                "passed": center_offset_pass,
+                "required": True,
+                "observed": center_offset,
+                "threshold": (None if max_center_offset < 0 else max_center_offset),
+            }
+            if not center_offset_pass:
+                gate_warnings.append(
+                    "BLOCKING: Diffraction center offset exceeds gate threshold "
+                    f"({center_offset:.3f}px > {max_center_offset:.3f}px)."
+                )
+
+            rel_uncertainties: list[float] = []
+            for item in report.diffraction.d_spacings:
+                if item.uncertainty is None:
+                    continue
+                if not isinstance(item.value, (int, float)):
+                    continue
+                if not isinstance(item.uncertainty, (int, float)):
+                    continue
+                value = float(item.value)
+                if abs(value) <= 1e-12:
+                    continue
+                rel_uncertainties.append(abs(float(item.uncertainty) / value))
+            unc_coverage = (
+                len(rel_uncertainties) / max(1, len(report.diffraction.d_spacings))
+            )
+            mean_rel_unc = (
+                float(sum(rel_uncertainties) / len(rel_uncertainties))
+                if rel_uncertainties
+                else 0.0
+            )
+            unc_cov_pass = unc_coverage >= min_unc_coverage
+            unc_mean_pass = mean_rel_unc <= max_mean_rel_unc
+            gate_results["d_spacing_uncertainty_coverage_minimum"] = {
+                "passed": unc_cov_pass,
+                "required": True,
+                "observed": unc_coverage,
+                "threshold": min_unc_coverage,
+            }
+            gate_results["d_spacing_uncertainty_mean_relative_maximum"] = {
+                "passed": unc_mean_pass,
+                "required": True,
+                "observed": mean_rel_unc,
+                "threshold": max_mean_rel_unc,
+            }
+            if not unc_cov_pass:
+                gate_warnings.append(
+                    "BLOCKING: d-spacing uncertainty coverage below gate threshold "
+                    f"({unc_coverage:.3f} < {min_unc_coverage:.3f})."
+                )
+            if not unc_mean_pass:
+                gate_warnings.append(
+                    "BLOCKING: Mean d-spacing relative uncertainty above gate threshold "
+                    f"({mean_rel_unc:.3f} > {max_mean_rel_unc:.3f})."
+                )
+
+            if step_names.intersection({"index_diffraction", "phase_match"}):
+                consistency_payload = report.diffraction.provenance.get("b3_b4_consistency", {})
+                indexed_fraction = None
+                if isinstance(consistency_payload, dict):
+                    raw_fraction = consistency_payload.get("indexed_nonzero_fraction")
+                    if isinstance(raw_fraction, (int, float)):
+                        indexed_fraction = float(raw_fraction)
+                min_indexed_fraction = _cfg_float(
+                    diffraction_gate_cfg.get("min_indexed_nonzero_fraction"),
+                    default=0.20,
+                )
+                indexed_fraction_pass = (
+                    True
+                    if indexed_fraction is None
+                    else indexed_fraction >= min_indexed_fraction
+                )
+                gate_results["b3_b4_indexed_fraction_minimum"] = {
+                    "passed": indexed_fraction_pass,
+                    "required": True,
+                    "observed": indexed_fraction,
+                    "threshold": min_indexed_fraction,
+                }
+                if not indexed_fraction_pass:
+                    gate_warnings.append(
+                        "BLOCKING: B3/B4 indexed non-zero hkl fraction below gate threshold "
+                        f"({indexed_fraction:.3f} < {min_indexed_fraction:.3f})."
+                    )
 
     atom_required = "detect_atoms" in step_names
     if atom_required:
@@ -317,7 +474,6 @@ def _evaluate_quality_gates(
                 "BLOCKING: detect_atoms step requested but atom coordinates are empty."
             )
 
-    reporting_parameters = reporting_parameters or {}
     interface_gate_cfg_raw = reporting_parameters.get("interface_gates")
     interface_gate_cfg = (
         dict(interface_gate_cfg_raw)

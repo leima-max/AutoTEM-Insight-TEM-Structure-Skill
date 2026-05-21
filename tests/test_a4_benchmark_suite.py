@@ -246,6 +246,8 @@ def test_a4_extended_bc_reference_metrics_are_reported() -> None:
     assert "d_spacing_uncertainty_coverage" in metric_map
     assert "d_spacing_uncertainty_mean_relative" in metric_map
     assert "d_spacing_uncertainty_plausible_fraction" in metric_map
+    assert "b3_b4_indexed_nonzero_fraction" in metric_map
+    assert "b3_b4_top_phase_score" in metric_map
     assert benchmark.passed is True
 
 

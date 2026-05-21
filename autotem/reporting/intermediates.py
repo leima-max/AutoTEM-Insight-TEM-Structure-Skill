@@ -147,7 +147,11 @@ def persist_intermediate_artifacts(
         artifacts.append(main_artifact)
         artifacts.extend(aux_artifacts)
 
-    preprocessing_uri = report.preprocessing.image.uri if report.preprocessing is not None else None
+    preprocessing_uri = (
+        report.preprocessing.image.uri
+        if report.preprocessing is not None and report.preprocessing.image is not None
+        else None
+    )
     preprocessing_array = _load_array_from_uri(preprocessing_uri)
     if preprocessing_array is not None:
         main_artifact, aux_artifacts = _persist_layered_array(

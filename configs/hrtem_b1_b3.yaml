@@ -1,0 +1,55 @@
+workflow:
+  name: hrtem_b1_b3
+  description: B1 calibration + B3 diffraction metrics baseline workflow.
+  steps:
+    - load
+    - assess_quality
+    - calibrate
+    - preprocess
+    - analyze
+    - simulate
+    - report
+  parameters:
+    quality:
+      thresholds:
+        snr_min: 6.0
+        drift_px_max: 2.0
+        overall_score_min: 0.35
+    calibration:
+      method: reference
+      known_d_spacing: 0.235
+      known_d_spacing_unit: nm
+      measured_radius_px: 8.5
+      known_d_uncertainty_nm: 0.002
+      measured_radius_uncertainty_px: 0.3
+      detector_pixel_size_um: 14.0
+    preprocessing:
+      recipe: auto
+      denoise_method: wiener
+      wiener_window: 5
+      background_method: gaussian
+      background_sigma: 12.0
+    diffraction:
+      auto_peak_tuning: true
+      top_k_peaks: 24
+      min_peak_distance: 3
+      center_exclusion_radius: 4.0
+      peak_threshold_strategy: auto
+      peak_detector: log
+      detector_sigma: 1.2
+      fft_center_mode: auto
+      direct_beam_refine_window: 3
+      indexing_mode: auto
+      phase_top_n: 3
+    reporting:
+      diffraction_gates:
+        min_peak_count: 4
+        min_uncertainty_coverage: 0.8
+        max_mean_relative_uncertainty: 0.35
+        min_indexed_nonzero_fraction: 0.2
+outputs:
+  formats:
+    - json
+    - csv
+    - html
+  save_intermediates: true

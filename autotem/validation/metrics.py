@@ -187,6 +187,71 @@ def collect_validation_metrics(report: AnalysisReport) -> tuple[list[ValidationM
             direction="higher_is_better",
         )
     )
+    if diffraction is not None:
+        indexed_nonzero = sum(
+            1
+            for spot in diffraction.indexed_spots
+            if (int(spot.h), int(spot.k), int(spot.l)) != (0, 0, 0)
+        )
+        indexed_fraction = indexed_nonzero / peak_count if peak_count > 0 else 0.0
+        metrics.append(
+            _metric(
+                name="b3_b4_indexed_nonzero_fraction",
+                value=indexed_fraction,
+                unit="fraction",
+                method="diffraction.indexed_spots_scan",
+                direction="higher_is_better",
+                details={
+                    "indexed_nonzero": indexed_nonzero,
+                    "peak_count": peak_count,
+                },
+            )
+        )
+        fft_payload = diffraction.provenance.get("fft", {})
+        if isinstance(fft_payload, dict):
+            center_payload = fft_payload.get("center", {})
+            if isinstance(center_payload, dict) and isinstance(
+                center_payload.get("offset_px"),
+                (int, float),
+            ):
+                metrics.append(
+                    _metric(
+                        name="diffraction_center_offset_px",
+                        value=float(center_payload["offset_px"]),
+                        unit="pixel",
+                        method="fft.center.offset_px",
+                        direction="lower_is_better",
+                    )
+                )
+        consistency_payload = diffraction.provenance.get("b3_b4_consistency", {})
+        top_phase_score = None
+        if isinstance(consistency_payload, dict) and isinstance(
+            consistency_payload.get("top_phase_score"),
+            (int, float),
+        ):
+            top_phase_score = float(consistency_payload["top_phase_score"])
+            score_method = "diffraction.provenance.b3_b4_consistency"
+        else:
+            candidate_scores = [
+                float(item.score)
+                for item in diffraction.phase_candidates
+                if isinstance(item.score, (int, float))
+            ]
+            if candidate_scores:
+                top_phase_score = max(candidate_scores)
+                score_method = "diffraction.phase_candidates"
+            else:
+                score_method = "diffraction.phase_candidates"
+        if top_phase_score is not None:
+            metrics.append(
+                _metric(
+                    name="b3_b4_top_phase_score",
+                    value=float(top_phase_score),
+                    unit="score",
+                    method=score_method,
+                    direction="higher_is_better",
+                )
+            )
 
     atom_count = len(report.atom_lattice.atoms) if report.atom_lattice is not None else 0
     metrics.append(

@@ -10,10 +10,11 @@ from pydantic import Field
 
 from autotem.calibration.open_source_adapters import SUPPORTED_DIFFRACTION_CALIBRATION_ENGINES
 from autotem.core.models import AutoTEMModel, WorkflowConfig, WorkflowStep
+from autotem.diffraction.open_source_adapters import SUPPORTED_PEAK_ADAPTER_ENGINES
 
 DEFAULT_WORKFLOW_NAME = "a2_default"
 DEFAULT_WORKFLOW_DESCRIPTION = "A2 baseline load-calibrate-diffraction-simulation workflow."
-WORKFLOW_PARAMETER_SCHEMA_VERSION = "2026-05-13.b1.1"
+WORKFLOW_PARAMETER_SCHEMA_VERSION = "2026-05-21.b2b3.2"
 DEFAULT_STEP_SEQUENCE: tuple[str, ...] = (
     "load",
     "assess_quality",
@@ -29,8 +30,12 @@ STEP_ALIASES: dict[str, tuple[str, ...]] = {
 _SUPPORTED_OUTPUT_FORMATS = {"json", "csv", "html", "svg", "pdf"}
 _SUPPORTED_CALIBRATION_METHODS = {"auto", "metadata", "manual", "reference"}
 _SUPPORTED_PREPROCESS_RECIPES = {"auto", "min_max"}
+_SUPPORTED_DENOISE_METHODS = {"auto", "none", "gaussian", "median", "wiener", "nlm"}
+_SUPPORTED_BACKGROUND_METHODS = {"none", "gaussian", "rolling_ball"}
 _SUPPORTED_PEAK_THRESHOLD_STRATEGIES = {"auto", "quantile", "std", "relative_max", "mad"}
+_SUPPORTED_PEAK_DETECTORS = {"local_max", "log", "dog"}
 _SUPPORTED_INDEXING_MODES = {"auto", "baseline", "lattice_fit"}
+_SUPPORTED_FFT_CENTER_MODES = {"auto", "geometric"}
 _SUPPORTED_ACCEPTANCE_OPS = {">=", "<=", ">", "<", "=="}
 _QUALITY_THRESHOLD_RANGE_01_KEYS = {
     "blur_risk_max",
@@ -40,6 +45,15 @@ _QUALITY_THRESHOLD_RANGE_01_KEYS = {
     "overall_score_min",
 }
 _QUALITY_THRESHOLD_NONNEG_KEYS = {"snr_min", "drift_px_max"}
+_QUALITY_WEIGHT_KEYS = {
+    "snr",
+    "drift",
+    "blur",
+    "contamination",
+    "astigmatism",
+    "undersampling",
+    "metadata",
+}
 
 
 class WorkflowOutputs(AutoTEMModel):
@@ -108,6 +122,16 @@ def _as_float(value: Any, *, field_name: str) -> float:
     raise ValueError(msg)
 
 
+def _as_bool(value: Any, *, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
+            return token in {"true", "1", "yes", "on"}
+    raise ValueError(f"Workflow parameter '{field_name}' must be boolean.")
+
+
 def _validate_output_formats(formats: list[str]) -> list[str]:
     normalized: list[str] = []
     for item in formats:
@@ -153,6 +177,95 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
                     raise ValueError(
                         f"workflow.parameters.quality.thresholds.{key} must be within [0, 1]."
                     )
+        thresholds_by_modality = quality.get("thresholds_by_modality")
+        if thresholds_by_modality is not None:
+            if not isinstance(thresholds_by_modality, dict):
+                raise ValueError(
+                    "workflow.parameters.quality.thresholds_by_modality must be a mapping."
+                )
+            for modality_key, row in thresholds_by_modality.items():
+                if not isinstance(modality_key, str) or not modality_key.strip():
+                    raise ValueError(
+                        "workflow.parameters.quality.thresholds_by_modality keys "
+                        "must be non-empty strings."
+                    )
+                if not isinstance(row, dict):
+                    raise ValueError(
+                        "workflow.parameters.quality.thresholds_by_modality entries "
+                        "must be mappings."
+                    )
+                for key in _QUALITY_THRESHOLD_NONNEG_KEYS:
+                    if key in row:
+                        value = _as_float(
+                            row[key],
+                            field_name=(
+                                "quality.thresholds_by_modality."
+                                f"{modality_key}.{key}"
+                            ),
+                        )
+                        if value < 0:
+                            raise ValueError(
+                                "workflow.parameters.quality.thresholds_by_modality."
+                                f"{modality_key}.{key} must be >= 0."
+                            )
+                for key in _QUALITY_THRESHOLD_RANGE_01_KEYS:
+                    if key in row:
+                        value = _as_float(
+                            row[key],
+                            field_name=(
+                                "quality.thresholds_by_modality."
+                                f"{modality_key}.{key}"
+                            ),
+                        )
+                        if not (0 <= value <= 1):
+                            raise ValueError(
+                                "workflow.parameters.quality.thresholds_by_modality."
+                                f"{modality_key}.{key} must be within [0, 1]."
+                            )
+        metric_weights = quality.get("metric_weights")
+        if metric_weights is not None:
+            if not isinstance(metric_weights, dict):
+                raise ValueError("workflow.parameters.quality.metric_weights must be a mapping.")
+            for key, raw_value in metric_weights.items():
+                if key not in _QUALITY_WEIGHT_KEYS:
+                    continue
+                value = _as_float(raw_value, field_name=f"quality.metric_weights.{key}")
+                if value <= 0:
+                    raise ValueError(
+                        f"workflow.parameters.quality.metric_weights.{key} must be > 0."
+                    )
+        metric_weights_by_modality = quality.get("metric_weights_by_modality")
+        if metric_weights_by_modality is not None:
+            if not isinstance(metric_weights_by_modality, dict):
+                raise ValueError(
+                    "workflow.parameters.quality.metric_weights_by_modality must be a mapping."
+                )
+            for modality_key, row in metric_weights_by_modality.items():
+                if not isinstance(modality_key, str) or not modality_key.strip():
+                    raise ValueError(
+                        "workflow.parameters.quality.metric_weights_by_modality keys "
+                        "must be non-empty strings."
+                    )
+                if not isinstance(row, dict):
+                    raise ValueError(
+                        "workflow.parameters.quality.metric_weights_by_modality entries "
+                        "must be mappings."
+                    )
+                for key, raw_value in row.items():
+                    if key not in _QUALITY_WEIGHT_KEYS:
+                        continue
+                    value = _as_float(
+                        raw_value,
+                        field_name=(
+                            "quality.metric_weights_by_modality."
+                            f"{modality_key}.{key}"
+                        ),
+                    )
+                    if value <= 0:
+                        raise ValueError(
+                            "workflow.parameters.quality.metric_weights_by_modality."
+                            f"{modality_key}.{key} must be > 0."
+                        )
 
     calibration = params.get("calibration")
     if calibration is not None:
@@ -249,6 +362,105 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
                     "workflow.parameters.calibration.known_d_spacing_unit "
                     "must be a non-empty string."
                 )
+        if "multi_reference_outlier_sigma" in calibration:
+            outlier_sigma = _as_float(
+                calibration["multi_reference_outlier_sigma"],
+                field_name="calibration.multi_reference_outlier_sigma",
+            )
+            if outlier_sigma < 0:
+                raise ValueError(
+                    "workflow.parameters.calibration.multi_reference_outlier_sigma must be >= 0."
+                )
+        if "multi_reference_min_inliers" in calibration:
+            min_inliers = int(
+                _as_float(
+                    calibration["multi_reference_min_inliers"],
+                    field_name="calibration.multi_reference_min_inliers",
+                )
+            )
+            if min_inliers < 1:
+                raise ValueError(
+                    "workflow.parameters.calibration.multi_reference_min_inliers must be >= 1."
+                )
+        if "known_d_spacing_refs" in calibration:
+            refs = calibration["known_d_spacing_refs"]
+            if not isinstance(refs, list):
+                raise ValueError(
+                    "workflow.parameters.calibration.known_d_spacing_refs must be a list."
+                )
+            for idx, row in enumerate(refs):
+                if isinstance(row, dict):
+                    if "known_d_spacing" not in row or "measured_radius_px" not in row:
+                        raise ValueError(
+                            "workflow.parameters.calibration.known_d_spacing_refs."
+                            f"[{idx}] must include known_d_spacing and measured_radius_px."
+                        )
+                    known_d = _as_float(
+                        row["known_d_spacing"],
+                        field_name=f"calibration.known_d_spacing_refs[{idx}].known_d_spacing",
+                    )
+                    radius = _as_float(
+                        row["measured_radius_px"],
+                        field_name=f"calibration.known_d_spacing_refs[{idx}].measured_radius_px",
+                    )
+                    if known_d <= 0 or radius <= 0:
+                        raise ValueError(
+                            "workflow.parameters.calibration.known_d_spacing_refs."
+                            f"[{idx}] known_d_spacing and measured_radius_px must be > 0."
+                        )
+                elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                    known_d = _as_float(
+                        row[0],
+                        field_name=f"calibration.known_d_spacing_refs[{idx}][0]",
+                    )
+                    radius = _as_float(
+                        row[1],
+                        field_name=f"calibration.known_d_spacing_refs[{idx}][1]",
+                    )
+                    if known_d <= 0 or radius <= 0:
+                        raise ValueError(
+                            "workflow.parameters.calibration.known_d_spacing_refs."
+                            f"[{idx}] values must be > 0."
+                        )
+                else:
+                    raise ValueError(
+                        "workflow.parameters.calibration.known_d_spacing_refs."
+                        f"[{idx}] must be a mapping or [known_d_spacing, measured_radius_px]."
+                    )
+        known_d_spacings = calibration.get("known_d_spacings")
+        measured_radii_px_list = calibration.get("measured_radii_px")
+        if known_d_spacings is not None or measured_radii_px_list is not None:
+            if (
+                not isinstance(known_d_spacings, list)
+                or not isinstance(measured_radii_px_list, list)
+            ):
+                raise ValueError(
+                    "workflow.parameters.calibration.known_d_spacings and measured_radii_px "
+                    "must be lists when either is provided."
+                )
+            if not known_d_spacings or not measured_radii_px_list:
+                raise ValueError(
+                    "workflow.parameters.calibration.known_d_spacings and measured_radii_px "
+                    "must be non-empty lists."
+                )
+            for idx, value in enumerate(known_d_spacings):
+                known_d = _as_float(
+                    value,
+                    field_name=f"calibration.known_d_spacings[{idx}]",
+                )
+                if known_d <= 0:
+                    raise ValueError(
+                        f"workflow.parameters.calibration.known_d_spacings[{idx}] must be > 0."
+                    )
+            for idx, value in enumerate(measured_radii_px_list):
+                radius = _as_float(
+                    value,
+                    field_name=f"calibration.measured_radii_px[{idx}]",
+                )
+                if radius <= 0:
+                    raise ValueError(
+                        f"workflow.parameters.calibration.measured_radii_px[{idx}] must be > 0."
+                    )
         reference = calibration.get("reference")
         if reference is not None and not isinstance(reference, dict):
             raise ValueError(
@@ -337,6 +549,67 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
             )
             if denoise_sigma < 0:
                 raise ValueError("workflow.parameters.preprocessing.denoise_sigma must be >= 0.")
+        if "denoise_method" in preprocessing:
+            denoise_method = str(preprocessing["denoise_method"]).strip().lower()
+            if denoise_method not in _SUPPORTED_DENOISE_METHODS:
+                raise ValueError(
+                    "workflow.parameters.preprocessing.denoise_method must be one of "
+                    f"{sorted(_SUPPORTED_DENOISE_METHODS)}."
+                )
+        if "median_size" in preprocessing:
+            median_size = int(
+                _as_float(
+                    preprocessing["median_size"],
+                    field_name="preprocessing.median_size",
+                )
+            )
+            if median_size < 1:
+                raise ValueError("workflow.parameters.preprocessing.median_size must be >= 1.")
+        if "wiener_window" in preprocessing:
+            wiener_window = int(
+                _as_float(
+                    preprocessing["wiener_window"],
+                    field_name="preprocessing.wiener_window",
+                )
+            )
+            if wiener_window < 3:
+                raise ValueError("workflow.parameters.preprocessing.wiener_window must be >= 3.")
+        if "wiener_noise" in preprocessing:
+            wiener_noise = _as_float(
+                preprocessing["wiener_noise"],
+                field_name="preprocessing.wiener_noise",
+            )
+            if wiener_noise < 0:
+                raise ValueError("workflow.parameters.preprocessing.wiener_noise must be >= 0.")
+        if "nlm_h" in preprocessing:
+            nlm_h = _as_float(
+                preprocessing["nlm_h"],
+                field_name="preprocessing.nlm_h",
+            )
+            if nlm_h <= 0:
+                raise ValueError("workflow.parameters.preprocessing.nlm_h must be > 0.")
+        if "nlm_patch_size" in preprocessing:
+            patch_size = int(
+                _as_float(
+                    preprocessing["nlm_patch_size"],
+                    field_name="preprocessing.nlm_patch_size",
+                )
+            )
+            if patch_size < 3:
+                raise ValueError(
+                    "workflow.parameters.preprocessing.nlm_patch_size must be >= 3."
+                )
+        if "nlm_patch_distance" in preprocessing:
+            patch_distance = int(
+                _as_float(
+                    preprocessing["nlm_patch_distance"],
+                    field_name="preprocessing.nlm_patch_distance",
+                )
+            )
+            if patch_distance < 1:
+                raise ValueError(
+                    "workflow.parameters.preprocessing.nlm_patch_distance must be >= 1."
+                )
         if "background_sigma" in preprocessing:
             background_sigma = _as_float(
                 preprocessing["background_sigma"],
@@ -345,6 +618,24 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
             if background_sigma < 0:
                 raise ValueError(
                     "workflow.parameters.preprocessing.background_sigma must be >= 0."
+                )
+        if "background_method" in preprocessing:
+            background_method = str(preprocessing["background_method"]).strip().lower()
+            if background_method not in _SUPPORTED_BACKGROUND_METHODS:
+                raise ValueError(
+                    "workflow.parameters.preprocessing.background_method must be one of "
+                    f"{sorted(_SUPPORTED_BACKGROUND_METHODS)}."
+                )
+        if "background_opening_size" in preprocessing:
+            opening_size = int(
+                _as_float(
+                    preprocessing["background_opening_size"],
+                    field_name="preprocessing.background_opening_size",
+                )
+            )
+            if opening_size < 3:
+                raise ValueError(
+                    "workflow.parameters.preprocessing.background_opening_size must be >= 3."
                 )
 
     diffraction = params.get("diffraction")
@@ -364,6 +655,11 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
             )
             if phase_top_n < 1:
                 raise ValueError("workflow.parameters.diffraction.phase_top_n must be >= 1.")
+        if "auto_peak_tuning" in diffraction:
+            _as_bool(
+                diffraction["auto_peak_tuning"],
+                field_name="diffraction.auto_peak_tuning",
+            )
         if "min_peak_distance" in diffraction:
             min_distance = _as_float(
                 diffraction["min_peak_distance"],
@@ -403,11 +699,41 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
                     "workflow.parameters.diffraction.peak_threshold_strategy must be one of "
                     f"{sorted(_SUPPORTED_PEAK_THRESHOLD_STRATEGIES)}."
                 )
+        if "peak_detector" in diffraction:
+            detector = str(diffraction["peak_detector"]).strip().lower()
+            if detector not in _SUPPORTED_PEAK_DETECTORS:
+                raise ValueError(
+                    "workflow.parameters.diffraction.peak_detector must be one of "
+                    f"{sorted(_SUPPORTED_PEAK_DETECTORS)}."
+                )
+        if "peak_adapter_engine" in diffraction:
+            peak_adapter_engine = str(diffraction["peak_adapter_engine"]).strip().lower()
+            if peak_adapter_engine not in SUPPORTED_PEAK_ADAPTER_ENGINES:
+                raise ValueError(
+                    "workflow.parameters.diffraction.peak_adapter_engine must be one of "
+                    f"{sorted(SUPPORTED_PEAK_ADAPTER_ENGINES)}."
+                )
         if "peak_threshold_value" in diffraction:
             _as_float(
                 diffraction["peak_threshold_value"],
                 field_name="diffraction.peak_threshold_value",
             )
+        if "detector_sigma" in diffraction:
+            detector_sigma = _as_float(
+                diffraction["detector_sigma"],
+                field_name="diffraction.detector_sigma",
+            )
+            if detector_sigma <= 0:
+                raise ValueError("workflow.parameters.diffraction.detector_sigma must be > 0.")
+        if "dog_sigma_ratio" in diffraction:
+            sigma_ratio = _as_float(
+                diffraction["dog_sigma_ratio"],
+                field_name="diffraction.dog_sigma_ratio",
+            )
+            if sigma_ratio <= 1:
+                raise ValueError(
+                    "workflow.parameters.diffraction.dog_sigma_ratio must be > 1."
+                )
         if "subpixel_window_radius" in diffraction:
             radius = int(
                 _as_float(
@@ -428,6 +754,106 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(
                     "workflow.parameters.diffraction.subpixel_max_shift must be >= 0."
                 )
+        if "fft_center_mode" in diffraction:
+            fft_center_mode = str(diffraction["fft_center_mode"]).strip().lower()
+            if fft_center_mode not in _SUPPORTED_FFT_CENTER_MODES:
+                raise ValueError(
+                    "workflow.parameters.diffraction.fft_center_mode must be one of "
+                    f"{sorted(_SUPPORTED_FFT_CENTER_MODES)}."
+                )
+        if "direct_beam_search_radius" in diffraction:
+            direct_beam_search_radius = _as_float(
+                diffraction["direct_beam_search_radius"],
+                field_name="diffraction.direct_beam_search_radius",
+            )
+            if direct_beam_search_radius < 0:
+                raise ValueError(
+                    "workflow.parameters.diffraction.direct_beam_search_radius must be >= 0."
+                )
+        if "direct_beam_refine_window" in diffraction:
+            direct_beam_refine_window = int(
+                _as_float(
+                    diffraction["direct_beam_refine_window"],
+                    field_name="diffraction.direct_beam_refine_window",
+                )
+            )
+            if direct_beam_refine_window < 1:
+                raise ValueError(
+                    "workflow.parameters.diffraction.direct_beam_refine_window must be >= 1."
+                )
+        if "direct_beam_center_uncertainty_px" in diffraction:
+            center_uncertainty_px = _as_float(
+                diffraction["direct_beam_center_uncertainty_px"],
+                field_name="diffraction.direct_beam_center_uncertainty_px",
+            )
+            if center_uncertainty_px < 0:
+                raise ValueError(
+                    "workflow.parameters.diffraction.direct_beam_center_uncertainty_px "
+                    "must be >= 0."
+                )
+
+    reporting = params.get("reporting")
+    if reporting is not None:
+        if not isinstance(reporting, dict):
+            raise ValueError("workflow.parameters.reporting must be a mapping.")
+        diffraction_gates = reporting.get("diffraction_gates")
+        if diffraction_gates is not None:
+            if not isinstance(diffraction_gates, dict):
+                raise ValueError(
+                    "workflow.parameters.reporting.diffraction_gates must be a mapping."
+                )
+            if "min_peak_count" in diffraction_gates:
+                min_peak_count = int(
+                    _as_float(
+                        diffraction_gates["min_peak_count"],
+                        field_name="reporting.diffraction_gates.min_peak_count",
+                    )
+                )
+                if min_peak_count < 1:
+                    raise ValueError(
+                        "workflow.parameters.reporting.diffraction_gates.min_peak_count "
+                        "must be >= 1."
+                    )
+            if "max_center_offset_px" in diffraction_gates:
+                max_center_offset = _as_float(
+                    diffraction_gates["max_center_offset_px"],
+                    field_name="reporting.diffraction_gates.max_center_offset_px",
+                )
+                if max_center_offset < 0:
+                    raise ValueError(
+                        "workflow.parameters.reporting.diffraction_gates.max_center_offset_px "
+                        "must be >= 0."
+                    )
+            if "min_uncertainty_coverage" in diffraction_gates:
+                min_uncertainty_coverage = _as_float(
+                    diffraction_gates["min_uncertainty_coverage"],
+                    field_name="reporting.diffraction_gates.min_uncertainty_coverage",
+                )
+                if not (0 <= min_uncertainty_coverage <= 1):
+                    raise ValueError(
+                        "workflow.parameters.reporting.diffraction_gates."
+                        "min_uncertainty_coverage must be within [0, 1]."
+                    )
+            if "max_mean_relative_uncertainty" in diffraction_gates:
+                max_mean_relative_uncertainty = _as_float(
+                    diffraction_gates["max_mean_relative_uncertainty"],
+                    field_name="reporting.diffraction_gates.max_mean_relative_uncertainty",
+                )
+                if max_mean_relative_uncertainty < 0:
+                    raise ValueError(
+                        "workflow.parameters.reporting.diffraction_gates."
+                        "max_mean_relative_uncertainty must be >= 0."
+                    )
+            if "min_indexed_nonzero_fraction" in diffraction_gates:
+                min_indexed_fraction = _as_float(
+                    diffraction_gates["min_indexed_nonzero_fraction"],
+                    field_name="reporting.diffraction_gates.min_indexed_nonzero_fraction",
+                )
+                if not (0 <= min_indexed_fraction <= 1):
+                    raise ValueError(
+                        "workflow.parameters.reporting.diffraction_gates."
+                        "min_indexed_nonzero_fraction must be within [0, 1]."
+                    )
 
     def _validate_acceptance_criteria(
         value: Any,
