@@ -262,3 +262,74 @@ def test_cli_benchmark_config_error(monkeypatch, tmp_path: Path, capsys) -> None
 
     assert exit_code == EXIT_CONFIG_ERROR
     assert "benchmark configuration error" in captured.err
+
+
+def test_cli_preview_b1b3_launches_streamlit(monkeypatch, tmp_path: Path, capsys) -> None:
+    called: dict[str, object] = {}
+
+    class _Completed:
+        returncode = 0
+
+    def _fake_find_spec(name: str):
+        return object() if name == "streamlit" else None
+
+    def _fake_run(cmd, check, env):
+        called["cmd"] = cmd
+        called["check"] = check
+        called["env"] = env
+        return _Completed()
+
+    monkeypatch.setattr("autotem.cli.importlib.util.find_spec", _fake_find_spec)
+    monkeypatch.setattr("autotem.cli.subprocess.run", _fake_run)
+
+    output_root = tmp_path / "preview_outputs"
+    exit_code = main(
+        [
+            "preview-b1b3",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8601",
+            "--output-root",
+            str(output_root),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Launching B1-B3 preview UI" in captured.out
+    cmd = called["cmd"]
+    assert isinstance(cmd, list)
+    assert "streamlit" in cmd
+    assert "b1_b3_preview_ui.py" in " ".join(str(item) for item in cmd)
+    env = called["env"]
+    assert isinstance(env, dict)
+    assert env.get("AUTOTEM_UI_OUTPUT_ROOT") == str(output_root)
+
+
+def test_cli_preview_b1b3_missing_streamlit_returns_config_error(
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr("autotem.cli.importlib.util.find_spec", lambda _: None)
+    exit_code = main(["preview-b1b3"])
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_CONFIG_ERROR
+    assert "streamlit is not installed" in captured.err
+
+
+def test_cli_preview_b1b3_nonzero_streamlit_exit_returns_runtime_error(
+    monkeypatch,
+    capsys,
+) -> None:
+    class _Completed:
+        returncode = 1
+
+    monkeypatch.setattr("autotem.cli.importlib.util.find_spec", lambda _: object())
+    monkeypatch.setattr("autotem.cli.subprocess.run", lambda *_, **__: _Completed())
+    exit_code = main(["preview-b1b3"])
+    captured = capsys.readouterr()
+
+    assert "Launching B1-B3 preview UI" in captured.out
+    assert exit_code == EXIT_RUNTIME_ERROR

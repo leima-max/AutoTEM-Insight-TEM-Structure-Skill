@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -102,6 +105,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--fail-on-failed",
         action="store_true",
         help="Return non-zero exit code when any benchmark case/criteria fail.",
+    )
+
+    preview = subparsers.add_parser(
+        "preview-b1b3",
+        help="Launch Streamlit UI for B1-B3 preview testing.",
+    )
+    preview.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Streamlit server address (default: 127.0.0.1).",
+    )
+    preview.add_argument(
+        "--port",
+        type=int,
+        default=8501,
+        help="Streamlit server port (default: 8501).",
+    )
+    preview.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help="Default output root directory shown in UI.",
     )
 
     return parser
@@ -206,6 +232,51 @@ def main(argv: list[str] | None = None) -> int:
         if args.fail_on_failed and not all_passed:
             return EXIT_RUNTIME_ERROR
         return EXIT_OK
+
+    if args.command == "preview-b1b3":
+        if importlib.util.find_spec("streamlit") is None:
+            print(
+                "AutoTEM preview configuration error: streamlit is not installed. "
+                "Install UI extras via `pip install \"autotem-insight[ui]\"`.",
+                file=sys.stderr,
+            )
+            return EXIT_CONFIG_ERROR
+
+        app_path = Path(__file__).resolve().parents[1] / "apps" / "b1_b3_preview_ui.py"
+        if not app_path.exists():
+            print(
+                f"AutoTEM preview file error: UI script not found: {app_path}",
+                file=sys.stderr,
+            )
+            return EXIT_FILE_ERROR
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "streamlit",
+            "run",
+            str(app_path),
+            "--server.address",
+            str(args.host),
+            "--server.port",
+            str(args.port),
+            "--server.headless",
+            "false",
+        ]
+        env = dict(os.environ)
+        if args.output_root is not None:
+            env["AUTOTEM_UI_OUTPUT_ROOT"] = str(args.output_root)
+
+        print(
+            "Launching B1-B3 preview UI on "
+            f"http://{args.host}:{args.port} ...",
+        )
+        try:
+            completed = subprocess.run(cmd, check=False, env=env)
+        except Exception as exc:  # noqa: BLE001
+            print(f"AutoTEM preview runtime error: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+        return EXIT_OK if completed.returncode == 0 else EXIT_RUNTIME_ERROR
 
     parser.print_help()
     return EXIT_OK

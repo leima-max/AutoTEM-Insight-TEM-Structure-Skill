@@ -16,6 +16,20 @@ calibration, diffraction analysis, reporting, and validation hooks.
 autotem analyze examples/sample.tif --output outputs/sample_run
 ```
 
+## B1-B3 Preview UI
+
+Launch an interactive UI for B1/B2/B3 preview testing:
+
+```powershell
+autotem preview-b1b3 --host 127.0.0.1 --port 8501
+```
+
+If UI dependencies are missing:
+
+```powershell
+pip install "autotem-insight[ui]"
+```
+
 ## B1 Calibration Fill-In (Recommended)
 
 When you know one standard ring/spot:
