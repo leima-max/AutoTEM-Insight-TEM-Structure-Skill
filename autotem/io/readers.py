@@ -257,10 +257,44 @@ def _read_dm(path: Path) -> ReadResult:
     except ImportError as exc:
         raise RuntimeError("Reading DM3/DM4 requires `ncempy`. Please install ncempy.") from exc
 
-    payload = dm.dmReader(str(path))
-    array = np.asarray(payload.get("data"))
-    metadata_raw = _to_jsonable(dict(payload))
-    metadata_raw.pop("data", None)
+    with dm.fileDM(str(path), on_memory=True) as dm_file:
+        payload = dm_file.getDataset(0)
+        array = np.asarray(payload.get("data"))
+        metadata_raw = _to_jsonable(dict(payload))
+        metadata_raw.pop("data", None)
+
+        dm_sections: dict[str, Any] = {}
+
+        dataset_metadata = dm_file.getMetadata(0)
+        if isinstance(dataset_metadata, dict):
+            dataset_metadata_json = _to_jsonable(dataset_metadata)
+            dm_sections["dataset_metadata"] = dataset_metadata_json
+            if isinstance(dataset_metadata_json, dict):
+                for key, value in dataset_metadata_json.items():
+                    metadata_raw.setdefault(str(key), value)
+
+        file_metadata = getattr(dm_file, "metadata", None)
+        if isinstance(file_metadata, dict):
+            file_metadata_json = _to_jsonable(file_metadata)
+            dm_sections["file_metadata"] = file_metadata_json
+            if isinstance(file_metadata_json, dict):
+                for key, value in file_metadata_json.items():
+                    metadata_raw.setdefault(str(key), value)
+
+        all_tags = getattr(dm_file, "allTags", None)
+        if isinstance(all_tags, dict):
+            all_tags_json = _to_jsonable(all_tags)
+            dm_sections["all_tags"] = all_tags_json
+            if isinstance(all_tags_json, dict):
+                for key, value in all_tags_json.items():
+                    key_text = str(key)
+                    metadata_raw.setdefault(key_text, value)
+                    stripped = key_text.lstrip(".")
+                    if stripped:
+                        metadata_raw.setdefault(stripped, value)
+
+        if dm_sections:
+            metadata_raw["dm_sections"] = dm_sections
 
     metadata_norm, warnings = normalize_metadata(metadata_raw, source_format=path.suffix)
     return ReadResult(
@@ -268,7 +302,7 @@ def _read_dm(path: Path) -> ReadResult:
         metadata_raw=metadata_raw,
         metadata_norm=metadata_norm,
         warnings=warnings,
-        provenance={"reader": "ncempy.dmReader", "format": "DM", "path": str(path)},
+        provenance={"reader": "ncempy.fileDM", "format": "DM", "path": str(path)},
     )
 
 

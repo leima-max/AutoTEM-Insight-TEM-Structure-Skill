@@ -52,6 +52,7 @@ def suggest_peak_parameter_defaults(
         "top_k_peaks": int(_clip(round(base * 0.40), 16, 96)),
         "min_peak_distance": int(_clip(round(base / 32.0), 2, 8)),
         "center_exclusion_radius": _clip(base * 0.06, 3.0, 14.0),
+        "max_peak_radius_px": _clip(base * 0.35, 24.0, base * 0.50),
         "detector_sigma": _clip(base / 96.0, 0.8, 2.2),
         "dog_sigma_ratio": 1.8,
     }
@@ -198,6 +199,9 @@ def detect_bragg_peaks(
     top_k: int = 32,
     min_distance: int = 3,
     center_exclusion_radius: float = 4.0,
+    max_peak_radius_px: float | None = None,
+    radius_outlier_filter: bool = True,
+    radius_outlier_mad_factor: float = 4.0,
     threshold_strategy: str = "auto",
     threshold_value: float | None = None,
     subpixel_window_radius: int = 2,
@@ -216,11 +220,18 @@ def detect_bragg_peaks(
     )
     yy, xx = np.indices(response.shape)
     rr = np.hypot(xx - float(center[0]), yy - float(center[1]))
+    max_radius = (
+        None
+        if max_peak_radius_px is None or float(max_peak_radius_px) <= 0
+        else float(max_peak_radius_px)
+    )
     threshold_response = response
-    if float(center_exclusion_radius) > 0:
-        annulus = response[rr >= float(center_exclusion_radius)]
-        if annulus.size >= 32:
-            threshold_response = np.asarray(annulus, dtype=np.float64)
+    annulus_mask = rr >= float(center_exclusion_radius)
+    if max_radius is not None:
+        annulus_mask = annulus_mask & (rr <= max_radius)
+    annulus = response[annulus_mask]
+    if annulus.size >= 32:
+        threshold_response = np.asarray(annulus, dtype=np.float64)
     threshold, threshold_method, threshold_diag = _resolve_threshold(
         threshold_response,
         strategy=threshold_strategy,
@@ -237,6 +248,7 @@ def detect_bragg_peaks(
             "std": std_value,
             "candidate_count": 0,
             "selected_count": 0,
+            "max_peak_radius_px": max_radius,
         }, warnings
 
     distance = max(1, int(min_distance))
@@ -258,6 +270,8 @@ def detect_bragg_peaks(
             & (response_map >= threshold_value_local)
             & (rr >= float(center_exclusion_radius))
         )
+        if max_radius is not None:
+            mask_local = mask_local & (rr <= max_radius)
         return np.argwhere(mask_local)
 
     coords = _candidate_coords(response, threshold)
@@ -309,20 +323,70 @@ def detect_bragg_peaks(
                 "candidate_count": 0,
                 "selected_count": 0,
                 "used_relaxed_threshold": used_relaxed_threshold,
+                "max_peak_radius_px": max_radius,
             }, warnings
 
     scores = response[coords[:, 0], coords[:, 1]]
     order = np.argsort(scores)[::-1]
-    selected: list[tuple[int, int]] = []
-    suppressed = np.zeros(response.shape, dtype=bool)
-    for idx in order.tolist():
-        y, x = int(coords[idx, 0]), int(coords[idx, 1])
-        if suppressed[y, x]:
-            continue
-        selected.append((y, x))
-        _suppress_disk(suppressed, y, x, distance=distance)
-        if len(selected) >= max(1, int(top_k)):
-            break
+
+    def _select_nms(
+        *,
+        radius_limit_px: float | None,
+        seed_coords: list[tuple[int, int]] | None = None,
+    ) -> list[tuple[int, int]]:
+        selected_coords = [] if seed_coords is None else list(seed_coords)
+        suppressed_mask = np.zeros(response.shape, dtype=bool)
+        for y0, x0 in selected_coords:
+            _suppress_disk(suppressed_mask, int(y0), int(x0), distance=distance)
+
+        for idx in order.tolist():
+            if len(selected_coords) >= max(1, int(top_k)):
+                break
+            y, x = int(coords[idx, 0]), int(coords[idx, 1])
+            if radius_limit_px is not None and rr[y, x] > float(radius_limit_px):
+                continue
+            if suppressed_mask[y, x]:
+                continue
+            selected_coords.append((y, x))
+            _suppress_disk(suppressed_mask, y, x, distance=distance)
+        return selected_coords
+
+    selected: list[tuple[int, int]] = _select_nms(radius_limit_px=max_radius)
+    outlier_removed_count = 0
+    outlier_radius_limit = None
+    outlier_radius_stats: dict[str, float] = {}
+    if bool(radius_outlier_filter) and len(selected) >= 8:
+        selected_radii = np.asarray([rr[y, x] for y, x in selected], dtype=np.float64)
+        radius_median = float(np.median(selected_radii))
+        radius_mad = float(np.median(np.abs(selected_radii - radius_median)))
+        mad_scale = max(2.0, radius_mad)
+        mad_factor = max(2.0, float(radius_outlier_mad_factor))
+        radius_limit = radius_median + mad_factor * mad_scale
+        p90 = float(np.quantile(selected_radii, 0.90))
+        radius_limit = min(radius_limit, p90 + 2.5 * mad_scale)
+        outlier_radius_stats = {
+            "median_radius_px": radius_median,
+            "mad_radius_px": radius_mad,
+            "p90_radius_px": p90,
+        }
+        if np.isfinite(radius_limit):
+            kept = [(y, x) for y, x in selected if rr[y, x] <= radius_limit]
+            outlier_removed_count = len(selected) - len(kept)
+            if outlier_removed_count > 0:
+                outlier_radius_limit = float(radius_limit)
+                selected = _select_nms(
+                    radius_limit_px=float(radius_limit),
+                    seed_coords=kept,
+                )
+                if len(selected) < max(1, int(top_k)):
+                    warnings.append(
+                        "Radius-outlier filtering reduced available inlier peaks below top_k; "
+                        f"kept {len(selected)} peak(s)."
+                    )
+                warnings.append(
+                    "Filtered far-radius peak outliers "
+                    f"({outlier_removed_count} removed, radius_limit={radius_limit:.1f}px)."
+                )
 
     if not selected:
         warnings.append("No FFT peaks remained after non-maximum suppression.")
@@ -333,6 +397,7 @@ def detect_bragg_peaks(
             "std": std_value,
             "candidate_count": int(coords.shape[0]),
             "selected_count": 0,
+            "max_peak_radius_px": max_radius,
         }, warnings
 
     selected_values = np.asarray([response[y, x] for y, x in selected], dtype=np.float64)
@@ -373,7 +438,13 @@ def detect_bragg_peaks(
         "selected_count": len(peaks),
         "min_distance_px": distance,
         "center_exclusion_radius_px": float(center_exclusion_radius),
+        "max_peak_radius_px": max_radius,
+        "radius_outlier_filter": bool(radius_outlier_filter),
+        "radius_outlier_mad_factor": float(radius_outlier_mad_factor),
+        "radius_outlier_removed_count": int(outlier_removed_count),
+        "radius_outlier_limit_px": outlier_radius_limit,
         "used_relaxed_threshold": used_relaxed_threshold,
     }
+    diagnostics.update(outlier_radius_stats)
     diagnostics.update(threshold_diag)
     return peaks, diagnostics, warnings

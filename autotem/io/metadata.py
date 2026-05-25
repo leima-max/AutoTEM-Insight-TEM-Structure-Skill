@@ -92,19 +92,117 @@ FORMAT_METADATA_MAPPINGS: dict[str, dict[str, list[dict[str, Any]]]] = {
     },
     "dm": {
         "pixel_size": [
-            {"keys": ["pixelSize.0"], "unit": "nm", "priority": 500},
-            {"keys": ["pixelSize"], "unit": "nm", "priority": 400},
+            {"keys": ["pixelSize.0"], "unit": "nm", "priority": 900},
+            {"keys": ["Calibrations Dimension 1 Scale"], "unit": "nm", "priority": 860},
+            {"keys": ["Calibrations Dimension 2 Scale"], "unit": "nm", "priority": 855},
+            {
+                "keys": ["dataset_metadata.Calibrations Dimension 1 Scale"],
+                "unit": "nm",
+                "priority": 850,
+            },
+            {
+                "keys": ["dataset_metadata.Calibrations Dimension 2 Scale"],
+                "unit": "nm",
+                "priority": 845,
+            },
+            {
+                "keys": ["ImageList.2.ImageData.Calibrations.Dimension.1.Scale"],
+                "unit": "nm",
+                "priority": 840,
+            },
+            {
+                "keys": ["ImageList.2.ImageData.Calibrations.Dimension.2.Scale"],
+                "unit": "nm",
+                "priority": 835,
+            },
+            {
+                "keys": ["dm_sections.dataset_metadata.Calibrations Dimension 1 Scale"],
+                "unit": "nm",
+                "priority": 830,
+            },
+            {"keys": ["pixelSize"], "unit": "nm", "priority": 500},
             {"keys": ["scale"], "unit": "nm", "priority": 300},
         ],
         "voltage": [
+            {"keys": ["Microscope Info Formatted Voltage"], "unit": None, "priority": 920},
+            {
+                "keys": ["dataset_metadata.Microscope Info Formatted Voltage"],
+                "unit": None,
+                "priority": 915,
+            },
+            {
+                "keys": ["ImageList.2.ImageTags.Microscope Info.Formatted Voltage"],
+                "unit": None,
+                "priority": 910,
+            },
+            {"keys": ["Microscope Info Voltage"], "unit": "v", "priority": 900},
+            {"keys": ["dataset_metadata.Microscope Info Voltage"], "unit": "v", "priority": 895},
+            {
+                "keys": ["ImageList.2.ImageTags.Microscope Info.Voltage"],
+                "unit": "v",
+                "priority": 890,
+            },
+            {
+                "keys": ["dm_sections.dataset_metadata.Microscope Info Formatted Voltage"],
+                "unit": None,
+                "priority": 885,
+            },
+            {
+                "keys": ["dm_sections.dataset_metadata.Microscope Info Voltage"],
+                "unit": "v",
+                "priority": 880,
+            },
             {"keys": ["acqMicroscopeInfo.Voltage"], "unit": "kv", "priority": 500},
             {"keys": ["Voltage"], "unit": "kv", "priority": 300},
         ],
         "camera_length": [
+            {"keys": ["Microscope Info STEM Camera Length"], "unit": "mm", "priority": 920},
+            {
+                "keys": ["dataset_metadata.Microscope Info STEM Camera Length"],
+                "unit": "mm",
+                "priority": 915,
+            },
+            {
+                "keys": ["ImageList.2.ImageTags.Microscope Info.STEM Camera Length"],
+                "unit": "mm",
+                "priority": 910,
+            },
+            {
+                "keys": ["dm_sections.dataset_metadata.Microscope Info STEM Camera Length"],
+                "unit": "mm",
+                "priority": 905,
+            },
             {"keys": ["acqMicroscopeInfo.CameraLength"], "unit": "mm", "priority": 500},
             {"keys": ["CameraLength"], "unit": "mm", "priority": 300},
         ],
         "magnification": [
+            {"keys": ["Microscope Info Indicated Magnification"], "unit": None, "priority": 920},
+            {"keys": ["Microscope Info Actual Magnification"], "unit": None, "priority": 915},
+            {
+                "keys": ["dataset_metadata.Microscope Info Indicated Magnification"],
+                "unit": None,
+                "priority": 910,
+            },
+            {
+                "keys": ["dataset_metadata.Microscope Info Actual Magnification"],
+                "unit": None,
+                "priority": 905,
+            },
+            {
+                "keys": ["ImageList.2.ImageTags.Microscope Info.Indicated Magnification"],
+                "unit": None,
+                "priority": 900,
+            },
+            {
+                "keys": ["ImageList.2.ImageTags.Microscope Info.Actual Magnification"],
+                "unit": None,
+                "priority": 895,
+            },
+            {
+                "keys": ["dm_sections.dataset_metadata.Microscope Info Indicated Magnification"],
+                "unit": None,
+                "priority": 890,
+            },
             {"keys": ["acqMicroscopeInfo.IndicatedMagnification"], "unit": None, "priority": 500},
             {"keys": ["Magnification"], "unit": None, "priority": 300},
         ],

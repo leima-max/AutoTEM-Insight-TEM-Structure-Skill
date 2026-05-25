@@ -200,11 +200,14 @@ def _resolve_peak_params(
     raw_top_k = _to_float(params.get("top_k_peaks"))
     raw_min_distance = _to_float(params.get("min_peak_distance"))
     raw_center_exclusion_radius = _to_float(params.get("center_exclusion_radius"))
+    raw_max_peak_radius = _to_float(params.get("max_peak_radius_px"))
     raw_detector_sigma = _to_float(params.get("detector_sigma"))
     raw_dog_sigma_ratio = _to_float(params.get("dog_sigma_ratio"))
     raw_threshold_value = _to_float(params.get("peak_threshold_value"))
     raw_subpixel_window_radius = _to_float(params.get("subpixel_window_radius"))
     raw_subpixel_max_shift = _to_float(params.get("subpixel_max_shift"))
+    raw_radius_outlier_mad_factor = _to_float(params.get("radius_outlier_mad_factor"))
+    raw_radius_outlier_filter = params.get("radius_outlier_filter")
 
     peak_params = {
         "top_k": (
@@ -224,6 +227,16 @@ def _resolve_peak_params(
                 auto_defaults.get(
                     "center_exclusion_radius",
                     max(2.0, min(image.shape) * 0.05),
+                )
+            )
+        ),
+        "max_peak_radius_px": (
+            max(0.0, float(raw_max_peak_radius))
+            if raw_max_peak_radius is not None
+            else float(
+                auto_defaults.get(
+                    "max_peak_radius_px",
+                    max(24.0, min(image.shape) * 0.35),
                 )
             )
         ),
@@ -251,6 +264,12 @@ def _resolve_peak_params(
             if raw_dog_sigma_ratio is not None
             else float(auto_defaults.get("dog_sigma_ratio", 1.8))
         ),
+        "radius_outlier_filter": _to_bool(raw_radius_outlier_filter, default=True),
+        "radius_outlier_mad_factor": (
+            max(2.0, float(raw_radius_outlier_mad_factor))
+            if raw_radius_outlier_mad_factor is not None
+            else 4.0
+        ),
     }
     diagnostics = {
         "enabled": auto_peak_tuning,
@@ -259,8 +278,11 @@ def _resolve_peak_params(
             "top_k_peaks": raw_top_k is None,
             "min_peak_distance": raw_min_distance is None,
             "center_exclusion_radius": raw_center_exclusion_radius is None,
+            "max_peak_radius_px": raw_max_peak_radius is None,
             "detector_sigma": raw_detector_sigma is None,
             "dog_sigma_ratio": raw_dog_sigma_ratio is None,
+            "radius_outlier_filter": raw_radius_outlier_filter is None,
+            "radius_outlier_mad_factor": raw_radius_outlier_mad_factor is None,
         },
     }
     return peak_params, diagnostics
@@ -345,6 +367,9 @@ def run_diffraction_analysis(
     top_k = int(peak_params["top_k"])
     min_distance = int(peak_params["min_distance"])
     center_exclusion_radius = float(peak_params["center_exclusion_radius"])
+    max_peak_radius_px = _to_float(peak_params.get("max_peak_radius_px"))
+    if max_peak_radius_px is not None and max_peak_radius_px <= 0:
+        max_peak_radius_px = None
     threshold_strategy = str(peak_params["threshold_strategy"])
     threshold_value = _to_float(peak_params["threshold_value"])
     subpixel_window_radius = int(peak_params["subpixel_window_radius"])
@@ -353,6 +378,8 @@ def run_diffraction_analysis(
     peak_adapter_engine = str(peak_params["peak_adapter_engine"])
     detector_sigma = float(peak_params["detector_sigma"])
     dog_sigma_ratio = float(peak_params["dog_sigma_ratio"])
+    radius_outlier_filter = bool(peak_params["radius_outlier_filter"])
+    radius_outlier_mad_factor = float(peak_params["radius_outlier_mad_factor"])
     peak_adapter_status = "internal"
 
     if peak_adapter_engine.strip().lower() != "none":
@@ -364,6 +391,7 @@ def run_diffraction_analysis(
                 top_k=max(1, top_k),
                 min_distance=max(1, min_distance),
                 center_exclusion_radius=max(0.0, center_exclusion_radius),
+                max_peak_radius_px=max_peak_radius_px,
                 threshold_strategy=threshold_strategy,
                 threshold_value=threshold_value,
                 subpixel_window_radius=max(1, subpixel_window_radius),
@@ -371,6 +399,8 @@ def run_diffraction_analysis(
                 detector=peak_detector,
                 detector_sigma=max(0.2, detector_sigma),
                 dog_sigma_ratio=max(1.2, dog_sigma_ratio),
+                radius_outlier_filter=radius_outlier_filter,
+                radius_outlier_mad_factor=max(2.0, radius_outlier_mad_factor),
             )
             peak_adapter_status = f"adapter.{peak_adapter_engine.strip().lower()}"
         except Exception as exc:  # noqa: BLE001
@@ -385,6 +415,7 @@ def run_diffraction_analysis(
                 top_k=max(1, top_k),
                 min_distance=max(1, min_distance),
                 center_exclusion_radius=max(0.0, center_exclusion_radius),
+                max_peak_radius_px=max_peak_radius_px,
                 threshold_strategy=threshold_strategy,
                 threshold_value=threshold_value,
                 subpixel_window_radius=max(1, subpixel_window_radius),
@@ -392,6 +423,8 @@ def run_diffraction_analysis(
                 detector=peak_detector,
                 detector_sigma=max(0.2, detector_sigma),
                 dog_sigma_ratio=max(1.2, dog_sigma_ratio),
+                radius_outlier_filter=radius_outlier_filter,
+                radius_outlier_mad_factor=max(2.0, radius_outlier_mad_factor),
             )
             peak_adapter_status = "internal_fallback"
     else:
@@ -401,6 +434,7 @@ def run_diffraction_analysis(
             top_k=max(1, top_k),
             min_distance=max(1, min_distance),
             center_exclusion_radius=max(0.0, center_exclusion_radius),
+            max_peak_radius_px=max_peak_radius_px,
             threshold_strategy=threshold_strategy,
             threshold_value=threshold_value,
             subpixel_window_radius=max(1, subpixel_window_radius),
@@ -408,6 +442,8 @@ def run_diffraction_analysis(
             detector=peak_detector,
             detector_sigma=max(0.2, detector_sigma),
             dog_sigma_ratio=max(1.2, dog_sigma_ratio),
+            radius_outlier_filter=radius_outlier_filter,
+            radius_outlier_mad_factor=max(2.0, radius_outlier_mad_factor),
         )
     warnings.extend(peak_warnings)
 

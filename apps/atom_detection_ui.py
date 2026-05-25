@@ -1367,7 +1367,8 @@ with right:
 st.subheader("Atom-Position Strain (AI-STEM inspired)")
 st.caption(
     "Alternative strain path from the current edited atom-column coordinates. "
-    "This workflow is independent from external g-vector pipelines and is intended for C0/C1-based testing."
+    "This workflow is independent from external g-vector pipelines and is intended "
+    "for C0/C1-based testing."
 )
 atom_strain_button_col, atom_strain_info_col = st.columns([0.34, 0.66])
 run_atom_strain_button = atom_strain_button_col.button(
