@@ -1,0 +1,3229 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import matplotlib.pyplot as plt
+import numpy as np
+import streamlit as st
+import streamlit.elements.image as st_image
+import yaml
+from PIL import Image
+from scipy.optimize import least_squares
+from streamlit_drawable_canvas import st_canvas
+
+from autotem.calibration import calibrate_dataset
+from autotem.core import DiffractionPeak, IndexedSpot, Measurement, PhaseCandidate
+from autotem.diffraction.b4_indexing import run_b4_indexing
+from autotem.diffraction.basic import run_diffraction_analysis
+from autotem.diffraction.fft import compute_fft_analysis
+from autotem.diffraction.gvector import compute_gvectors_and_dspacing
+from autotem.diffraction.open_source_adapters import SUPPORTED_PEAK_ADAPTER_ENGINES
+from autotem.diffraction.peak_detection import (
+    SUPPORTED_PEAK_DETECTORS,
+    SUPPORTED_THRESHOLD_STRATEGIES,
+)
+from autotem.io import load_tem_dataset, read_image
+from autotem.preprocessing import SUPPORTED_DENOISE_METHODS, assess_quality, preprocess_dataset
+
+# Compatibility patch for streamlit-drawable-canvas on newer Streamlit.
+if not hasattr(st_image, "image_to_url"):
+    from types import SimpleNamespace
+
+    from streamlit.elements.lib import image_utils as _st_image_utils
+
+    def _image_to_url_compat(image, width, clamp, channels, output_format, image_id):
+        layout_config = SimpleNamespace(width=width)
+        return _st_image_utils.image_to_url(
+            image=image,
+            layout_config=layout_config,
+            clamp=clamp,
+            channels=channels,
+            output_format=output_format,
+            image_id=image_id,
+        )
+
+    st_image.image_to_url = _image_to_url_compat
+
+
+_APP_TITLE = "AutoTEM B1-B3 Interactive Preview"
+_UI_BUILD_TAG = "b1_b3_interactive_v6_backup_mode_controls_2026-05-26"
+_WORKFLOW_TEMPLATE = "configs/hrtem_b1_b3.yaml"
+_OUTPUT_ROOT_ENV = "AUTOTEM_UI_OUTPUT_ROOT"
+
+PHASE_OPTIONS = ["Silicon", "Gold", "Graphite", "Titanium Dioxide"]
+# Keep mode labels ASCII because these strings become Streamlit widget keys.
+MODE_AUTO_EDIT = "Auto peaks"
+MODE_TWO_VECTOR = "Two-point vector synthesis"
+INDEXING_MODE_LABELS: dict[str, str] = {
+    "auto": "auto (B3+B4 auto)",
+    "baseline": "baseline (B3 baseline hkl)",
+    "lattice_fit": "lattice_fit (B4 lattice-fit)",
+}
+
+SUPPORTED_BACKGROUND_METHODS = ["none", "gaussian", "rolling_ball"]
+SUPPORTED_FFT_CENTER_MODES = ["auto", "geometric"]
+SUPPORTED_INDEXING_MODES = ["auto", "baseline", "lattice_fit"]
+
+DEFAULT_B4_CANDIDATES_JSON = json.dumps(
+    [
+        {
+            "name": "Silicon",
+            "a": 0.5431,
+            "b": 0.5431,
+            "c": 0.5431,
+            "alpha": 90.0,
+            "beta": 90.0,
+            "gamma": 90.0,
+            "space_group": "Fd-3m",
+            "formula": "Si",
+        },
+        {
+            "name": "Gold",
+            "a": 0.4078,
+            "b": 0.4078,
+            "c": 0.4078,
+            "alpha": 90.0,
+            "beta": 90.0,
+            "gamma": 90.0,
+            "space_group": "Fm-3m",
+            "formula": "Au",
+        },
+        {
+            "name": "Graphite",
+            "a": 0.2460,
+            "b": 0.2460,
+            "c": 0.6710,
+            "alpha": 90.0,
+            "beta": 90.0,
+            "gamma": 120.0,
+            "space_group": "P63/mmc",
+            "formula": "C",
+        },
+    ],
+    ensure_ascii=False,
+    indent=2,
+)
+
+_FALLBACK_DEFAULTS: dict[str, Any] = {
+    "quality": {
+        "thresholds": {
+            "snr_min": 6.0,
+            "drift_px_max": 2.0,
+            "overall_score_min": 0.35,
+        }
+    },
+    "calibration": {
+        "method": "auto",
+        "diffraction_calibration_engine": "none",
+        "voltage_kv": 200.0,
+        "pixel_size_nm": 0.02,
+        "pixel_size_uncertainty_nm": 0.001,
+        "known_d_spacing": 0.235,
+        "known_d_spacing_unit": "nm",
+        "known_d_uncertainty_nm": 0.002,
+        "measured_radius_px": 8.5,
+        "measured_radius_uncertainty_px": 0.3,
+        "detector_pixel_size_um": 14.0,
+    },
+    "preprocessing": {
+        "recipe": "auto",
+        "clip_percentile_low": 1.0,
+        "clip_percentile_high": 99.0,
+        "denoise_method": "wiener",
+        "denoise_sigma": 0.8,
+        "wiener_window": 5,
+        "background_method": "gaussian",
+        "background_sigma": 12.0,
+    },
+    "diffraction": {
+        "auto_peak_tuning": True,
+        "top_k_peaks": 24,
+        "min_peak_distance": 3,
+        "center_exclusion_radius": 4.0,
+        "max_peak_radius_px": 0.0,
+        "radius_outlier_filter": True,
+        "radius_outlier_mad_factor": 4.0,
+        "peak_threshold_strategy": "auto",
+        "peak_detector": "log",
+        "peak_adapter_engine": "none",
+        "detector_sigma": 1.2,
+        "dog_sigma_ratio": 1.8,
+        "subpixel_window_radius": 2,
+        "subpixel_max_shift": 1.5,
+        "fft_center_mode": "auto",
+        "direct_beam_refine_window": 3,
+        "direct_beam_center_uncertainty_px": 0.35,
+        "indexing_mode": "auto",
+        "phase_top_n": 3,
+        "candidate_phases": ["Silicon", "Gold", "Graphite"],
+        "max_hkl": 4,
+        "d_tolerance_rel": 0.10,
+        "angle_tolerance_deg": 12.0,
+        "b4_strict_mode": False,
+    },
+}
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _safe_name(raw_name: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name.strip())
+    return token or "input"
+
+
+def _json_signature(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _default_output_root() -> Path:
+    from_env = os.environ.get(_OUTPUT_ROOT_ENV)
+    if from_env:
+        return Path(from_env).expanduser().resolve()
+    return _repo_root() / "outputs" / "b1_b3_preview"
+
+
+def _as_mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = dict(base)
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(dict(merged[key]), value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _read_template_defaults() -> dict[str, Any]:
+    path = _repo_root() / _WORKFLOW_TEMPLATE
+    if not path.exists():
+        return {}
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return {}
+    workflow = payload.get("workflow", {})
+    if not isinstance(workflow, dict):
+        return {}
+    params = workflow.get("parameters", {})
+    return dict(params) if isinstance(params, dict) else {}
+
+
+def _num(value: Any, fallback: float) -> float:
+    if value is None or isinstance(value, bool):
+        return float(fallback)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return float(fallback)
+    return float(fallback)
+
+
+def _choice(options: list[str], value: Any, fallback: str) -> str:
+    text = str(value)
+    return text if text in options else fallback
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _decode_uploaded_text(uploaded_file: Any) -> str:
+    if uploaded_file is None:
+        return ""
+    raw = uploaded_file.getvalue()
+    if not raw:
+        return ""
+    for encoding in ("utf-8-sig", "utf-8", "gb18030", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
+
+
+def _wrap_angle_deg(value: float) -> float:
+    out = (float(value) + 180.0) % 360.0 - 180.0
+    return float(out)
+
+
+def _angle_error_deg(angle_a: float, angle_b: float) -> float:
+    return abs(_wrap_angle_deg(float(angle_a) - float(angle_b)))
+
+
+def _percentile(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    return float(np.percentile(np.asarray(values, dtype=float), q))
+
+
+def _parse_manual_spot_table(raw_text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    text = str(raw_text or "")
+    if not text.strip():
+        return [], []
+    number_pat = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
+    rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip().replace("\ufeff", "")
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if (
+            "spot#" in lowered
+            or "d-spacing" in lowered
+            or "rec. pos" in lowered
+            or "degrees to" in lowered
+            or "amplitude" in lowered
+        ):
+            continue
+        tokens = number_pat.findall(stripped)
+        if len(tokens) < 2:
+            continue
+        values: list[float] = []
+        for token in tokens:
+            try:
+                values.append(float(token))
+            except ValueError:
+                continue
+        if len(values) < 2:
+            continue
+
+        spot_id = len(rows) + 1
+        d_spacing_nm: float | None = None
+        g_magnitude: float | None = None
+        angle_x_deg: float | None = None
+        amplitude: float | None = None
+
+        has_spot_id = len(values) >= 3 and abs(values[0] - round(values[0])) < 1e-6
+        if has_spot_id:
+            spot_id = int(round(values[0]))
+
+        if len(values) >= 6 and has_spot_id:
+            d_spacing_nm = float(values[1])
+            g_magnitude = float(values[2])
+            angle_x_deg = float(values[4])
+            amplitude = float(values[5])
+        elif len(values) >= 5 and has_spot_id:
+            d_spacing_nm = float(values[1])
+            g_magnitude = float(values[2])
+            angle_x_deg = float(values[4])
+        elif len(values) >= 5:
+            d_spacing_nm = float(values[0])
+            g_magnitude = float(values[1])
+            angle_x_deg = float(values[3])
+            amplitude = float(values[4])
+        elif len(values) >= 4:
+            d_spacing_nm = float(values[0])
+            g_magnitude = float(values[1])
+            angle_x_deg = float(values[2])
+            amplitude = float(values[3])
+        else:
+            d_spacing_nm = float(values[0])
+            g_magnitude = float(values[1])
+            angle_x_deg = None
+
+        if d_spacing_nm is not None and g_magnitude is not None:
+            if d_spacing_nm > 1.0 and g_magnitude < 1.0:
+                d_spacing_nm, g_magnitude = g_magnitude, d_spacing_nm
+
+        if (d_spacing_nm is None or d_spacing_nm <= 0) and g_magnitude and g_magnitude > 0:
+            d_spacing_nm = 1.0 / float(g_magnitude)
+        if (g_magnitude is None or g_magnitude <= 0) and d_spacing_nm and d_spacing_nm > 0:
+            g_magnitude = 1.0 / float(d_spacing_nm)
+
+        if d_spacing_nm is None or d_spacing_nm <= 0 or g_magnitude is None or g_magnitude <= 0:
+            warnings.append(f"Line {line_no}: skipped due to invalid d/g values.")
+            continue
+
+        rows.append(
+            {
+                "spot_id": int(spot_id),
+                "d_spacing_nm": round(float(d_spacing_nm), 6),
+                "g_magnitude": round(float(g_magnitude), 6),
+                "angle_x_deg": (
+                    None if angle_x_deg is None else round(_wrap_angle_deg(float(angle_x_deg)), 4)
+                ),
+                "amplitude": None if amplitude is None else round(float(amplitude), 6),
+                "source_line": int(line_no),
+            }
+        )
+
+    if not rows:
+        warnings.append("No valid manual spot rows parsed from text.")
+    return rows, list(dict.fromkeys(warnings))
+
+
+def _build_align_candidates(
+    peak_rows: list[dict[str, Any]],
+    *,
+    id_key: str,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in peak_rows:
+        g_mag = _to_float(row.get("g_magnitude"))
+        d_nm = _to_float(row.get("d_spacing"))
+        gx = _to_float(row.get("gx"))
+        gy = _to_float(row.get("gy"))
+        if g_mag is None or d_nm is None or g_mag <= 0 or d_nm <= 0:
+            continue
+        angle_x_deg = None
+        if gx is not None and gy is not None:
+            angle_x_deg = float(np.degrees(np.arctan2(float(gy), float(gx))))
+            angle_x_deg = _wrap_angle_deg(angle_x_deg)
+        out.append(
+            {
+                "id": int(_to_float(row.get(id_key)) or len(out)),
+                "g_magnitude": float(g_mag),
+                "d_spacing_nm": float(d_nm),
+                "angle_x_deg": angle_x_deg,
+                "raw": row,
+            }
+        )
+    return out
+
+
+def _match_with_transform(
+    manual_rows: list[dict[str, Any]],
+    target_rows: list[dict[str, Any]],
+    *,
+    sign: int,
+    angle_offset_deg: float,
+    max_g_rel: float,
+    max_d_rel: float,
+    max_angle_deg: float,
+    weight_g: float,
+    weight_d: float,
+    weight_angle: float,
+) -> list[dict[str, Any]]:
+    pair_candidates: list[dict[str, Any]] = []
+    for m_idx, manual in enumerate(manual_rows):
+        mg = float(manual["g_magnitude"])
+        md = float(manual["d_spacing_nm"])
+        ma = manual.get("angle_x_deg")
+        for t_idx, target in enumerate(target_rows):
+            tg = float(target["g_magnitude"])
+            td = float(target["d_spacing_nm"])
+            ta = target.get("angle_x_deg")
+            g_rel = abs(tg - mg) / max(abs(mg), 1e-9)
+            d_rel = abs(td - md) / max(abs(md), 1e-9)
+            if g_rel > max_g_rel or d_rel > max_d_rel:
+                continue
+            angle_err = None
+            if ma is not None and ta is not None:
+                predicted = _wrap_angle_deg(float(sign) * float(ma) + float(angle_offset_deg))
+                angle_err = _angle_error_deg(float(ta), predicted)
+                if angle_err > max_angle_deg:
+                    continue
+            angle_term = 0.0 if angle_err is None else float(angle_err) / 90.0
+            cost = (
+                float(weight_g) * float(g_rel)
+                + float(weight_d) * float(d_rel)
+                + float(weight_angle) * float(angle_term)
+            )
+            pair_candidates.append(
+                {
+                    "manual_idx": int(m_idx),
+                    "target_idx": int(t_idx),
+                    "g_rel": float(g_rel),
+                    "d_rel": float(d_rel),
+                    "angle_err_deg": angle_err,
+                    "cost": float(cost),
+                }
+            )
+    pair_candidates.sort(key=lambda item: float(item["cost"]))
+
+    used_manual: set[int] = set()
+    used_target: set[int] = set()
+    matches: list[dict[str, Any]] = []
+    for item in pair_candidates:
+        m_idx = int(item["manual_idx"])
+        t_idx = int(item["target_idx"])
+        if m_idx in used_manual or t_idx in used_target:
+            continue
+        used_manual.add(m_idx)
+        used_target.add(t_idx)
+        merged = dict(item)
+        merged["manual"] = manual_rows[m_idx]
+        merged["target"] = target_rows[t_idx]
+        matches.append(merged)
+    return matches
+
+
+def _align_manual_spot_table(
+    *,
+    manual_rows: list[dict[str, Any]],
+    target_rows: list[dict[str, Any]],
+    max_g_rel: float,
+    max_d_rel: float,
+    max_angle_deg: float,
+    weight_g: float,
+    weight_d: float,
+    weight_angle: float,
+    angle_step_deg: float,
+) -> dict[str, Any]:
+    if not manual_rows:
+        return {"warnings": ["Manual spot table is empty."]}
+    if not target_rows:
+        return {"warnings": ["Target peak table has no valid rows for alignment."]}
+    step = max(0.25, float(angle_step_deg))
+    offsets = np.arange(-180.0, 180.0, step, dtype=float)
+    best: dict[str, Any] | None = None
+    best_key: tuple[int, float] | None = None
+    for sign in (1, -1):
+        for offset in offsets:
+            matches = _match_with_transform(
+                manual_rows,
+                target_rows,
+                sign=sign,
+                angle_offset_deg=float(offset),
+                max_g_rel=float(max_g_rel),
+                max_d_rel=float(max_d_rel),
+                max_angle_deg=float(max_angle_deg),
+                weight_g=float(weight_g),
+                weight_d=float(weight_d),
+                weight_angle=float(weight_angle),
+            )
+            matched = len(matches)
+            if matched == 0:
+                continue
+            mean_cost = float(np.mean([float(item["cost"]) for item in matches]))
+            key = (matched, -mean_cost)
+            if best_key is None or key > best_key:
+                best_key = key
+                best = {
+                    "sign": int(sign),
+                    "angle_offset_deg": round(float(offset), 4),
+                    "matches": matches,
+                    "mean_cost": float(mean_cost),
+                }
+
+    if best is None:
+        return {
+            "warnings": [
+                "No matches found under current alignment thresholds. Relax d/g/angle thresholds."
+            ]
+        }
+
+    matches = list(best["matches"])
+    used_manual = {int(item["manual_idx"]) for item in matches}
+    used_target = {int(item["target_idx"]) for item in matches}
+    manual_unmatched = [
+        row for idx, row in enumerate(manual_rows) if int(idx) not in used_manual
+    ]
+    target_unmatched = [
+        row for idx, row in enumerate(target_rows) if int(idx) not in used_target
+    ]
+
+    g_rel_vals = [float(item["g_rel"]) for item in matches]
+    d_rel_vals = [float(item["d_rel"]) for item in matches]
+    angle_vals = [
+        float(item["angle_err_deg"])
+        for item in matches
+        if item.get("angle_err_deg") is not None
+    ]
+
+    match_rows: list[dict[str, Any]] = []
+    for item in matches:
+        manual = item["manual"]
+        target = item["target"]
+        match_rows.append(
+            {
+                "manual_spot_id": int(manual["spot_id"]),
+                "target_peak_id": int(target["id"]),
+                "manual_d_spacing_nm": round(float(manual["d_spacing_nm"]), 6),
+                "target_d_spacing_nm": round(float(target["d_spacing_nm"]), 6),
+                "d_rel_error_pct": round(float(item["d_rel"]) * 100.0, 4),
+                "manual_g_1_per_nm": round(float(manual["g_magnitude"]), 6),
+                "target_g_1_per_nm": round(float(target["g_magnitude"]), 6),
+                "g_rel_error_pct": round(float(item["g_rel"]) * 100.0, 4),
+                "manual_angle_x_deg": manual.get("angle_x_deg"),
+                "target_angle_x_deg": target.get("angle_x_deg"),
+                "angle_error_deg": (
+                    None
+                    if item.get("angle_err_deg") is None
+                    else round(float(item["angle_err_deg"]), 4)
+                ),
+                "match_cost": round(float(item["cost"]), 6),
+            }
+        )
+    match_rows.sort(key=lambda row: (int(row["manual_spot_id"]), int(row["target_peak_id"])))
+
+    return {
+        "warnings": [],
+        "sign": int(best["sign"]),
+        "angle_offset_deg": float(best["angle_offset_deg"]),
+        "matched_count": int(len(matches)),
+        "manual_count": int(len(manual_rows)),
+        "target_count": int(len(target_rows)),
+        "mean_cost": round(float(best["mean_cost"]), 6),
+        "summary": {
+            "g_rel_mean_pct": (
+                round(float(np.mean(g_rel_vals)) * 100.0, 4) if g_rel_vals else None
+            ),
+            "g_rel_median_pct": (
+                round(float(np.median(g_rel_vals)) * 100.0, 4)
+                if g_rel_vals
+                else None
+            ),
+            "g_rel_p90_pct": (
+                None
+                if _percentile(g_rel_vals, 90.0) is None
+                else round(float(_percentile(g_rel_vals, 90.0)) * 100.0, 4)
+            ),
+            "d_rel_mean_pct": (
+                round(float(np.mean(d_rel_vals)) * 100.0, 4) if d_rel_vals else None
+            ),
+            "d_rel_median_pct": (
+                round(float(np.median(d_rel_vals)) * 100.0, 4)
+                if d_rel_vals
+                else None
+            ),
+            "d_rel_p90_pct": (
+                None
+                if _percentile(d_rel_vals, 90.0) is None
+                else round(float(_percentile(d_rel_vals, 90.0)) * 100.0, 4)
+            ),
+            "angle_mean_deg": round(float(np.mean(angle_vals)), 4) if angle_vals else None,
+            "angle_median_deg": round(float(np.median(angle_vals)), 4) if angle_vals else None,
+            "angle_p90_deg": (
+                None
+                if _percentile(angle_vals, 90.0) is None
+                else round(float(_percentile(angle_vals, 90.0)), 4)
+            ),
+        },
+        "matches": match_rows,
+        "manual_unmatched": [
+            {
+                "manual_spot_id": int(row.get("spot_id", 0)),
+                "manual_d_spacing_nm": row.get("d_spacing_nm"),
+                "manual_g_1_per_nm": row.get("g_magnitude"),
+                "manual_angle_x_deg": row.get("angle_x_deg"),
+                "amplitude": row.get("amplitude"),
+            }
+            for row in manual_unmatched
+        ],
+        "target_unmatched": [
+            {
+                "target_peak_id": int(row.get("id", 0)),
+                "target_d_spacing_nm": round(float(row.get("d_spacing_nm", 0.0)), 6),
+                "target_g_1_per_nm": round(float(row.get("g_magnitude", 0.0)), 6),
+                "target_angle_x_deg": row.get("angle_x_deg"),
+            }
+            for row in target_unmatched
+        ],
+    }
+
+
+def _measurement_value(measurement: Measurement | None) -> float | None:
+    if measurement is None:
+        return None
+    if isinstance(measurement.value, (int, float)):
+        return float(measurement.value)
+    return None
+
+
+def _measurement_uncertainty(measurement: Measurement | None) -> float | None:
+    if measurement is None:
+        return None
+    if isinstance(measurement.uncertainty, (int, float)):
+        return float(measurement.uncertainty)
+    return None
+
+
+def _normalize_for_display(image: np.ndarray) -> np.ndarray:
+    arr = np.asarray(image, dtype=np.float32)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return np.zeros_like(arr, dtype=np.float32)
+    if not finite.all():
+        fill = float(np.nanmedian(arr[finite]))
+        arr = np.where(finite, arr, fill)
+    p1, p99 = np.percentile(arr, [1.0, 99.0])
+    span = max(float(p99 - p1), 1e-12)
+    out = (arr - float(p1)) / span
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+def _to_fft_display_image(
+    fft_image_norm: np.ndarray,
+    *,
+    max_side: int = 900,
+) -> tuple[Image.Image, float, float]:
+    h, w = fft_image_norm.shape
+    scale = min(max_side / max(h, w), 1.0)
+    disp_h = max(1, int(round(h * scale)))
+    disp_w = max(1, int(round(w * scale)))
+    arr = (np.clip(fft_image_norm, 0.0, 1.0) * 255.0).astype(np.uint8)
+    img = Image.fromarray(arr, mode="L").convert("RGB").resize(
+        (disp_w, disp_h),
+        resample=Image.BILINEAR,
+    )
+    sx = w / disp_w
+    sy = h / disp_h
+    return img, sx, sy
+
+
+def _extract_canvas_points_xy(
+    canvas_result: Any,
+    *,
+    sx: float,
+    sy: float,
+) -> list[tuple[float, float]]:
+    json_data = getattr(canvas_result, "json_data", None)
+    if not isinstance(json_data, dict):
+        return []
+    objects = json_data.get("objects")
+    if not isinstance(objects, list):
+        return []
+
+    points: list[tuple[float, float]] = []
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        try:
+            left = float(obj.get("left", 0.0))
+            top = float(obj.get("top", 0.0))
+        except (TypeError, ValueError):
+            continue
+
+        radius = obj.get("radius")
+        width = obj.get("width")
+        height = obj.get("height")
+        if radius is not None:
+            try:
+                r = float(radius)
+            except (TypeError, ValueError):
+                r = 0.0
+            disp_x = left + r
+            disp_y = top + r
+        elif width is not None and height is not None:
+            try:
+                w = float(width)
+                h = float(height)
+            except (TypeError, ValueError):
+                w = 0.0
+                h = 0.0
+            disp_x = left + 0.5 * w
+            disp_y = top + 0.5 * h
+        else:
+            disp_x = left
+            disp_y = top
+        points.append((disp_x * sx, disp_y * sy))
+    return points
+
+
+def _deduplicate_points(
+    points_xy: list[tuple[float, float]],
+    *,
+    min_distance_px: float,
+) -> list[tuple[float, float]]:
+    selected: list[tuple[float, float]] = []
+    for x, y in points_xy:
+        if any(np.hypot(x - sx, y - sy) < min_distance_px for sx, sy in selected):
+            continue
+        selected.append((x, y))
+    return selected
+
+
+def _round_points_for_signature(
+    points_xy: list[tuple[float, float]],
+    *,
+    digits: int = 3,
+) -> list[list[float]]:
+    return [
+        [round(float(x), digits), round(float(y), digits)]
+        for x, y in points_xy
+    ]
+
+
+def _generate_lattice_points_from_two_basis(
+    *,
+    center_xy: tuple[float, float],
+    basis1_xy: tuple[float, float],
+    basis2_xy: tuple[float, float],
+    shape_hw: tuple[int, int],
+    max_order: int,
+    min_distance: float,
+) -> list[tuple[float, float]]:
+    cx, cy = float(center_xy[0]), float(center_xy[1])
+    p1x, p1y = float(basis1_xy[0]), float(basis1_xy[1])
+    p2x, p2y = float(basis2_xy[0]), float(basis2_xy[1])
+    v1x, v1y = p1x - cx, p1y - cy
+    v2x, v2y = p2x - cx, p2y - cy
+    h, w = shape_hw
+    points: list[tuple[float, float]] = []
+    radius_ref = float(max(np.hypot(v1x, v1y), np.hypot(v2x, v2y), 1e-9))
+
+    for m in range(-int(max_order), int(max_order) + 1):
+        for n in range(-int(max_order), int(max_order) + 1):
+            if m == 0 and n == 0:
+                continue
+            # Skip very high-order points far from the basis shell to reduce noise picks.
+            if np.hypot(float(m), float(n)) > float(max_order) + 0.35:
+                continue
+            x = cx + float(m) * v1x + float(n) * v2x
+            y = cy + float(m) * v1y + float(n) * v2y
+            if not (0.0 <= x < float(w) and 0.0 <= y < float(h)):
+                continue
+            if np.hypot(x - cx, y - cy) < 0.25 * radius_ref:
+                continue
+            points.append((float(x), float(y)))
+
+    points = _deduplicate_points(points, min_distance_px=max(0.1, float(min_distance)))
+    points.sort(key=lambda p: float(np.hypot(float(p[0]) - cx, float(p[1]) - cy)))
+    return points
+
+
+def _nearest_point_within_radius(
+    point_xy: tuple[float, float],
+    candidates_xy: list[tuple[float, float]],
+    *,
+    max_radius_px: float,
+) -> tuple[tuple[float, float], float] | None:
+    if not candidates_xy:
+        return None
+    px, py = float(point_xy[0]), float(point_xy[1])
+    best_idx = -1
+    best_dist = float(max_radius_px) + 1e-9
+    for idx, (cx, cy) in enumerate(candidates_xy):
+        dist = float(np.hypot(float(cx) - px, float(cy) - py))
+        if dist <= float(max_radius_px) and dist < best_dist:
+            best_dist = dist
+            best_idx = int(idx)
+    if best_idx < 0:
+        return None
+    candidate = candidates_xy[best_idx]
+    return (float(candidate[0]), float(candidate[1])), float(best_dist)
+
+
+def _find_local_max_near_point(
+    image: np.ndarray,
+    *,
+    x: float,
+    y: float,
+    radius_px: float,
+) -> tuple[tuple[float, float], float, float] | None:
+    h, w = image.shape
+    xi = float(np.clip(float(x), 0.0, max(0.0, float(w - 1))))
+    yi = float(np.clip(float(y), 0.0, max(0.0, float(h - 1))))
+    r = max(1, int(np.ceil(float(radius_px))))
+    x0 = max(0, int(np.floor(xi)) - r)
+    x1 = min(w, int(np.floor(xi)) + r + 1)
+    y0 = max(0, int(np.floor(yi)) - r)
+    y1 = min(h, int(np.floor(yi)) + r + 1)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    patch = np.asarray(image[y0:y1, x0:x1], dtype=np.float64)
+    if patch.size == 0 or not np.isfinite(patch).any():
+        return None
+    finite = np.isfinite(patch)
+    patch_safe = np.where(finite, patch, -np.inf)
+    max_idx = int(np.argmax(patch_safe))
+    yy, xx = np.unravel_index(max_idx, patch_safe.shape)
+    xf = float(x0 + xx)
+    yf = float(y0 + yy)
+    intensity = float(patch_safe[yy, xx])
+    dist = float(np.hypot(xf - xi, yf - yi))
+    return (xf, yf), intensity, dist
+
+
+def _synthesize_points_from_two_basis(
+    *,
+    center_xy: tuple[float, float],
+    basis_points_xy: list[tuple[float, float]],
+    shape_hw: tuple[int, int],
+    fft_log_magnitude: np.ndarray,
+    auto_points_xy: list[tuple[float, float]],
+    max_order: int,
+    min_distance_px: float,
+    snap_mode: str,
+    snap_radius_px: float,
+    local_intensity_percentile: float,
+    max_points: int,
+) -> tuple[list[tuple[float, float]], dict[str, Any], list[str]]:
+    warnings: list[str] = []
+    if len(basis_points_xy) < 2:
+        return [], {"enabled": True, "reason": "insufficient_basis_points"}, [
+            "Need at least two basis points for vector synthesis."
+        ]
+    basis1 = (float(basis_points_xy[0][0]), float(basis_points_xy[0][1]))
+    basis2 = (float(basis_points_xy[1][0]), float(basis_points_xy[1][1]))
+    cx, cy = float(center_xy[0]), float(center_xy[1])
+    v1 = np.array([basis1[0] - cx, basis1[1] - cy], dtype=np.float64)
+    v2 = np.array([basis2[0] - cx, basis2[1] - cy], dtype=np.float64)
+    n1 = float(np.linalg.norm(v1))
+    n2 = float(np.linalg.norm(v2))
+    if n1 <= 1.0 or n2 <= 1.0:
+        warnings.append("Basis vectors are too short. Please click farther diffraction spots.")
+    cosang = float(np.dot(v1, v2) / max(1e-12, n1 * n2))
+    cosang = max(-1.0, min(1.0, cosang))
+    angle_deg = float(np.degrees(np.arccos(cosang)))
+    if angle_deg < 10.0 or angle_deg > 170.0:
+        warnings.append(
+            "Basis vectors are nearly collinear "
+            f"(angle={angle_deg:.2f} deg); synthesis may be unstable."
+        )
+
+    generated = _generate_lattice_points_from_two_basis(
+        center_xy=(cx, cy),
+        basis1_xy=basis1,
+        basis2_xy=basis2,
+        shape_hw=shape_hw,
+        max_order=max(1, int(max_order)),
+        min_distance=max(0.1, float(min_distance_px)),
+    )
+    seed_points = _deduplicate_points(
+        [basis1, basis2] + list(generated),
+        min_distance_px=max(0.1, float(min_distance_px)),
+    )
+    if int(max_points) > 0:
+        seed_points = seed_points[: int(max_points)]
+
+    image = np.asarray(fft_log_magnitude, dtype=np.float64)
+    finite_vals = image[np.isfinite(image)]
+    if finite_vals.size:
+        q = float(np.clip(float(local_intensity_percentile), 50.0, 99.99))
+        local_threshold = float(np.percentile(finite_vals, q))
+    else:
+        local_threshold = float("-inf")
+
+    mode = str(snap_mode).strip().lower()
+    if mode not in {"none", "auto_peak_nearest", "local_max", "hybrid"}:
+        mode = "hybrid"
+    used_auto: set[int] = set()
+    snapped_points: list[tuple[float, float]] = []
+    source_counts: dict[str, int] = {
+        "basis_keep": 0,
+        "auto_peak_nearest": 0,
+        "local_max": 0,
+    }
+    dropped_non_basis = 0
+    pairs: list[dict[str, Any]] = []
+
+    for idx, (px, py) in enumerate(seed_points):
+        is_basis = idx < 2
+        best_pt: tuple[float, float] | None = None
+        best_dist = float("inf")
+        best_src = ""
+
+        if mode in {"auto_peak_nearest", "hybrid"} and auto_points_xy:
+            # Find nearest unused auto point.
+            nearest_idx = -1
+            nearest_dist = float(snap_radius_px) + 1e-9
+            for ai, (ax, ay) in enumerate(auto_points_xy):
+                if ai in used_auto:
+                    continue
+                dist = float(np.hypot(float(ax) - float(px), float(ay) - float(py)))
+                if dist <= float(snap_radius_px) and dist < nearest_dist:
+                    nearest_dist = dist
+                    nearest_idx = int(ai)
+            if nearest_idx >= 0:
+                ax, ay = auto_points_xy[nearest_idx]
+                best_pt = (float(ax), float(ay))
+                best_dist = float(nearest_dist)
+                best_src = "auto_peak_nearest"
+                used_auto.add(nearest_idx)
+
+        if mode in {"local_max", "hybrid"}:
+            local_hit = _find_local_max_near_point(
+                image,
+                x=float(px),
+                y=float(py),
+                radius_px=float(snap_radius_px),
+            )
+            if local_hit is not None:
+                (lx, ly), lv, ld = local_hit
+                if lv >= float(local_threshold) or is_basis:
+                    if best_pt is None or float(ld) < float(best_dist):
+                        best_pt = (float(lx), float(ly))
+                        best_dist = float(ld)
+                        best_src = "local_max"
+
+        if best_pt is None:
+            if is_basis:
+                best_pt = (float(px), float(py))
+                best_src = "basis_keep"
+                best_dist = 0.0
+            else:
+                dropped_non_basis += 1
+                continue
+
+        source_counts[best_src] = int(source_counts.get(best_src, 0)) + 1
+        snapped_points.append(best_pt)
+        pairs.append(
+            {
+                "x_seed": round(float(px), 3),
+                "y_seed": round(float(py), 3),
+                "x_selected": round(float(best_pt[0]), 3),
+                "y_selected": round(float(best_pt[1]), 3),
+                "shift_px": round(float(best_dist), 4),
+                "source": best_src,
+                "is_basis": bool(is_basis),
+            }
+        )
+
+    snapped_points = _deduplicate_points(
+        snapped_points,
+        min_distance_px=max(0.1, float(min_distance_px)),
+    )
+    snapped_points.sort(key=lambda p: float(np.hypot(float(p[0]) - cx, float(p[1]) - cy)))
+    if int(max_points) > 0 and len(snapped_points) > int(max_points):
+        snapped_points = snapped_points[: int(max_points)]
+
+    diagnostics = {
+        "enabled": True,
+        "mode": mode,
+        "basis_angle_deg": round(float(angle_deg), 4),
+        "basis_norm_px": [round(float(n1), 4), round(float(n2), 4)],
+        "generated_count": int(len(generated)),
+        "seed_count": int(len(seed_points)),
+        "selected_count": int(len(snapped_points)),
+        "dropped_non_basis_count": int(dropped_non_basis),
+        "snap_radius_px": float(snap_radius_px),
+        "local_intensity_percentile": float(local_intensity_percentile),
+        "local_intensity_threshold": float(local_threshold),
+        "source_counts": source_counts,
+        "seed_to_selected_pairs": pairs,
+    }
+    if dropped_non_basis > 0:
+        warnings.append(
+            f"Vector synthesis dropped {dropped_non_basis} predicted point(s) "
+            "with no reliable local match."
+        )
+    return snapped_points, diagnostics, warnings
+
+
+def _refine_point_centroid(
+    image: np.ndarray,
+    *,
+    x: float,
+    y: float,
+    window_radius: int,
+    max_shift_px: float,
+) -> tuple[float, float, str]:
+    h, w = image.shape
+    xi = float(np.clip(x, 0.0, max(0.0, w - 1)))
+    yi = float(np.clip(y, 0.0, max(0.0, h - 1)))
+    x0 = max(0, int(np.floor(xi)) - int(window_radius))
+    x1 = min(w, int(np.floor(xi)) + int(window_radius) + 1)
+    y0 = max(0, int(np.floor(yi)) - int(window_radius))
+    y1 = min(h, int(np.floor(yi)) + int(window_radius) + 1)
+    patch = np.asarray(image[y0:y1, x0:x1], dtype=np.float64)
+    if patch.size == 0:
+        return xi, yi, "centroid_empty_patch"
+    if not np.isfinite(patch).any():
+        return xi, yi, "centroid_invalid_patch"
+    finite_patch = patch[np.isfinite(patch)]
+    floor = float(np.min(finite_patch))
+    weights = np.maximum(patch - floor, 0.0)
+    total = float(np.sum(weights))
+    if total <= 1e-12:
+        return xi, yi, "centroid_low_contrast"
+    yy, xx = np.indices(patch.shape, dtype=np.float64)
+    abs_x = xx + float(x0)
+    abs_y = yy + float(y0)
+    xf = float(np.sum(weights * abs_x) / total)
+    yf = float(np.sum(weights * abs_y) / total)
+    shift = float(np.hypot(xf - xi, yf - yi))
+    if shift > float(max_shift_px) and shift > 1e-12:
+        ratio = float(max_shift_px) / shift
+        xf = xi + (xf - xi) * ratio
+        yf = yi + (yf - yi) * ratio
+        return float(xf), float(yf), "centroid_clamped"
+    return float(xf), float(yf), "centroid_ok"
+
+
+def _refine_point_gaussian(
+    image: np.ndarray,
+    *,
+    x: float,
+    y: float,
+    window_radius: int,
+    max_shift_px: float,
+) -> tuple[float, float, str]:
+    h, w = image.shape
+    xi = float(np.clip(x, 0.0, max(0.0, w - 1)))
+    yi = float(np.clip(y, 0.0, max(0.0, h - 1)))
+    x0 = max(0, int(np.floor(xi)) - int(window_radius))
+    x1 = min(w, int(np.floor(xi)) + int(window_radius) + 1)
+    y0 = max(0, int(np.floor(yi)) - int(window_radius))
+    y1 = min(h, int(np.floor(yi)) + int(window_radius) + 1)
+    patch = np.asarray(image[y0:y1, x0:x1], dtype=np.float64)
+    if patch.size < 9 or not np.isfinite(patch).any():
+        xf, yf, tag = _refine_point_centroid(
+            image,
+            x=xi,
+            y=yi,
+            window_radius=window_radius,
+            max_shift_px=max_shift_px,
+        )
+        return xf, yf, f"gaussian_fallback_{tag}"
+
+    yy, xx = np.indices(patch.shape, dtype=np.float64)
+    abs_x = xx + float(x0)
+    abs_y = yy + float(y0)
+    finite_patch = patch[np.isfinite(patch)]
+    bg0 = float(np.percentile(finite_patch, 10.0))
+    signal = np.maximum(patch - bg0, 0.0)
+    total = float(np.sum(signal))
+    if total <= 1e-12:
+        xf, yf, tag = _refine_point_centroid(
+            image,
+            x=xi,
+            y=yi,
+            window_radius=window_radius,
+            max_shift_px=max_shift_px,
+        )
+        return xf, yf, f"gaussian_fallback_{tag}"
+
+    cx0 = float(np.sum(signal * abs_x) / total)
+    cy0 = float(np.sum(signal * abs_y) / total)
+    amp0 = float(np.max(signal))
+    std_patch = float(np.std(finite_patch))
+    bg_low = float(np.min(finite_patch) - max(1e-6, 2.0 * std_patch))
+    bg_high = float(np.max(finite_patch) + max(1e-6, 2.0 * std_patch))
+    amp_high = max(1e-6, 5.0 * max(amp0, std_patch))
+    sigma_high = max(0.8, 2.5 * float(window_radius))
+    cx_low = max(float(x0), xi - float(max_shift_px))
+    cx_high = min(float(x1 - 1), xi + float(max_shift_px))
+    cy_low = max(float(y0), yi - float(max_shift_px))
+    cy_high = min(float(y1 - 1), yi + float(max_shift_px))
+    if cx_low >= cx_high or cy_low >= cy_high:
+        xf, yf, tag = _refine_point_centroid(
+            image,
+            x=xi,
+            y=yi,
+            window_radius=window_radius,
+            max_shift_px=max_shift_px,
+        )
+        return xf, yf, f"gaussian_fallback_{tag}"
+
+    p0 = np.array(
+        [
+            bg0,
+            max(1e-6, amp0),
+            float(np.clip(cx0, cx_low, cx_high)),
+            float(np.clip(cy0, cy_low, cy_high)),
+            max(0.6, float(window_radius) * 0.8),
+            max(0.6, float(window_radius) * 0.8),
+        ],
+        dtype=np.float64,
+    )
+    lower = np.array([bg_low, 0.0, cx_low, cy_low, 0.35, 0.35], dtype=np.float64)
+    upper = np.array(
+        [bg_high, amp_high, cx_high, cy_high, sigma_high, sigma_high],
+        dtype=np.float64,
+    )
+
+    def _residual(params: np.ndarray) -> np.ndarray:
+        bg, amp, cx, cy, sx, sy = [float(v) for v in params]
+        model = bg + amp * np.exp(
+            -0.5 * (((abs_x - cx) / max(0.2, sx)) ** 2 + ((abs_y - cy) / max(0.2, sy)) ** 2)
+        )
+        return (model - patch).ravel()
+
+    try:
+        result = least_squares(
+            _residual,
+            p0,
+            bounds=(lower, upper),
+            method="trf",
+            loss="soft_l1",
+            max_nfev=80,
+        )
+        if not result.success:
+            xf, yf, tag = _refine_point_centroid(
+                image,
+                x=xi,
+                y=yi,
+                window_radius=window_radius,
+                max_shift_px=max_shift_px,
+            )
+            return xf, yf, f"gaussian_fallback_{tag}"
+        cx_fit = float(result.x[2])
+        cy_fit = float(result.x[3])
+        return cx_fit, cy_fit, "gaussian_ok"
+    except Exception:  # noqa: BLE001
+        xf, yf, tag = _refine_point_centroid(
+            image,
+            x=xi,
+            y=yi,
+            window_radius=window_radius,
+            max_shift_px=max_shift_px,
+        )
+        return xf, yf, f"gaussian_fallback_{tag}"
+
+
+def _refine_manual_points(
+    points_xy: list[tuple[float, float]],
+    *,
+    fft_log_magnitude: np.ndarray,
+    method: str,
+    window_radius: int,
+    max_shift_px: float,
+) -> tuple[list[tuple[float, float]], dict[str, Any], list[str]]:
+    mode = str(method or "gaussian").strip().lower()
+    if mode not in {"none", "centroid", "gaussian"}:
+        mode = "gaussian"
+    if not points_xy or mode == "none":
+        return (
+            list(points_xy),
+            {
+                "enabled": False,
+                "method": mode,
+                "point_count": int(len(points_xy)),
+                "refined_count": int(len(points_xy)),
+                "mean_shift_px": 0.0,
+                "max_shift_px": 0.0,
+                "fallback_count": 0,
+            },
+            [],
+        )
+
+    image = np.asarray(fft_log_magnitude, dtype=np.float64)
+    refined: list[tuple[float, float]] = []
+    shifts: list[float] = []
+    fallback_count = 0
+    tags: list[str] = []
+    point_pairs: list[dict[str, Any]] = []
+    for x, y in points_xy:
+        x0 = float(x)
+        y0 = float(y)
+        if mode == "centroid":
+            xf, yf, tag = _refine_point_centroid(
+                image,
+                x=x0,
+                y=y0,
+                window_radius=max(1, int(window_radius)),
+                max_shift_px=max(0.0, float(max_shift_px)),
+            )
+        else:
+            xf, yf, tag = _refine_point_gaussian(
+                image,
+                x=x0,
+                y=y0,
+                window_radius=max(1, int(window_radius)),
+                max_shift_px=max(0.0, float(max_shift_px)),
+            )
+        if "fallback" in tag:
+            fallback_count += 1
+        tags.append(tag)
+        refined.append((float(xf), float(yf)))
+        shift_px = float(np.hypot(float(xf) - x0, float(yf) - y0))
+        shifts.append(shift_px)
+        point_pairs.append(
+            {
+                "x_raw": round(x0, 3),
+                "y_raw": round(y0, 3),
+                "x_refined": round(float(xf), 3),
+                "y_refined": round(float(yf), 3),
+                "shift_px": round(float(shift_px), 4),
+                "tag": tag,
+            }
+        )
+
+    mean_shift = float(np.mean(shifts)) if shifts else 0.0
+    max_shift = float(np.max(shifts)) if shifts else 0.0
+    diagnostics = {
+        "enabled": True,
+        "method": mode,
+        "window_radius_px": int(max(1, int(window_radius))),
+        "max_shift_limit_px": float(max(0.0, float(max_shift_px))),
+        "point_count": int(len(points_xy)),
+        "refined_count": int(len(refined)),
+        "mean_shift_px": float(mean_shift),
+        "max_shift_px": float(max_shift),
+        "fallback_count": int(fallback_count),
+        "tags": list(tags),
+        "point_pairs": point_pairs,
+    }
+    warnings: list[str] = []
+    if fallback_count > 0:
+        warnings.append(
+            f"Manual refine fallback occurred for {fallback_count}/{len(points_xy)} point(s)."
+        )
+    return refined, diagnostics, warnings
+
+
+def _array_from_reference(array_ref: Any) -> np.ndarray | None:
+    if array_ref is None:
+        return None
+    inline = getattr(array_ref, "inline", None)
+    shape = tuple(int(v) for v in getattr(array_ref, "shape", ()))
+    if inline is not None:
+        try:
+            arr = np.asarray(inline, dtype=np.float32)
+            if shape and arr.size == int(np.prod(shape)):
+                arr = arr.reshape(shape)
+            if arr.ndim == 2:
+                return arr
+        except Exception:  # noqa: BLE001
+            pass
+
+    uri = getattr(array_ref, "uri", None)
+    if not isinstance(uri, str) or not uri:
+        return None
+    path = Path(uri)
+    if not path.exists() or not path.is_file():
+        return None
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".npy":
+            arr = np.load(path, allow_pickle=False)
+            return np.asarray(arr, dtype=np.float32) if arr.ndim == 2 else None
+        if suffix in {".txt", ".csv"}:
+            arr = np.loadtxt(path)
+            return np.asarray(arr, dtype=np.float32) if arr.ndim == 2 else None
+        if suffix in {".tif", ".tiff", ".png", ".jpg", ".jpeg"}:
+            with Image.open(path) as handle:
+                image = np.asarray(handle)
+            if image.ndim == 3:
+                image = image.mean(axis=2)
+            return np.asarray(image, dtype=np.float32) if image.ndim == 2 else None
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _build_demo_input(run_dir: Path) -> Path:
+    rng = np.random.default_rng(20260524)
+    h, w = 256, 256
+    image = rng.normal(loc=0.03, scale=0.008, size=(h, w)).astype(np.float32)
+    cy, cx = h // 2, w // 2
+    points = [(0, 34), (0, -34), (22, 18), (-22, -18), (26, -20), (-26, 20)]
+    for dy, dx in points:
+        yy = cy + dy
+        xx = cx + dx
+        if 2 <= yy < h - 2 and 2 <= xx < w - 2:
+            image[yy - 1 : yy + 2, xx - 1 : xx + 2] += 1.0
+    in_dir = run_dir / "inputs"
+    in_dir.mkdir(parents=True, exist_ok=True)
+    out_path = in_dir / "demo_b1_b3.npy"
+    np.save(out_path, image)
+    return out_path
+
+
+def _save_uploaded(uploaded_file, run_dir: Path) -> Path:
+    input_dir = run_dir / "inputs"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    path = input_dir / _safe_name(uploaded_file.name)
+    path.write_bytes(uploaded_file.getbuffer())
+    return path
+
+
+def _parse_candidate_phase_params(raw_text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    text = str(raw_text).strip()
+    if not text:
+        return [], []
+    try:
+        payload = json.loads(text)
+    except Exception as exc:  # noqa: BLE001
+        return [], [f"candidate_phase_params JSON parse failed: {exc}"]
+    if not isinstance(payload, list):
+        return [], ["candidate_phase_params must be a JSON list."]
+    rows = [row for row in payload if isinstance(row, dict)]
+    if not rows:
+        return [], ["candidate_phase_params has no valid mapping rows."]
+    return rows, []
+
+
+def _baseline_indexed_spots(d_spacings: list[Measurement | None]) -> list[IndexedSpot]:
+    out: list[IndexedSpot] = []
+    for idx, d_spacing in enumerate(d_spacings):
+        out.append(
+            IndexedSpot(
+                peak_index=idx,
+                h=0,
+                k=0,
+                l=0,
+                d_spacing=d_spacing,
+                error=Measurement(value=1.0, unit="relative", method="manual_unindexed"),
+                confidence=0.1,
+            )
+        )
+    return out
+
+
+def _phase_placeholders(names: list[str], top_n: int) -> list[PhaseCandidate]:
+    chosen = [name for name in names if name][: max(1, int(top_n))]
+    if not chosen:
+        return []
+    return [
+        PhaseCandidate(
+            name=name,
+            source="candidate_phases",
+            score=max(0.1, 0.35 - 0.04 * idx),
+            matched_spot_count=0,
+            warnings=["Placeholder candidate; candidate_phase_params not used in this mode."],
+        )
+        for idx, name in enumerate(chosen)
+    ]
+
+
+def _build_peak_rows(
+    *,
+    peaks: list[DiffractionPeak],
+    g_vectors: list[Any],
+    d_by_peak: list[Measurement | None],
+    indexed_spots: list[IndexedSpot],
+) -> list[dict[str, Any]]:
+    indexed_map = {int(spot.peak_index): spot for spot in indexed_spots}
+    rows: list[dict[str, Any]] = []
+    for idx, peak in enumerate(peaks):
+        g_item = g_vectors[idx] if idx < len(g_vectors) else None
+        d_item = d_by_peak[idx] if idx < len(d_by_peak) else None
+        spot = indexed_map.get(idx)
+
+        gx = _measurement_value(getattr(g_item, "gx", None))
+        gy = _measurement_value(getattr(g_item, "gy", None))
+        gm = _measurement_value(getattr(g_item, "magnitude", None))
+        dval = _measurement_value(d_item)
+        dunc = _measurement_uncertainty(d_item)
+
+        rows.append(
+            {
+                "peak_id": idx,
+                "x": round(float(peak.x), 4),
+                "y": round(float(peak.y), 4),
+                "intensity": (
+                    None if peak.intensity is None else round(float(peak.intensity), 6)
+                ),
+                "peak_confidence": (
+                    None if peak.confidence is None else round(float(peak.confidence), 4)
+                ),
+                "gx": None if gx is None else round(float(gx), 6),
+                "gy": None if gy is None else round(float(gy), 6),
+                "g_magnitude": None if gm is None else round(float(gm), 6),
+                "g_unit": (
+                    "-"
+                    if g_item is None
+                    else str(getattr(getattr(g_item, "gx", None), "unit", "-"))
+                ),
+                "d_spacing": None if dval is None else round(float(dval), 6),
+                "d_uncertainty": None if dunc is None else round(float(dunc), 6),
+                "d_unit": "-" if d_item is None else str(d_item.unit or "-"),
+                "h": 0 if spot is None else int(spot.h),
+                "k": 0 if spot is None else int(spot.k),
+                "l": 0 if spot is None else int(spot.l),
+                "index_confidence": (
+                    None
+                    if spot is None or spot.confidence is None
+                    else round(float(spot.confidence), 4)
+                ),
+            }
+        )
+    return rows
+
+
+def _build_phase_rows(phase_candidates: list[PhaseCandidate]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in phase_candidates:
+        rows.append(
+            {
+                "name": item.name,
+                "formula": item.formula,
+                "source": item.source,
+                "score": item.score,
+                "matched_spot_count": item.matched_spot_count,
+                "zone_axis": item.zone_axis,
+                "mean_d_error": (
+                    None
+                    if item.mean_d_error is None or item.mean_d_error.value is None
+                    else item.mean_d_error.value
+                ),
+                "mean_angle_error": (
+                    None
+                    if item.mean_angle_error is None or item.mean_angle_error.value is None
+                    else item.mean_angle_error.value
+                ),
+            }
+        )
+    return rows
+
+
+def _build_manual_diffraction(
+    *,
+    selected_points_xy: list[tuple[float, float]],
+    fft_log_magnitude: np.ndarray,
+    fft_center: tuple[float, float],
+    calibration: Any,
+    diff_params: dict[str, Any],
+    candidate_phase_params: list[dict[str, Any]],
+    candidate_phases: list[str],
+) -> dict[str, Any]:
+    warnings: list[str] = []
+    if not selected_points_xy:
+        return {
+            "peaks": [],
+            "g_vectors": [],
+            "d_by_peak": [],
+            "indexed_spots": [],
+            "phase_candidates": [],
+            "warnings": ["No manual points selected."],
+            "provenance": {"manual_selection": True, "selected_point_count": 0},
+        }
+
+    h, w = fft_log_magnitude.shape
+    peaks: list[DiffractionPeak] = []
+    for x, y in selected_points_xy:
+        xx = int(np.clip(round(x), 0, w - 1))
+        yy = int(np.clip(round(y), 0, h - 1))
+        intensity = float(fft_log_magnitude[yy, xx])
+        peaks.append(
+            DiffractionPeak(
+                x=float(x),
+                y=float(y),
+                intensity=intensity,
+                confidence=0.9,
+            )
+        )
+
+    scale_value = _measurement_value(getattr(calibration, "diffraction_scale", None))
+    scale_unc = _measurement_uncertainty(getattr(calibration, "diffraction_scale", None))
+    scale_source = (
+        "unresolved"
+        if getattr(calibration, "diffraction_scale", None) is None
+        else str(getattr(calibration.diffraction_scale, "method", "unknown"))
+    )
+
+    fft_center_mode = str(diff_params.get("fft_center_mode", "auto")).strip().lower()
+    center_unc = diff_params.get("direct_beam_center_uncertainty_px")
+    center_unc_val = _num(center_unc, 0.35 if fft_center_mode == "auto" else 0.0)
+
+    reciprocal = compute_gvectors_and_dspacing(
+        peaks,
+        center=fft_center,
+        diffraction_scale_value=scale_value,
+        diffraction_scale_uncertainty=scale_unc,
+        diffraction_scale_source=scale_source,
+        center_uncertainty_px=center_unc_val,
+    )
+    warnings.extend(reciprocal.warnings)
+
+    indexed_spots = _baseline_indexed_spots(reciprocal.d_by_peak)
+    phase_candidates: list[PhaseCandidate] = []
+    indexing_mode = str(diff_params.get("indexing_mode", "auto")).strip().lower()
+    if indexing_mode in {"auto", "lattice_fit"} and peaks:
+        b4_result = run_b4_indexing(
+            peaks=peaks,
+            g_vectors=reciprocal.g_vectors,
+            d_by_peak=reciprocal.d_by_peak,
+            initial_indexed_spots=indexed_spots,
+            candidate_phase_params=candidate_phase_params,
+            allowed_phase_names=set(candidate_phases) if candidate_phases else None,
+            max_hkl=max(1, int(_num(diff_params.get("max_hkl"), 4))),
+            d_tolerance_rel=max(1e-4, _num(diff_params.get("d_tolerance_rel"), 0.10)),
+            angle_tolerance_deg=max(0.1, _num(diff_params.get("angle_tolerance_deg"), 12.0)),
+            strict_mode=bool(diff_params.get("b4_strict_mode", False)),
+            cif_candidates_dir=(
+                str(diff_params.get("cif_candidates_dir"))
+                if diff_params.get("cif_candidates_dir")
+                else None
+            ),
+            top_n=max(1, int(_num(diff_params.get("phase_top_n"), 3))),
+        )
+        indexed_spots = b4_result.indexed_spots
+        phase_candidates = b4_result.phase_candidates
+        warnings.extend(b4_result.warnings)
+        b4_provenance = b4_result.provenance
+    else:
+        b4_provenance = {"active": False, "reason": "indexing_mode_baseline_or_no_peaks"}
+
+    if not phase_candidates and candidate_phases:
+        phase_candidates = _phase_placeholders(
+            list(candidate_phases),
+            max(1, int(_num(diff_params.get("phase_top_n"), 3))),
+        )
+
+    return {
+        "peaks": peaks,
+        "g_vectors": reciprocal.g_vectors,
+        "d_by_peak": reciprocal.d_by_peak,
+        "indexed_spots": indexed_spots,
+        "phase_candidates": phase_candidates,
+        "warnings": list(dict.fromkeys(warnings)),
+        "provenance": {
+            "manual_selection": True,
+            "selected_point_count": len(peaks),
+            "fft_center": [float(fft_center[0]), float(fft_center[1])],
+            "reciprocal_metrics": reciprocal.diagnostics,
+            "b4_indexing": b4_provenance,
+        },
+    }
+
+
+def _with_manual_context(
+    manual_result: dict[str, Any],
+    *,
+    selection_mode: str,
+    selected_points_xy: list[tuple[float, float]],
+    manual_refine_warnings: list[str],
+    vector_synth_warnings: list[str],
+    manual_refine_diagnostics: dict[str, Any],
+    vector_synth_diagnostics: dict[str, Any],
+    auto_remove_peak_ids: list[int],
+    manual_points_refined_xy: list[tuple[float, float]],
+) -> dict[str, Any]:
+    result = dict(manual_result)
+    result["warnings"] = list(
+        dict.fromkeys(
+            list(result.get("warnings", []))
+            + list(manual_refine_warnings)
+            + list(vector_synth_warnings)
+        )
+    )
+
+    provenance = dict(result.get("provenance", {}))
+    provenance["manual_point_refine"] = dict(manual_refine_diagnostics)
+    if selection_mode == MODE_TWO_VECTOR:
+        provenance["vector_synthesis"] = dict(vector_synth_diagnostics)
+    if selection_mode == MODE_AUTO_EDIT:
+        provenance["auto_edit"] = {
+            "removed_auto_peak_ids": [int(i) for i in auto_remove_peak_ids],
+            "removed_count": int(len(auto_remove_peak_ids)),
+            "manual_add_count": int(len(manual_points_refined_xy)),
+            "selected_point_count": int(len(selected_points_xy)),
+        }
+    result["provenance"] = provenance
+    return result
+
+
+def _plot_peak_overlay(
+    fft_image_norm: np.ndarray,
+    *,
+    center_xy: tuple[float, float],
+    auto_points_xy: list[tuple[float, float]],
+    selected_points_xy: list[tuple[float, float]],
+    manual_raw_points_xy: list[tuple[float, float]] | None = None,
+    manual_refined_points_xy: list[tuple[float, float]] | None = None,
+    basis_points_xy: list[tuple[float, float]] | None = None,
+    annotate_auto_ids: bool = True,
+    annotate_selected_ids: bool = False,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(7.0, 7.0), dpi=150)
+    ax.imshow(fft_image_norm, cmap="gray")
+    if auto_points_xy:
+        auto_x = [float(item[0]) for item in auto_points_xy]
+        auto_y = [float(item[1]) for item in auto_points_xy]
+        ax.scatter(auto_x, auto_y, s=16, c="cyan", marker="o", label="auto")
+        if annotate_auto_ids:
+            for idx, (xv, yv) in enumerate(auto_points_xy):
+                ax.annotate(
+                    str(idx),
+                    (float(xv), float(yv)),
+                    xytext=(4, 4),
+                    textcoords="offset points",
+                    color="cyan",
+                    fontsize=7,
+                    fontweight="bold",
+                    bbox={
+                        "boxstyle": "round,pad=0.15",
+                        "fc": (0.0, 0.0, 0.0, 0.35),
+                        "ec": (0.0, 0.0, 0.0, 0.0),
+                    },
+                )
+    if selected_points_xy:
+        sel_x = [float(item[0]) for item in selected_points_xy]
+        sel_y = [float(item[1]) for item in selected_points_xy]
+        ax.scatter(sel_x, sel_y, s=28, facecolors="none", edgecolors="red", label="selected")
+        if annotate_selected_ids:
+            for idx, (xv, yv) in enumerate(selected_points_xy):
+                ax.annotate(
+                    str(idx),
+                    (float(xv), float(yv)),
+                    xytext=(4, -10),
+                    textcoords="offset points",
+                    color="red",
+                    fontsize=7,
+                    fontweight="bold",
+                    bbox={
+                        "boxstyle": "round,pad=0.15",
+                        "fc": (0.0, 0.0, 0.0, 0.35),
+                        "ec": (0.0, 0.0, 0.0, 0.0),
+                    },
+                )
+    if manual_raw_points_xy:
+        raw_x = [float(item[0]) for item in manual_raw_points_xy]
+        raw_y = [float(item[1]) for item in manual_raw_points_xy]
+        ax.scatter(raw_x, raw_y, s=26, c="orange", marker="x", label="manual_raw")
+    if manual_refined_points_xy:
+        ref_x = [float(item[0]) for item in manual_refined_points_xy]
+        ref_y = [float(item[1]) for item in manual_refined_points_xy]
+        ax.scatter(ref_x, ref_y, s=22, c="lime", marker="+", label="manual_refined")
+    if basis_points_xy:
+        bx = [float(item[0]) for item in basis_points_xy]
+        by = [float(item[1]) for item in basis_points_xy]
+        ax.scatter(bx, by, s=44, c="magenta", marker="*", label="basis(g1/g2)")
+    ax.scatter([center_xy[0]], [center_xy[1]], s=40, c="yellow", marker="+", label="center")
+    ax.set_title("FFT Peaks Overlay")
+    ax.set_axis_off()
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    return fig
+
+
+def _run_b1b3_pipeline(
+    *,
+    input_path: Path,
+    quality_params: dict[str, Any],
+    calibration_method: str,
+    calibration_params: dict[str, Any],
+    recipe: str,
+    preprocessing_params: dict[str, Any],
+    diffraction_params: dict[str, Any],
+    fft_center_mode: str,
+    direct_beam_search_radius: float,
+    direct_beam_refine_window: int,
+) -> dict[str, Any]:
+    dataset = load_tem_dataset(input_path)
+    quality = assess_quality(dataset, parameters=quality_params)
+    calibration = calibrate_dataset(
+        dataset,
+        method=str(calibration_method),
+        parameters=calibration_params,
+    )
+    preprocessing = preprocess_dataset(
+        dataset,
+        quality_after=quality,
+        recipe=str(recipe),
+        parameters=preprocessing_params,
+    )
+    diffraction_auto = run_diffraction_analysis(
+        preprocessing,
+        calibration,
+        parameters=diffraction_params,
+    )
+
+    original_image = _array_from_reference(dataset.data)
+    if original_image is None:
+        read_result = read_image(input_path)
+        original_image = np.asarray(read_result.array, dtype=np.float32)
+    processed_image = _array_from_reference(preprocessing.image)
+    if processed_image is None:
+        processed_image = np.asarray(original_image, dtype=np.float32)
+
+    fft_analysis, fft_warnings = compute_fft_analysis(
+        np.asarray(processed_image, dtype=np.float64),
+        center_mode=str(fft_center_mode),
+        search_radius_px=(
+            float(direct_beam_search_radius)
+            if float(direct_beam_search_radius) > 0
+            else None
+        ),
+        refine_window=max(1, int(direct_beam_refine_window)),
+    )
+
+    return {
+        "dataset": dataset,
+        "quality": quality,
+        "calibration": calibration,
+        "preprocessing": preprocessing,
+        "diffraction_auto": diffraction_auto,
+        "original_image": np.asarray(original_image, dtype=np.float32),
+        "processed_image": np.asarray(processed_image, dtype=np.float32),
+        "fft_analysis": fft_analysis,
+        "fft_warnings": list(fft_warnings),
+    }
+
+
+def _render_mode_selector(mode_options: list[str]) -> str:
+    selection_mode = _render_mode_selector(mode_options)
+    return str(selection_mode)
+
+
+def _render_preview_metrics(
+    *,
+    quality: Any,
+    calibration: Any,
+    diffraction_auto: Any,
+) -> None:
+    st.subheader("B1/B2/B3 Preview")
+    metrics_cols = st.columns(6)
+    metrics_cols[0].metric("Quality Score", f"{float(quality.overall_score or 0.0):.3f}")
+    metrics_cols[1].metric("Auto Peaks", str(len(diffraction_auto.peaks)))
+    metrics_cols[2].metric("Auto d-spacing", str(len(diffraction_auto.d_spacings)))
+    metrics_cols[3].metric("Auto Phase Top-N", str(len(diffraction_auto.phase_candidates)))
+    metrics_cols[4].metric(
+        "Diffraction Confidence",
+        f"{float(diffraction_auto.confidence or 0.0):.3f}",
+    )
+    metrics_cols[5].metric(
+        "Calibration Confidence",
+        f"{float(calibration.confidence or 0.0):.3f}",
+    )
+
+
+def _render_preview_images(
+    *,
+    original_image: np.ndarray,
+    processed_image: np.ndarray,
+    fft_image_norm: np.ndarray,
+) -> None:
+    img_col1, img_col2, img_col3 = st.columns(3)
+    with img_col1:
+        st.image(
+            _normalize_for_display(original_image),
+            caption="Input image",
+            use_container_width=True,
+        )
+    with img_col2:
+        st.image(
+            _normalize_for_display(processed_image),
+            caption="Preprocessed",
+            use_container_width=True,
+        )
+    with img_col3:
+        st.image(fft_image_norm, caption="FFT log-magnitude", use_container_width=True)
+
+
+def main() -> None:
+    st.set_page_config(page_title=_APP_TITLE, layout="wide")
+    st.title(_APP_TITLE)
+    st.caption(
+        "B1/B2/B3 interactive preview on current main-branch pipeline parameters "
+        "(quality, calibration, preprocessing, FFT peaks, indexing, phase match)."
+    )
+    st.caption(f"UI build: `{_UI_BUILD_TAG}`")
+
+    merged_defaults = _deep_merge(_FALLBACK_DEFAULTS, _read_template_defaults())
+    quality_defaults = _as_mapping(_as_mapping(merged_defaults.get("quality")).get("thresholds"))
+    cal_defaults = _as_mapping(merged_defaults.get("calibration"))
+    prep_defaults = _as_mapping(merged_defaults.get("preprocessing"))
+    diff_defaults = _as_mapping(merged_defaults.get("diffraction"))
+
+    st.sidebar.header("Run Setup")
+    input_mode = st.sidebar.radio(
+        "Input source",
+        ["Upload file", "Built-in demo", "Local file path"],
+        index=0,
+    )
+    uploaded = None
+    local_file_path = ""
+    if input_mode == "Upload file":
+        uploaded = st.sidebar.file_uploader(
+            "Input TEM image/data",
+            type=[
+                "npy",
+                "txt",
+                "csv",
+                "tif",
+                "tiff",
+                "png",
+                "jpg",
+                "jpeg",
+                "dm",
+                "dm3",
+                "dm4",
+                "mrc",
+                "h5",
+                "hdf5",
+                "emd",
+            ],
+        )
+    elif input_mode == "Local file path":
+        local_file_path = st.sidebar.text_input(
+            "Local data file path",
+            value=str(st.session_state.get("b1b3_local_file_path", "")),
+            help="Example: D:/Users/.../1.0017.dm4",
+        ).strip()
+        if local_file_path:
+            st.session_state["b1b3_local_file_path"] = local_file_path
+
+    output_root_raw = st.sidebar.text_input("Output root", value=str(_default_output_root()))
+    run_name = st.sidebar.text_input(
+        "Run folder name",
+        value=f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+    )
+    auto_rerun = st.sidebar.checkbox("Auto rerun on parameter change", value=True)
+
+    with st.sidebar.expander("B1 Quality", expanded=False):
+        snr_min = st.number_input(
+            "snr_min",
+            min_value=0.0,
+            value=_num(quality_defaults.get("snr_min"), 6.0),
+            step=0.5,
+        )
+        drift_px_max = st.number_input(
+            "drift_px_max",
+            min_value=0.0,
+            value=_num(quality_defaults.get("drift_px_max"), 2.0),
+            step=0.2,
+        )
+        overall_score_min = st.number_input(
+            "overall_score_min",
+            min_value=0.0,
+            max_value=1.0,
+            value=_num(quality_defaults.get("overall_score_min"), 0.35),
+            step=0.05,
+        )
+
+    with st.sidebar.expander("B1 Calibration", expanded=True):
+        manual_calibration_override = st.checkbox(
+            "manual_calibration_override",
+            value=bool(cal_defaults.get("manual_calibration_override", False)),
+            help=(
+                "Off: DM uses file metadata auto calibration; non-DM prioritizes "
+                "scale-bar auto sizing. "
+                "On: apply manual values below."
+            ),
+        )
+        cal_method_default = str(cal_defaults.get("method", "auto"))
+        if cal_method_default not in {"auto", "reference", "manual", "metadata"}:
+            cal_method_default = "auto"
+        cal_method = st.selectbox(
+            "method",
+            options=["auto", "reference", "manual", "metadata"],
+            index=["auto", "reference", "manual", "metadata"].index(cal_method_default),
+            disabled=not manual_calibration_override,
+        )
+        diffraction_engine_default = str(
+            cal_defaults.get("diffraction_calibration_engine", "none")
+        )
+        if diffraction_engine_default not in {"none", "pyxem", "py4dstem"}:
+            diffraction_engine_default = "none"
+        diffraction_engine = st.selectbox(
+            "diffraction_calibration_engine",
+            options=["none", "pyxem", "py4dstem"],
+            index=["none", "pyxem", "py4dstem"].index(diffraction_engine_default),
+        )
+        voltage_kv = st.number_input(
+            "voltage_kv",
+            min_value=1.0,
+            value=_num(cal_defaults.get("voltage_kv"), 200.0),
+            step=10.0,
+            disabled=not manual_calibration_override,
+        )
+        pixel_size_nm = st.number_input(
+            "pixel_size_nm",
+            min_value=1e-6,
+            value=_num(cal_defaults.get("pixel_size_nm"), 0.02),
+            step=0.001,
+            format="%.6f",
+            disabled=not manual_calibration_override,
+        )
+        pixel_size_unc_nm = st.number_input(
+            "pixel_size_uncertainty_nm",
+            min_value=0.0,
+            value=_num(cal_defaults.get("pixel_size_uncertainty_nm"), 0.001),
+            step=0.0005,
+            format="%.6f",
+            disabled=not manual_calibration_override,
+        )
+        known_d_spacing = st.number_input(
+            "known_d_spacing",
+            min_value=1e-6,
+            value=_num(cal_defaults.get("known_d_spacing"), 0.235),
+            step=0.001,
+            format="%.6f",
+            disabled=not manual_calibration_override,
+        )
+        known_d_unit = st.selectbox(
+            "known_d_spacing_unit",
+            options=["nm", "angstrom", "pm"],
+            index=["nm", "angstrom", "pm"].index(
+                str(cal_defaults.get("known_d_spacing_unit", "nm"))
+                if str(cal_defaults.get("known_d_spacing_unit", "nm")) in {"nm", "angstrom", "pm"}
+                else "nm"
+            ),
+            disabled=not manual_calibration_override,
+        )
+        measured_radius_px = st.number_input(
+            "measured_radius_px",
+            min_value=0.1,
+            value=_num(cal_defaults.get("measured_radius_px"), 8.5),
+            step=0.1,
+            disabled=not manual_calibration_override,
+        )
+        known_d_unc_nm = st.number_input(
+            "known_d_uncertainty_nm",
+            min_value=0.0,
+            value=_num(cal_defaults.get("known_d_uncertainty_nm"), 0.002),
+            step=0.0005,
+            format="%.6f",
+            disabled=not manual_calibration_override,
+        )
+        radius_unc_px = st.number_input(
+            "measured_radius_uncertainty_px",
+            min_value=0.0,
+            value=_num(cal_defaults.get("measured_radius_uncertainty_px"), 0.3),
+            step=0.05,
+            disabled=not manual_calibration_override,
+        )
+        detector_pixel_size_um = st.number_input(
+            "detector_pixel_size_um",
+            min_value=0.1,
+            value=_num(cal_defaults.get("detector_pixel_size_um"), 14.0),
+            step=0.5,
+            disabled=not manual_calibration_override,
+        )
+        multi_ref_json = st.text_area(
+            "known_d_spacing_refs (optional JSON list)",
+            value="",
+            height=96,
+            disabled=not manual_calibration_override,
+            help=(
+                "Optional list rows like "
+                '{"known_d_spacing":0.213,"known_d_spacing_unit":"nm","measured_radius_px":46.5}.'
+            ),
+        )
+
+    with st.sidebar.expander("B2 Preprocessing", expanded=False):
+        recipe = st.selectbox(
+            "recipe",
+            options=["auto", "min_max"],
+            index=0 if str(prep_defaults.get("recipe", "auto")) == "auto" else 1,
+        )
+        clip_low = st.number_input(
+            "clip_percentile_low",
+            min_value=0.0,
+            max_value=99.9,
+            value=_num(prep_defaults.get("clip_percentile_low"), 1.0),
+            step=0.5,
+        )
+        clip_high = st.number_input(
+            "clip_percentile_high",
+            min_value=0.1,
+            max_value=100.0,
+            value=_num(prep_defaults.get("clip_percentile_high"), 99.0),
+            step=0.5,
+        )
+        denoise_method = st.selectbox(
+            "denoise_method",
+            options=sorted(SUPPORTED_DENOISE_METHODS),
+            index=sorted(SUPPORTED_DENOISE_METHODS).index(
+                str(prep_defaults.get("denoise_method", "wiener"))
+                if str(prep_defaults.get("denoise_method", "wiener")) in SUPPORTED_DENOISE_METHODS
+                else "auto"
+            ),
+        )
+        denoise_sigma = st.number_input(
+            "denoise_sigma",
+            min_value=0.0,
+            value=_num(prep_defaults.get("denoise_sigma"), 0.8),
+            step=0.1,
+        )
+        median_size = st.number_input("median_size", min_value=1, value=3, step=1)
+        wiener_window = st.number_input(
+            "wiener_window",
+            min_value=3,
+            value=int(_num(prep_defaults.get("wiener_window"), 5)),
+            step=1,
+        )
+        wiener_noise = st.number_input("wiener_noise", min_value=0.0, value=0.0, step=0.01)
+        nlm_h = st.number_input("nlm_h", min_value=0.0, value=0.05, step=0.01)
+        nlm_patch_size = st.number_input("nlm_patch_size", min_value=3, value=5, step=1)
+        nlm_patch_distance = st.number_input("nlm_patch_distance", min_value=1, value=6, step=1)
+        background_method_default = _choice(
+            SUPPORTED_BACKGROUND_METHODS,
+            prep_defaults.get("background_method", "gaussian"),
+            "none",
+        )
+        background_method = st.selectbox(
+            "background_method",
+            options=SUPPORTED_BACKGROUND_METHODS,
+            index=SUPPORTED_BACKGROUND_METHODS.index(background_method_default),
+        )
+        background_sigma = st.number_input(
+            "background_sigma",
+            min_value=0.0,
+            value=_num(prep_defaults.get("background_sigma"), 12.0),
+            step=0.5,
+        )
+        background_opening_size = st.number_input(
+            "background_opening_size",
+            min_value=3,
+            value=31,
+            step=2,
+        )
+        background_clip_zero = st.checkbox("background_clip_zero", value=False)
+
+    with st.sidebar.expander("B3 Diffraction", expanded=True):
+        auto_peak_tuning = st.checkbox(
+            "auto_peak_tuning",
+            value=bool(diff_defaults.get("auto_peak_tuning", True)),
+        )
+        peak_detector = st.selectbox(
+            "peak_detector",
+            options=sorted(SUPPORTED_PEAK_DETECTORS),
+            index=sorted(SUPPORTED_PEAK_DETECTORS).index(
+                str(diff_defaults.get("peak_detector", "log"))
+                if str(diff_defaults.get("peak_detector", "log")) in SUPPORTED_PEAK_DETECTORS
+                else "local_max"
+            ),
+        )
+        peak_adapter_options = sorted(SUPPORTED_PEAK_ADAPTER_ENGINES)
+        peak_adapter_default = _choice(
+            peak_adapter_options,
+            diff_defaults.get("peak_adapter_engine", "none"),
+            "none",
+        )
+        peak_adapter_engine = st.selectbox(
+            "peak_adapter_engine",
+            options=peak_adapter_options,
+            index=peak_adapter_options.index(peak_adapter_default),
+        )
+        threshold_strategy_options = sorted(SUPPORTED_THRESHOLD_STRATEGIES)
+        threshold_strategy_default = _choice(
+            threshold_strategy_options,
+            diff_defaults.get("peak_threshold_strategy", "auto"),
+            "auto",
+        )
+        peak_threshold_strategy = st.selectbox(
+            "peak_threshold_strategy",
+            options=threshold_strategy_options,
+            index=threshold_strategy_options.index(threshold_strategy_default),
+        )
+        peak_threshold_value = st.number_input(
+            "peak_threshold_value",
+            value=_num(diff_defaults.get("peak_threshold_value"), 0.15),
+            step=0.01,
+            disabled=peak_threshold_strategy == "auto",
+        )
+        top_k_peaks = st.number_input(
+            "top_k_peaks",
+            min_value=1,
+            value=int(_num(diff_defaults.get("top_k_peaks"), 24)),
+            step=1,
+        )
+        min_peak_distance = st.number_input(
+            "min_peak_distance",
+            min_value=1,
+            value=int(_num(diff_defaults.get("min_peak_distance"), 3)),
+            step=1,
+        )
+        max_peak_radius_px = st.number_input(
+            "max_peak_radius_px (0=auto)",
+            min_value=0.0,
+            value=_num(diff_defaults.get("max_peak_radius_px"), 0.0),
+            step=10.0,
+        )
+        radius_outlier_filter = st.checkbox(
+            "radius_outlier_filter",
+            value=bool(diff_defaults.get("radius_outlier_filter", True)),
+            help="Automatically remove far-radius outlier peaks and refill from inlier candidates.",
+        )
+        radius_outlier_mad_factor = st.number_input(
+            "radius_outlier_mad_factor",
+            min_value=2.0,
+            value=_num(diff_defaults.get("radius_outlier_mad_factor"), 4.0),
+            step=0.2,
+            format="%.2f",
+            disabled=not radius_outlier_filter,
+        )
+        center_exclusion_radius = st.number_input(
+            "center_exclusion_radius",
+            min_value=0.0,
+            value=_num(diff_defaults.get("center_exclusion_radius"), 4.0),
+            step=0.5,
+        )
+        detector_sigma = st.number_input(
+            "detector_sigma",
+            min_value=0.2,
+            value=_num(diff_defaults.get("detector_sigma"), 1.2),
+            step=0.1,
+        )
+        dog_sigma_ratio = st.number_input(
+            "dog_sigma_ratio",
+            min_value=1.2,
+            value=_num(diff_defaults.get("dog_sigma_ratio"), 1.8),
+            step=0.1,
+        )
+        subpixel_window_radius = st.number_input(
+            "subpixel_window_radius",
+            min_value=1,
+            value=int(_num(diff_defaults.get("subpixel_window_radius"), 2)),
+            step=1,
+        )
+        subpixel_max_shift = st.number_input(
+            "subpixel_max_shift",
+            min_value=0.0,
+            value=_num(diff_defaults.get("subpixel_max_shift"), 1.5),
+            step=0.1,
+        )
+        fft_center_mode = st.selectbox(
+            "fft_center_mode",
+            options=SUPPORTED_FFT_CENTER_MODES,
+            index=SUPPORTED_FFT_CENTER_MODES.index(
+                str(diff_defaults.get("fft_center_mode", "auto"))
+                if str(diff_defaults.get("fft_center_mode", "auto")) in SUPPORTED_FFT_CENTER_MODES
+                else "auto"
+            ),
+        )
+        direct_beam_search_radius = st.number_input(
+            "direct_beam_search_radius",
+            min_value=0.0,
+            value=_num(diff_defaults.get("direct_beam_search_radius"), 0.0),
+            step=0.5,
+        )
+        direct_beam_refine_window = st.number_input(
+            "direct_beam_refine_window",
+            min_value=1,
+            value=int(_num(diff_defaults.get("direct_beam_refine_window"), 3)),
+            step=1,
+        )
+        direct_beam_center_uncertainty_px = st.number_input(
+            "direct_beam_center_uncertainty_px",
+            min_value=0.0,
+            value=_num(diff_defaults.get("direct_beam_center_uncertainty_px"), 0.35),
+            step=0.05,
+        )
+        indexing_mode = st.selectbox(
+            "indexing_mode",
+            options=SUPPORTED_INDEXING_MODES,
+            index=SUPPORTED_INDEXING_MODES.index(
+                str(diff_defaults.get("indexing_mode", "auto"))
+                if str(diff_defaults.get("indexing_mode", "auto")) in SUPPORTED_INDEXING_MODES
+                else "auto"
+            ),
+            format_func=lambda key: INDEXING_MODE_LABELS.get(str(key), str(key)),
+        )
+        phase_top_n = st.number_input(
+            "phase_top_n",
+            min_value=1,
+            value=int(_num(diff_defaults.get("phase_top_n"), 3)),
+            step=1,
+        )
+        candidate_phases_default = diff_defaults.get("candidate_phases", PHASE_OPTIONS[:3])
+        candidate_phases_default = [x for x in candidate_phases_default if x in PHASE_OPTIONS]
+        candidate_phases = st.multiselect(
+            "candidate_phases",
+            options=PHASE_OPTIONS,
+            default=candidate_phases_default if candidate_phases_default else PHASE_OPTIONS[:3],
+        )
+        b4_strict_mode = st.checkbox(
+            "b4_strict_mode",
+            value=bool(diff_defaults.get("b4_strict_mode", False)),
+            disabled=indexing_mode == "baseline",
+        )
+        max_hkl = st.number_input(
+            "max_hkl",
+            min_value=1,
+            value=int(_num(diff_defaults.get("max_hkl"), 4)),
+            step=1,
+        )
+        d_tolerance_rel = st.number_input(
+            "d_tolerance_rel",
+            min_value=0.001,
+            value=_num(diff_defaults.get("d_tolerance_rel"), 0.10),
+            step=0.01,
+            format="%.3f",
+        )
+        angle_tolerance_deg = st.number_input(
+            "angle_tolerance_deg",
+            min_value=0.1,
+            value=_num(diff_defaults.get("angle_tolerance_deg"), 12.0),
+            step=0.5,
+        )
+        cif_candidates_dir = st.text_input("cif_candidates_dir (optional)", value="")
+        candidate_phase_params_text = st.text_area(
+            "candidate_phase_params (JSON list)",
+            value=DEFAULT_B4_CANDIDATES_JSON,
+            height=190,
+        )
+
+    st.sidebar.subheader("Manual Point Selection Params")
+    overlay_label_mode = st.sidebar.selectbox(
+        "Overlay numbering",
+        options=["Auto peaks", "Selected points", "Both", "Off"],
+        index=0,
+    )
+    manual_min_distance = st.sidebar.slider("Manual dedup distance (px)", 0.5, 12.0, 2.0, 0.1)
+    manual_max_points = st.sidebar.slider("Manual max points", 2, 256, 64, 1)
+    with st.sidebar.expander("手动模式：两点向量合成参数", expanded=False):
+        vector_expand_order = st.slider(
+            "Vector expansion order",
+            min_value=1,
+            max_value=8,
+            value=3,
+            step=1,
+        )
+        vector_snap_mode = st.selectbox(
+            "Vector snap method",
+            options=["hybrid", "auto_peak_nearest", "local_max", "none"],
+            index=0,
+        )
+        vector_snap_radius_px = st.slider(
+            "Vector snap radius (px)",
+            min_value=0.5,
+            max_value=20.0,
+            value=7.5,
+            step=0.5,
+        )
+        vector_local_intensity_percentile = st.slider(
+            "Local max intensity percentile",
+            min_value=90.0,
+            max_value=99.99,
+            value=97.5,
+            step=0.1,
+        )
+        vector_max_points = st.slider(
+            "Vector synthesized max points",
+            min_value=8,
+            max_value=256,
+            value=96,
+            step=1,
+        )
+    with st.sidebar.expander("Manual point refine", expanded=False):
+        manual_refine_enabled = st.checkbox("Enable refine", value=True)
+        manual_refine_method = st.selectbox(
+            "Refine method",
+            options=["gaussian", "centroid", "none"],
+            index=0,
+            disabled=not manual_refine_enabled,
+        )
+        manual_refine_window_radius = st.slider(
+            "Refine window radius (px)",
+            min_value=1,
+            max_value=8,
+            value=3,
+            step=1,
+            disabled=not manual_refine_enabled or manual_refine_method == "none",
+        )
+        manual_refine_max_shift_px = st.slider(
+            "Refine max shift (px)",
+            min_value=0.2,
+            max_value=6.0,
+            value=3.0,
+            step=0.1,
+            disabled=not manual_refine_enabled or manual_refine_method == "none",
+        )
+    with st.sidebar.expander("Manual Spot Table Import + Align", expanded=False):
+        manual_table_upload = st.file_uploader(
+            "Upload manual spot table (.txt/.csv)",
+            type=["txt", "csv", "tsv"],
+            key="b1b3_manual_table_upload",
+        )
+        manual_table_text = st.text_area(
+            "Or paste manual spot table text",
+            value="",
+            height=150,
+            key="b1b3_manual_table_text",
+            help=(
+                "Supported: DM-like rows such as "
+                "'Spot# d-Spacing Rec. Pos.(1/nm) ... Degrees to x-axis Amplitude'."
+            ),
+        )
+        align_target_mode = st.selectbox(
+            "Align target",
+            options=["Auto (pipeline)", "Selected points"],
+            index=0,
+            key="b1b3_align_target_mode",
+        )
+        align_max_d_rel = st.slider(
+            "Max d relative error",
+            min_value=0.01,
+            max_value=0.80,
+            value=0.25,
+            step=0.01,
+            key="b1b3_align_max_d_rel",
+        )
+        align_max_g_rel = st.slider(
+            "Max g relative error",
+            min_value=0.01,
+            max_value=0.80,
+            value=0.25,
+            step=0.01,
+            key="b1b3_align_max_g_rel",
+        )
+        align_max_angle_deg = st.slider(
+            "Max angle error (deg)",
+            min_value=2.0,
+            max_value=90.0,
+            value=35.0,
+            step=1.0,
+            key="b1b3_align_max_angle_deg",
+        )
+        align_angle_step_deg = st.slider(
+            "Angle search step (deg)",
+            min_value=0.25,
+            max_value=5.0,
+            value=1.0,
+            step=0.25,
+            key="b1b3_align_angle_step_deg",
+        )
+        align_weight_d = st.slider(
+            "Weight: d",
+            min_value=0.0,
+            max_value=5.0,
+            value=2.0,
+            step=0.1,
+            key="b1b3_align_weight_d",
+        )
+        align_weight_g = st.slider(
+            "Weight: g",
+            min_value=0.0,
+            max_value=5.0,
+            value=2.0,
+            step=0.1,
+            key="b1b3_align_weight_g",
+        )
+        align_weight_angle = st.slider(
+            "Weight: angle",
+            min_value=0.0,
+            max_value=5.0,
+            value=1.0,
+            step=0.1,
+            key="b1b3_align_weight_angle",
+        )
+
+    quality_params = {
+        "thresholds": {
+            "snr_min": float(snr_min),
+            "drift_px_max": float(drift_px_max),
+            "overall_score_min": float(overall_score_min),
+        }
+    }
+    manual_calibration_params: dict[str, Any] = {
+        "diffraction_calibration_engine": str(diffraction_engine),
+        "voltage_kv": float(voltage_kv),
+        "pixel_size_nm": float(pixel_size_nm),
+        "pixel_size_uncertainty_nm": float(pixel_size_unc_nm),
+        "known_d_spacing": float(known_d_spacing),
+        "known_d_spacing_unit": str(known_d_unit),
+        "known_d_uncertainty_nm": float(known_d_unc_nm),
+        "measured_radius_px": float(measured_radius_px),
+        "measured_radius_uncertainty_px": float(radius_unc_px),
+        "detector_pixel_size_um": float(detector_pixel_size_um),
+    }
+    if multi_ref_json.strip():
+        try:
+            refs_payload = json.loads(multi_ref_json)
+            if isinstance(refs_payload, list):
+                manual_calibration_params["known_d_spacing_refs"] = refs_payload
+        except Exception:  # noqa: BLE001
+            pass
+
+    preprocessing_params: dict[str, Any] = {
+        "clip_percentile_low": float(clip_low),
+        "clip_percentile_high": float(clip_high),
+        "denoise_method": str(denoise_method),
+        "denoise_sigma": float(denoise_sigma),
+        "median_size": int(median_size),
+        "wiener_window": int(wiener_window),
+        "wiener_noise": float(wiener_noise),
+        "nlm_h": float(nlm_h),
+        "nlm_patch_size": int(nlm_patch_size),
+        "nlm_patch_distance": int(nlm_patch_distance),
+        "background_method": str(background_method),
+        "background_sigma": float(background_sigma),
+        "background_opening_size": int(background_opening_size),
+        "background_clip_zero": bool(background_clip_zero),
+    }
+
+    candidate_phase_params, candidate_phase_warnings = _parse_candidate_phase_params(
+        candidate_phase_params_text
+    )
+    diffraction_params: dict[str, Any] = {
+        "auto_peak_tuning": bool(auto_peak_tuning),
+        "peak_detector": str(peak_detector),
+        "peak_adapter_engine": str(peak_adapter_engine),
+        "peak_threshold_strategy": str(peak_threshold_strategy),
+        "top_k_peaks": int(top_k_peaks),
+        "min_peak_distance": int(min_peak_distance),
+        "center_exclusion_radius": float(center_exclusion_radius),
+        "max_peak_radius_px": (
+            float(max_peak_radius_px) if float(max_peak_radius_px) > 0 else None
+        ),
+        "radius_outlier_filter": bool(radius_outlier_filter),
+        "radius_outlier_mad_factor": float(radius_outlier_mad_factor),
+        "detector_sigma": float(detector_sigma),
+        "dog_sigma_ratio": float(dog_sigma_ratio),
+        "subpixel_window_radius": int(subpixel_window_radius),
+        "subpixel_max_shift": float(subpixel_max_shift),
+        "fft_center_mode": str(fft_center_mode),
+        "direct_beam_refine_window": int(direct_beam_refine_window),
+        "direct_beam_center_uncertainty_px": float(direct_beam_center_uncertainty_px),
+        "indexing_mode": str(indexing_mode),
+        "phase_top_n": int(phase_top_n),
+        "candidate_phases": list(candidate_phases),
+        "candidate_phase_params": list(candidate_phase_params),
+        "max_hkl": int(max_hkl),
+        "d_tolerance_rel": float(d_tolerance_rel),
+        "angle_tolerance_deg": float(angle_tolerance_deg),
+        "b4_strict_mode": bool(b4_strict_mode),
+    }
+    if peak_threshold_strategy != "auto":
+        diffraction_params["peak_threshold_value"] = float(peak_threshold_value)
+    if float(direct_beam_search_radius) > 0:
+        diffraction_params["direct_beam_search_radius"] = float(direct_beam_search_radius)
+    if cif_candidates_dir.strip():
+        diffraction_params["cif_candidates_dir"] = str(cif_candidates_dir.strip())
+
+    manual_table_from_upload = _decode_uploaded_text(manual_table_upload).strip()
+    manual_table_from_text = str(manual_table_text or "").strip()
+    if manual_table_from_upload:
+        manual_table_payload = manual_table_from_upload
+        manual_table_source = "upload"
+    else:
+        manual_table_payload = manual_table_from_text
+        manual_table_source = "paste"
+    manual_spot_rows, manual_table_parse_warnings = _parse_manual_spot_table(manual_table_payload)
+
+    output_root = Path(output_root_raw).expanduser()
+    run_dir = output_root / _safe_name(run_name)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    if input_mode == "Upload file":
+        if uploaded is None:
+            st.info("Upload one file to start preview.")
+            return
+        input_path = _save_uploaded(uploaded, run_dir)
+    elif input_mode == "Local file path":
+        if not local_file_path:
+            st.info("Enter a valid local file path to start preview.")
+            return
+        path_obj = Path(local_file_path).expanduser()
+        if not path_obj.exists() or not path_obj.is_file():
+            st.error(f"Local file not found: {path_obj}")
+            return
+        input_path = path_obj
+    else:
+        input_path = _build_demo_input(run_dir)
+
+    input_ext = input_path.suffix.lower().lstrip(".")
+    input_is_dm = input_ext in {"dm", "dm3", "dm4"}
+
+    calibration_params: dict[str, Any] = {
+        "diffraction_calibration_engine": str(diffraction_engine),
+    }
+    if manual_calibration_override:
+        calibration_method_effective = str(cal_method)
+        calibration_params.update(manual_calibration_params)
+        size_policy_label = "Manual override enabled"
+    else:
+        calibration_method_effective = "auto"
+        calibration_params["auto_scalebar_for_non_dm"] = not input_is_dm
+        calibration_params["prefer_scalebar"] = not input_is_dm
+        if input_is_dm:
+            size_policy_label = "DM auto metadata calibration"
+        else:
+            size_policy_label = "Non-DM auto scale-bar calibration"
+
+    st.caption(
+        "Size policy: "
+        f"`{size_policy_label}` | input=`.{input_ext or 'unknown'}` | "
+        f"method=`{calibration_method_effective}`"
+    )
+    mode_options = [MODE_AUTO_EDIT, MODE_TWO_VECTOR]
+    if "b1b3_selection_mode_main" not in st.session_state:
+        st.session_state["b1b3_selection_mode_main"] = mode_options[0]
+    if st.session_state.get("b1b3_selection_mode_main") not in mode_options:
+        st.session_state["b1b3_selection_mode_main"] = mode_options[0]
+
+    st.subheader("Spot Selection Mode")
+    selection_mode = st.radio(
+        "Spot source mode",
+        options=mode_options,
+        horizontal=True,
+        key="b1b3_selection_mode_main",
+    )
+    if selection_mode == MODE_AUTO_EDIT:
+        st.caption(
+            "Mode 1 mirrors the backup UI: run the pipeline detector first, then review "
+            "or exclude auto peaks before reading the tables."
+        )
+    else:
+        st.caption(
+            "Mode 2 mirrors the backup UI: click two FFT basis spots and synthesize the "
+            "reciprocal lattice from those vectors."
+        )
+
+    signature_payload = {
+        "input_path": str(input_path),
+        "input_mode": input_mode,
+        "input_extension": input_ext,
+        "manual_calibration_override": bool(manual_calibration_override),
+        "calibration_method_effective": calibration_method_effective,
+        "quality": quality_params,
+        "calibration": calibration_params,
+        "preprocessing": preprocessing_params,
+        "recipe": recipe,
+        "diffraction": diffraction_params,
+    }
+    signature = _json_signature(signature_payload)
+    run_button_label = (
+        "Run Auto-Peak Pipeline"
+        if selection_mode == MODE_AUTO_EDIT
+        else "Run Vector-Mode Base Analysis"
+    )
+    run_clicked = st.button(run_button_label, type="primary")
+    has_cache = isinstance(st.session_state.get("b1b3_analysis_cache"), dict)
+    last_signature = st.session_state.get("b1b3_last_signature")
+    if auto_rerun:
+        need_run = run_clicked or (not has_cache) or (last_signature != signature)
+    else:
+        need_run = run_clicked or (not has_cache)
+
+    if need_run:
+        with st.spinner("Running B1/B2/B3 analysis with current parameters..."):
+            try:
+                st.session_state["b1b3_analysis_cache"] = _run_b1b3_pipeline(
+                    input_path=input_path,
+                    quality_params=quality_params,
+                    calibration_method=str(calibration_method_effective),
+                    calibration_params=calibration_params,
+                    recipe=str(recipe),
+                    preprocessing_params=preprocessing_params,
+                    diffraction_params=diffraction_params,
+                    fft_center_mode=str(fft_center_mode),
+                    direct_beam_search_radius=float(direct_beam_search_radius),
+                    direct_beam_refine_window=int(direct_beam_refine_window),
+                )
+            except Exception as exc:  # noqa: BLE001 - UI should surface pipeline failures.
+                st.error(f"B1/B2/B3 pipeline failed: {exc}")
+                if has_cache:
+                    st.warning("Keeping the previous successful analysis result on screen.")
+                else:
+                    return
+            else:
+                st.session_state["b1b3_last_signature"] = signature
+
+    cache = st.session_state.get("b1b3_analysis_cache")
+    if not isinstance(cache, dict):
+        st.info(f"Click `{run_button_label}` to render previews.")
+        return
+
+    dataset = cache["dataset"]
+    quality = cache["quality"]
+    calibration = cache["calibration"]
+    preprocessing = cache["preprocessing"]
+    diffraction_auto = cache["diffraction_auto"]
+    original_image = np.asarray(cache["original_image"], dtype=np.float32)
+    processed_image = np.asarray(cache["processed_image"], dtype=np.float32)
+    fft_analysis = cache["fft_analysis"]
+    fft_warnings = list(cache.get("fft_warnings", []))
+
+    fft_image_norm = _normalize_for_display(
+        np.asarray(fft_analysis.log_magnitude, dtype=np.float32)
+    )
+    auto_points_xy = [(float(p.x), float(p.y)) for p in diffraction_auto.peaks]
+
+    if "b1b3_canvas_nonce" not in st.session_state:
+        st.session_state["b1b3_canvas_nonce"] = 0
+    if "b1b3_last_clicked_points_xy" not in st.session_state:
+        st.session_state["b1b3_last_clicked_points_xy"] = []
+    if "b1b3_last_canvas_points_xy" not in st.session_state:
+        st.session_state["b1b3_last_canvas_points_xy"] = []
+    if "b1b3_manual_points_bank_xy" not in st.session_state:
+        st.session_state["b1b3_manual_points_bank_xy"] = []
+    if st.session_state.get("b1b3_last_selection_mode") != selection_mode:
+        st.session_state["b1b3_last_selection_mode"] = selection_mode
+        st.session_state["b1b3_canvas_nonce"] = int(st.session_state["b1b3_canvas_nonce"]) + 1
+        st.session_state["b1b3_last_clicked_points_xy"] = []
+        st.session_state["b1b3_last_canvas_points_xy"] = []
+        st.session_state["b1b3_manual_points_bank_xy"] = []
+
+    _render_preview_metrics(
+        quality=quality,
+        calibration=calibration,
+        diffraction_auto=diffraction_auto,
+    )
+    _render_preview_images(
+        original_image=original_image,
+        processed_image=processed_image,
+        fft_image_norm=fft_image_norm,
+    )
+
+    manual_points_xy: list[tuple[float, float]] = []
+    manual_points_refined_xy: list[tuple[float, float]] = []
+    manual_refine_warnings: list[str] = []
+    manual_refine_diagnostics: dict[str, Any] = {
+        "enabled": False,
+        "method": "none",
+        "point_count": 0,
+        "refined_count": 0,
+        "mean_shift_px": 0.0,
+        "max_shift_px": 0.0,
+        "fallback_count": 0,
+    }
+    vector_basis_points_xy: list[tuple[float, float]] = []
+    vector_synth_points_xy: list[tuple[float, float]] = []
+    vector_synth_warnings: list[str] = []
+    vector_synth_diagnostics: dict[str, Any] = {"enabled": False, "mode": "none"}
+    auto_remove_peak_ids: list[int] = []
+    if selection_mode == MODE_AUTO_EDIT:
+        st.subheader("Auto Peak Review")
+        st.caption(
+            "Backup-style auto mode keeps the pipeline detector as the active spot source. "
+            "Use the exclusion list only for obvious false positives."
+        )
+        review_cols = st.columns(4)
+        review_cols[0].metric("Pipeline peaks", str(len(auto_points_xy)))
+        review_cols[1].metric("Manual points", "off")
+        review_cols[2].metric("Basis points", "n/a")
+        review_cols[3].metric("Mode", "Auto")
+        auto_options = list(range(len(auto_points_xy)))
+        auto_remove_peak_ids = st.multiselect(
+            "Exclude auto peak ids",
+            options=auto_options,
+            default=[],
+            format_func=lambda idx: (
+                f"{int(idx)}: x={float(auto_points_xy[int(idx)][0]):.1f}, "
+                f"y={float(auto_points_xy[int(idx)][1]):.1f}"
+            ),
+            key="b1b3_auto_remove_peak_ids_main",
+        )
+        if auto_remove_peak_ids:
+            st.caption(
+                f"{len(auto_remove_peak_ids)} auto peak(s) excluded from the active spot set."
+            )
+        else:
+            st.caption("No auto peaks excluded.")
+
+    if selection_mode == MODE_TWO_VECTOR:
+        st.subheader("Manual Basis Selection On FFT")
+        st.caption(
+            "Click two basis points directly on the FFT image. The app immediately "
+            "synthesizes lattice spots from those two vectors, matching the backup UI flow."
+        )
+
+        canvas_bg, sx, sy = _to_fft_display_image(fft_image_norm, max_side=900)
+        canvas_col, status_col = st.columns([1.05, 0.95])
+        with canvas_col:
+            st.write("Click two FFT basis points:")
+            canvas_key = (
+                f"b1b3-fft-basis-canvas-"
+                f"{int(st.session_state.get('b1b3_canvas_nonce', 0))}"
+            )
+            canvas_result = st_canvas(
+                fill_color="rgba(255,255,255,0.25)",
+                stroke_width=2,
+                stroke_color="#00ffaa",
+                background_image=canvas_bg,
+                drawing_mode="point",
+                point_display_radius=4,
+                display_toolbar=True,
+                update_streamlit=True,
+                height=canvas_bg.height,
+                width=canvas_bg.width,
+                key=canvas_key,
+            )
+            if st.button("Clear Basis Points", key="b1b3_clear_basis_points_btn"):
+                st.session_state["b1b3_canvas_nonce"] = int(
+                    st.session_state.get("b1b3_canvas_nonce", 0)
+                ) + 1
+                st.session_state["b1b3_last_clicked_points_xy"] = []
+                st.session_state["b1b3_last_canvas_points_xy"] = []
+                st.session_state["b1b3_manual_points_bank_xy"] = []
+                st.rerun()
+
+        clicked_points_xy = _extract_canvas_points_xy(canvas_result, sx=sx, sy=sy)
+        if clicked_points_xy:
+            st.session_state["b1b3_last_clicked_points_xy"] = list(clicked_points_xy)
+            st.session_state["b1b3_last_canvas_points_xy"] = list(clicked_points_xy)
+
+        manual_points_xy = _deduplicate_points(
+            list(st.session_state.get("b1b3_last_canvas_points_xy", [])),
+            min_distance_px=float(manual_min_distance),
+        )
+        if len(manual_points_xy) > int(manual_max_points):
+            manual_points_xy = manual_points_xy[: int(manual_max_points)]
+        st.session_state["b1b3_manual_points_bank_xy"] = list(manual_points_xy)
+        manual_points_refined_xy = list(manual_points_xy)
+
+        refine_active = bool(manual_refine_enabled) and str(manual_refine_method) != "none"
+        if refine_active and manual_points_xy:
+            (
+                manual_points_refined_xy,
+                manual_refine_diagnostics,
+                manual_refine_warnings,
+            ) = _refine_manual_points(
+                manual_points_xy,
+                fft_log_magnitude=np.asarray(fft_analysis.log_magnitude, dtype=np.float64),
+                method=str(manual_refine_method),
+                window_radius=int(manual_refine_window_radius),
+                max_shift_px=float(manual_refine_max_shift_px),
+            )
+            manual_points_refined_xy = _deduplicate_points(
+                manual_points_refined_xy,
+                min_distance_px=float(manual_min_distance),
+            )
+            if len(manual_points_refined_xy) > int(manual_max_points):
+                manual_points_refined_xy = manual_points_refined_xy[
+                    : int(manual_max_points)
+                ]
+            manual_refine_diagnostics["refined_count"] = int(len(manual_points_refined_xy))
+        else:
+            manual_refine_diagnostics = {
+                "enabled": bool(refine_active),
+                "method": str(manual_refine_method),
+                "point_count": int(len(manual_points_xy)),
+                "refined_count": int(len(manual_points_refined_xy)),
+                "mean_shift_px": 0.0,
+                "max_shift_px": 0.0,
+                "fallback_count": 0,
+            }
+
+        with status_col:
+            st.write(f"Clicked points: {len(manual_points_xy)}")
+            if manual_points_refined_xy:
+                st.code(
+                    "\n".join(
+                        f"{idx + 1}: x={pt[0]:.2f}, y={pt[1]:.2f}"
+                        for idx, pt in enumerate(manual_points_refined_xy)
+                    ),
+                    language="text",
+                )
+            else:
+                st.info("Click two FFT spots to define g1 and g2.")
+            if len(manual_points_refined_xy) >= 2:
+                st.success("Two basis spots are ready for vector synthesis.")
+            if bool(manual_refine_diagnostics.get("enabled")) and manual_points_refined_xy:
+                st.caption(
+                    "Refine "
+                    f"{manual_refine_diagnostics.get('method')} | "
+                    "mean shift="
+                    f"{float(manual_refine_diagnostics.get('mean_shift_px', 0.0)):.3f}px | "
+                    "max shift="
+                    f"{float(manual_refine_diagnostics.get('max_shift_px', 0.0)):.3f}px | "
+                    f"fallback={int(manual_refine_diagnostics.get('fallback_count', 0))}"
+                )
+                point_pairs = manual_refine_diagnostics.get("point_pairs")
+                if isinstance(point_pairs, list) and point_pairs:
+                    st.dataframe(point_pairs, use_container_width=True, height=180)
+
+    if selection_mode == MODE_AUTO_EDIT:
+        remove_id_set = {int(item) for item in auto_remove_peak_ids}
+        auto_kept_points_xy = [
+            (float(pt[0]), float(pt[1]))
+            for idx, pt in enumerate(auto_points_xy)
+            if int(idx) not in remove_id_set
+        ]
+        selected_points_xy = _deduplicate_points(
+            list(auto_kept_points_xy) + list(manual_points_refined_xy),
+            min_distance_px=float(manual_min_distance),
+        )
+    elif selection_mode == MODE_TWO_VECTOR:
+        basis_candidates = (
+            list(manual_points_refined_xy)
+            if manual_points_refined_xy
+            else list(manual_points_xy)
+        )
+        if len(basis_candidates) < 2:
+            st.warning("Please click at least two FFT spots as basis vectors g1/g2.")
+            selected_points_xy = []
+        else:
+            if len(basis_candidates) > 2:
+                st.warning(
+                    "More than two points were clicked. "
+                    "Only the first two are used as basis vectors."
+                )
+            vector_basis_points_xy = [basis_candidates[0], basis_candidates[1]]
+            h, w = fft_image_norm.shape
+            (
+                vector_synth_points_xy,
+                vector_synth_diagnostics,
+                vector_synth_warnings,
+            ) = _synthesize_points_from_two_basis(
+                center_xy=(float(fft_analysis.center[0]), float(fft_analysis.center[1])),
+                basis_points_xy=vector_basis_points_xy,
+                shape_hw=(int(h), int(w)),
+                fft_log_magnitude=np.asarray(fft_analysis.log_magnitude, dtype=np.float64),
+                auto_points_xy=list(auto_points_xy),
+                max_order=int(vector_expand_order),
+                min_distance_px=float(manual_min_distance),
+                snap_mode=str(vector_snap_mode),
+                snap_radius_px=float(vector_snap_radius_px),
+                local_intensity_percentile=float(vector_local_intensity_percentile),
+                max_points=int(vector_max_points),
+            )
+            selected_points_xy = list(vector_synth_points_xy)
+            if vector_synth_diagnostics.get("enabled"):
+                st.caption(
+                    "Vector synthesis: "
+                    f"selected={int(vector_synth_diagnostics.get('selected_count', 0))}, "
+                    f"dropped={int(vector_synth_diagnostics.get('dropped_non_basis_count', 0))}, "
+                    "basis angle="
+                    f"{float(vector_synth_diagnostics.get('basis_angle_deg', 0.0)):.2f} deg"
+                )
+                pair_rows = vector_synth_diagnostics.get("seed_to_selected_pairs")
+                if isinstance(pair_rows, list) and pair_rows:
+                    st.dataframe(
+                        pair_rows[: min(120, len(pair_rows))],
+                        use_container_width=True,
+                        height=200,
+                    )
+    else:
+        selected_points_xy = list(auto_points_xy)
+
+    manual_signature = _json_signature(
+        {
+            "mode": selection_mode,
+            "selected_points_xy": _round_points_for_signature(selected_points_xy),
+            "fft_center": _round_points_for_signature(
+                [(float(fft_analysis.center[0]), float(fft_analysis.center[1]))]
+            ),
+            "calibration_scale": _measurement_value(
+                getattr(calibration, "diffraction_scale", None)
+            ),
+            "calibration_scale_unc": _measurement_uncertainty(
+                getattr(calibration, "diffraction_scale", None)
+            ),
+            "diffraction": diffraction_params,
+            "candidate_phase_params": candidate_phase_params,
+            "candidate_phases": list(candidate_phases),
+            "manual_refine": manual_refine_diagnostics,
+            "vector_synthesis": vector_synth_diagnostics,
+            "auto_remove_peak_ids": [int(i) for i in auto_remove_peak_ids],
+        }
+    )
+    manual_cache = st.session_state.get("b1b3_manual_result_cache")
+    if isinstance(manual_cache, dict) and manual_cache.get("signature") == manual_signature:
+        manual_result = manual_cache["result"]
+    else:
+        manual_result = _build_manual_diffraction(
+            selected_points_xy=selected_points_xy,
+            fft_log_magnitude=np.asarray(fft_analysis.log_magnitude, dtype=np.float64),
+            fft_center=(float(fft_analysis.center[0]), float(fft_analysis.center[1])),
+            calibration=calibration,
+            diff_params=diffraction_params,
+            candidate_phase_params=candidate_phase_params,
+            candidate_phases=list(candidate_phases),
+        )
+        manual_result = _with_manual_context(
+            manual_result,
+            selection_mode=selection_mode,
+            selected_points_xy=selected_points_xy,
+            manual_refine_warnings=manual_refine_warnings,
+            vector_synth_warnings=vector_synth_warnings,
+            manual_refine_diagnostics=manual_refine_diagnostics,
+            vector_synth_diagnostics=vector_synth_diagnostics,
+            auto_remove_peak_ids=auto_remove_peak_ids,
+            manual_points_refined_xy=manual_points_refined_xy,
+        )
+        st.session_state["b1b3_manual_result_cache"] = {
+            "signature": manual_signature,
+            "result": manual_result,
+        }
+
+    overlay_fig = _plot_peak_overlay(
+        fft_image_norm,
+        center_xy=(float(fft_analysis.center[0]), float(fft_analysis.center[1])),
+        auto_points_xy=auto_points_xy,
+        selected_points_xy=selected_points_xy,
+        manual_raw_points_xy=(
+            manual_points_xy if selection_mode in {MODE_AUTO_EDIT, MODE_TWO_VECTOR} else []
+        ),
+        manual_refined_points_xy=(
+            manual_points_refined_xy if selection_mode in {MODE_AUTO_EDIT, MODE_TWO_VECTOR} else []
+        ),
+        basis_points_xy=(vector_basis_points_xy if selection_mode == MODE_TWO_VECTOR else []),
+        annotate_auto_ids=overlay_label_mode in {"Auto peaks", "Both"},
+        annotate_selected_ids=overlay_label_mode in {"Selected points", "Both"},
+    )
+    st.pyplot(overlay_fig, clear_figure=True)
+    st.caption(
+        "Overlay number equals table `peak_id`: `auto` -> `Auto (pipeline)`, "
+        "`selected` -> `Selected points`."
+    )
+    st.caption(
+        "The red `selected` markers are the active spot set for the selected mode."
+    )
+
+    auto_rows = _build_peak_rows(
+        peaks=list(diffraction_auto.peaks),
+        g_vectors=list(diffraction_auto.g_vectors),
+        d_by_peak=list(diffraction_auto.d_spacings),
+        indexed_spots=list(diffraction_auto.indexed_spots),
+    )
+    selected_rows = _build_peak_rows(
+        peaks=list(manual_result["peaks"]),
+        g_vectors=list(manual_result["g_vectors"]),
+        d_by_peak=list(manual_result["d_by_peak"]),
+        indexed_spots=list(manual_result["indexed_spots"]),
+    )
+    align_target_rows = auto_rows if align_target_mode == "Auto (pipeline)" else selected_rows
+    align_target_candidates = _build_align_candidates(align_target_rows, id_key="peak_id")
+    align_signature = _json_signature(
+        {
+            "manual_rows": manual_spot_rows,
+            "target_rows": align_target_candidates,
+            "max_g_rel": float(align_max_g_rel),
+            "max_d_rel": float(align_max_d_rel),
+            "max_angle_deg": float(align_max_angle_deg),
+            "weight_g": float(align_weight_g),
+            "weight_d": float(align_weight_d),
+            "weight_angle": float(align_weight_angle),
+            "angle_step_deg": float(align_angle_step_deg),
+        }
+    )
+    align_cache = st.session_state.get("b1b3_manual_align_cache")
+    if isinstance(align_cache, dict) and align_cache.get("signature") == align_signature:
+        align_result = align_cache["result"]
+    else:
+        align_result = _align_manual_spot_table(
+            manual_rows=manual_spot_rows,
+            target_rows=align_target_candidates,
+            max_g_rel=float(align_max_g_rel),
+            max_d_rel=float(align_max_d_rel),
+            max_angle_deg=float(align_max_angle_deg),
+            weight_g=float(align_weight_g),
+            weight_d=float(align_weight_d),
+            weight_angle=float(align_weight_angle),
+            angle_step_deg=float(align_angle_step_deg),
+        )
+        st.session_state["b1b3_manual_align_cache"] = {
+            "signature": align_signature,
+            "result": align_result,
+        }
+
+    selected_tab_label = (
+        "Auto review set"
+        if selection_mode == MODE_AUTO_EDIT
+        else "Vector synthesis set"
+    )
+    tab_auto, tab_selected, tab_manual_align, tab_b1, tab_diag = st.tabs(
+        [
+            "Auto (pipeline)",
+            selected_tab_label,
+            "Manual table align",
+            "B1 details",
+            "Warnings / Provenance",
+        ]
+    )
+
+    with tab_auto:
+        st.caption("Current main pipeline output (`run_diffraction_analysis`).")
+        st.dataframe(auto_rows, use_container_width=True, height=300)
+        st.subheader("Auto Phase Candidates")
+        st.dataframe(
+            _build_phase_rows(list(diffraction_auto.phase_candidates)),
+            use_container_width=True,
+        )
+
+    with tab_selected:
+        if selection_mode == MODE_AUTO_EDIT:
+            st.caption(
+                "Active auto-mode spot set after applying the exclusion list. "
+                "This keeps the backup UI's clear separation between pipeline peaks "
+                "and review output."
+            )
+        else:
+            st.caption(
+                "Active vector-mode spot set synthesized from the two basis points. "
+                "This panel uses the current B3/B4 code paths for metrics and indexing."
+            )
+        st.dataframe(selected_rows, use_container_width=True, height=300)
+        st.subheader("Selected Phase Candidates")
+        st.dataframe(
+            _build_phase_rows(list(manual_result["phase_candidates"])),
+            use_container_width=True,
+        )
+
+    with tab_manual_align:
+        st.caption(
+            "Import manual spot table and auto-align with current peak table for error statistics."
+        )
+        st.write(f"Table source: `{manual_table_source}` | Align target: `{align_target_mode}`")
+        if manual_spot_rows:
+            st.subheader("Imported Manual Spot Table")
+            st.dataframe(manual_spot_rows, use_container_width=True, height=220)
+        else:
+            st.info("Upload or paste manual spot table to enable alignment stats.")
+
+        align_warnings = list(manual_table_parse_warnings)
+        align_warnings.extend(list(align_result.get("warnings", [])))
+        if align_warnings:
+            for text in dict.fromkeys(align_warnings):
+                st.warning(str(text))
+
+        if not align_result.get("matches"):
+            st.info("No valid alignment result yet.")
+        else:
+            summary = align_result.get("summary", {})
+            metric_cols = st.columns(6)
+            metric_cols[0].metric(
+                "Matched",
+                f"{align_result.get('matched_count', 0)} / {align_result.get('manual_count', 0)}",
+            )
+            metric_cols[1].metric(
+                "Angle offset (deg)",
+                f"{float(align_result.get('angle_offset_deg', 0.0)):.2f}",
+            )
+            metric_cols[2].metric("Mirror sign", str(int(align_result.get("sign", 1))))
+            metric_cols[3].metric(
+                "d mean err (%)",
+                f"{float(summary.get('d_rel_mean_pct', 0.0)):.3f}",
+            )
+            metric_cols[4].metric(
+                "g mean err (%)",
+                f"{float(summary.get('g_rel_mean_pct', 0.0)):.3f}",
+            )
+            angle_mean = summary.get("angle_mean_deg")
+            metric_cols[5].metric(
+                "angle mean err (deg)",
+                "-" if angle_mean is None else f"{float(angle_mean):.3f}",
+            )
+            st.subheader("Matched Spot Error Table")
+            st.dataframe(
+                list(align_result.get("matches", [])),
+                use_container_width=True,
+                height=300,
+            )
+            unmatched_manual = list(align_result.get("manual_unmatched", []))
+            unmatched_target = list(align_result.get("target_unmatched", []))
+            if unmatched_manual:
+                st.subheader("Unmatched Manual Spots")
+                st.dataframe(unmatched_manual, use_container_width=True, height=180)
+            if unmatched_target:
+                st.subheader("Unmatched Target Peaks")
+                st.dataframe(unmatched_target, use_container_width=True, height=180)
+
+    with tab_b1:
+        cal = calibration
+        cal_rows = [
+            {
+                "item": "pixel_size",
+                "value": (
+                    "-"
+                    if cal.pixel_size is None
+                    else f"{cal.pixel_size.value} {cal.pixel_size.unit or ''}"
+                ),
+                "uncertainty": None if cal.pixel_size is None else cal.pixel_size.uncertainty,
+                "method": None if cal.pixel_size is None else cal.pixel_size.method,
+            },
+            {
+                "item": "diffraction_scale",
+                "value": (
+                    "-"
+                    if cal.diffraction_scale is None
+                    else f"{cal.diffraction_scale.value} {cal.diffraction_scale.unit or ''}"
+                ),
+                "uncertainty": (
+                    None if cal.diffraction_scale is None else cal.diffraction_scale.uncertainty
+                ),
+                "method": None if cal.diffraction_scale is None else cal.diffraction_scale.method,
+            },
+            {
+                "item": "camera_length",
+                "value": (
+                    "-"
+                    if cal.camera_length is None
+                    else f"{cal.camera_length.value} {cal.camera_length.unit or ''}"
+                ),
+                "uncertainty": None if cal.camera_length is None else cal.camera_length.uncertainty,
+                "method": None if cal.camera_length is None else cal.camera_length.method,
+            },
+            {
+                "item": "voltage",
+                "value": (
+                    "-"
+                    if cal.voltage is None
+                    else f"{cal.voltage.value} {cal.voltage.unit or ''}"
+                ),
+                "uncertainty": None if cal.voltage is None else cal.voltage.uncertainty,
+                "method": None if cal.voltage is None else cal.voltage.method,
+            },
+        ]
+        st.dataframe(cal_rows, use_container_width=True, hide_index=True)
+        transform = cal.transform if isinstance(cal.transform, dict) else {}
+        source_rows = [
+            {"source_item": "pixel_source", "value": transform.get("pixel_source")},
+            {"source_item": "voltage_source", "value": transform.get("voltage_source")},
+            {"source_item": "diffraction_source", "value": transform.get("diffraction_source")},
+            {"source_item": "method", "value": transform.get("method")},
+        ]
+        st.subheader("Calibration Sources")
+        st.dataframe(source_rows, use_container_width=True, hide_index=True)
+
+        metadata_norm = {}
+        if isinstance(dataset.metadata, dict):
+            metadata_norm = dataset.metadata.get("normalized", {})
+            if not isinstance(metadata_norm, dict):
+                metadata_norm = {}
+        st.subheader("Parsed Input Metadata")
+        st.json(
+            {
+                "source_format": metadata_norm.get("source_format"),
+                "pixel_size_nm": metadata_norm.get("pixel_size_nm"),
+                "accelerating_voltage_kv": metadata_norm.get("accelerating_voltage_kv"),
+                "camera_length_mm": metadata_norm.get("camera_length_mm"),
+                "magnification": metadata_norm.get("magnification"),
+                "metadata_completeness": metadata_norm.get("metadata_completeness"),
+                "metadata_confidence": metadata_norm.get("metadata_confidence"),
+            }
+        )
+        st.subheader("Quality Provenance")
+        st.json(quality.provenance)
+
+    with tab_diag:
+        warnings = []
+        warnings.extend(list(candidate_phase_warnings))
+        warnings.extend(list(manual_table_parse_warnings))
+        warnings.extend(list(align_result.get("warnings", [])))
+        warnings.extend(list(dataset.warnings))
+        warnings.extend(list(quality.warnings))
+        warnings.extend(list(calibration.warnings))
+        warnings.extend(list(preprocessing.warnings))
+        warnings.extend(list(diffraction_auto.warnings))
+        warnings.extend(list(fft_warnings))
+        warnings.extend(list(manual_result["warnings"]))
+        if warnings:
+            for warning in dict.fromkeys(warnings):
+                if str(warning).startswith("BLOCKING:"):
+                    st.error(str(warning))
+                elif str(warning).startswith("WARNING:"):
+                    st.warning(str(warning))
+                else:
+                    st.info(str(warning))
+        else:
+            st.success("No warnings.")
+
+        st.subheader("Provenance")
+        st.markdown("**Auto diffraction provenance**")
+        st.json(diffraction_auto.provenance)
+        st.markdown("**Selected-point provenance**")
+        st.json(manual_result["provenance"])
+        st.markdown("**Manual-table alignment summary**")
+        st.json(
+            {
+                "table_source": manual_table_source,
+                "align_target": align_target_mode,
+                "manual_row_count": len(manual_spot_rows),
+                "target_row_count": len(align_target_candidates),
+                "matched_count": align_result.get("matched_count"),
+                "angle_offset_deg": align_result.get("angle_offset_deg"),
+                "mirror_sign": align_result.get("sign"),
+                "summary": align_result.get("summary"),
+            }
+        )
+
+        st.subheader("Run context")
+        st.code(
+            yaml.safe_dump(
+                {
+                    "input_path": str(input_path),
+                    "output_dir": str(run_dir),
+                    "signature_len": len(signature),
+                },
+                sort_keys=False,
+                allow_unicode=False,
+            )
+        )
+
+
+if __name__ == "__main__":
+    main()

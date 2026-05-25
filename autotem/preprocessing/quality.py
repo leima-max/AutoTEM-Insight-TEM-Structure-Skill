@@ -145,6 +145,20 @@ def _load_from_uri(uri: str | None) -> np.ndarray | None:
         if image.ndim == 3:
             image = image.mean(axis=2)
         return np.asarray(image, dtype=np.float64) if image.ndim == 2 else None
+    # Fallback for microscopy formats handled by autotem.io readers
+    # (e.g., dm3/dm4/mrc/h5/emd/ser) that are not directly loadable here.
+    try:
+        from autotem.io.readers import read_image
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        read_result = read_image(path)
+    except Exception:  # noqa: BLE001
+        return None
+    array = np.asarray(read_result.array, dtype=np.float64)
+    if array.ndim == 3:
+        array = array.mean(axis=2)
+    return array if array.ndim == 2 else None
     return None
 
 

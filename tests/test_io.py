@@ -121,6 +121,27 @@ def test_metadata_unit_conversion_regression(raw: dict[str, str], expected_nm: f
     assert normalized["pixel_size_nm"] == pytest.approx(expected_nm)
 
 
+def test_dm_metadata_mapping_from_filedm_style_keys() -> None:
+    normalized, warnings = normalize_metadata(
+        {
+            "Calibrations Dimension 1 Scale": 0.008509393,
+            "Microscope Info Formatted Voltage": "200kV",
+            "Microscope Info STEM Camera Length": 400.0,
+            "Microscope Info Indicated Magnification": 1200000.0,
+        },
+        source_format="dm",
+    )
+    assert normalized["pixel_size_nm"] == pytest.approx(0.008509393)
+    assert normalized["accelerating_voltage_kv"] == pytest.approx(200.0)
+    assert normalized["camera_length_mm"] == pytest.approx(400.0)
+    assert normalized["magnification"] == pytest.approx(1200000.0)
+    warning_codes = {w["code"] for w in warnings}
+    assert "META_MISSING_PIXEL_SIZE" not in warning_codes
+    assert "META_MISSING_VOLTAGE" not in warning_codes
+    assert "META_MISSING_CAMERA_LENGTH" not in warning_codes
+    assert "META_MISSING_MAGNIFICATION" not in warning_codes
+
+
 @pytest.mark.parametrize(
     ("raw", "missing_code"),
     [

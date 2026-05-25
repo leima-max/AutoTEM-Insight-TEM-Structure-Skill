@@ -72,6 +72,24 @@ def test_b1_resolve_pixel_size_measurement_manual_reference() -> None:
     assert warnings == []
 
 
+def test_b1_resolve_pixel_size_prefers_scalebar_for_non_dm() -> None:
+    image = np.zeros((256, 256), dtype=np.float32)
+    image += 0.05
+    image[230:234, 140:240] = 1.0
+    dataset = _dataset_from_image(
+        image,
+        pixel_size_nm=1.2,
+        metadata={"normalized": {"source_format": "png", "pixel_size_nm": 1.2}},
+    )
+    dataset.source_path = "sample_with_scalebar_50nm.png"
+
+    measurement, source, warnings = resolve_pixel_size_measurement(dataset)
+    assert measurement is not None
+    assert measurement.value == pytest.approx(0.5, rel=0.15)
+    assert "scalebar" in source.lower()
+    assert not any("could not be resolved" in warning for warning in warnings)
+
+
 def test_b1_diffraction_scale_from_known_d_spacing() -> None:
     scale, uncertainty = diffraction_scale_from_known_d_spacing(
         known_d_spacing_nm=0.2,

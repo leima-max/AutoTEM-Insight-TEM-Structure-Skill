@@ -55,6 +55,7 @@ def detect_peaks_with_adapter(
     top_k: int,
     min_distance: int,
     center_exclusion_radius: float,
+    max_peak_radius_px: float | None,
     threshold_strategy: str,
     threshold_value: float | None,
     subpixel_window_radius: int,
@@ -62,6 +63,8 @@ def detect_peaks_with_adapter(
     detector: str,
     detector_sigma: float,
     dog_sigma_ratio: float,
+    radius_outlier_filter: bool,
+    radius_outlier_mad_factor: float,
 ) -> tuple[list[DiffractionPeak], dict[str, Any], list[str]]:
     """
     Adapter entry point for B3 peak detection.
@@ -83,6 +86,11 @@ def detect_peaks_with_adapter(
         top_k=max(1, int(top_k)),
         min_distance=max(1, int(min_distance)),
         center_exclusion_radius=max(0.0, float(center_exclusion_radius)),
+        max_peak_radius_px=(
+            None
+            if max_peak_radius_px is None or float(max_peak_radius_px) <= 0
+            else float(max_peak_radius_px)
+        ),
         threshold_strategy=threshold_strategy,
         threshold_value=threshold_value,
         subpixel_window_radius=max(1, int(subpixel_window_radius)),
@@ -90,6 +98,8 @@ def detect_peaks_with_adapter(
         detector=chosen_detector,
         detector_sigma=max(0.2, float(detector_sigma)),
         dog_sigma_ratio=max(1.2, float(dog_sigma_ratio)),
+        radius_outlier_filter=bool(radius_outlier_filter),
+        radius_outlier_mad_factor=max(2.0, float(radius_outlier_mad_factor)),
     )
 
     warnings = list(warnings)

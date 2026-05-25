@@ -51,6 +51,7 @@ _VOLT_RE = re.compile(
     re.IGNORECASE,
 )
 _EXTERNAL_OCR_READER: OCRReader | None = None
+_DM_SOURCE_FORMATS = {"dm", "dm3", "dm4"}
 
 
 def _normalize_unit(unit: str | None) -> str | None:
@@ -77,6 +78,22 @@ def _to_float(value: Any) -> float | None:
         if match:
             return float(match.group(0))
     return None
+
+
+def _to_bool(value: Any, default: bool | None = None) -> bool | None:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return default
 
 
 def _parse_length(value: Any, fallback_unit: str | None = None) -> tuple[float | None, str | None]:
@@ -505,7 +522,29 @@ def _load_dataset_image(dataset: TEMDataset) -> np.ndarray | None:
         if image.ndim == 3:
             image = image.mean(axis=2)
         return np.asarray(image, dtype=np.float64) if image.ndim == 2 else None
-    return None
+    try:
+        from autotem.io.readers import read_image
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        read_result = read_image(path)
+    except Exception:  # noqa: BLE001
+        return None
+    image = np.asarray(read_result.array, dtype=np.float64)
+    return image if image.ndim == 2 else None
+
+
+def _resolve_dataset_source_format(dataset: TEMDataset) -> str:
+    metadata = dataset.metadata if isinstance(dataset.metadata, dict) else {}
+    normalized = metadata.get("normalized", {}) if isinstance(metadata, dict) else {}
+    if isinstance(normalized, dict):
+        source_format = normalized.get("source_format")
+        if isinstance(source_format, str) and source_format.strip():
+            return source_format.strip().lower().lstrip(".")
+    source_path = str(dataset.source_path or "").strip().lower()
+    if "." in source_path:
+        return source_path.rsplit(".", 1)[-1]
+    return "unknown"
 
 
 def resolve_pixel_size_measurement(
@@ -518,6 +557,13 @@ def resolve_pixel_size_measurement(
     params = dict(parameters or {})
     ref = dict(reference or {})
     warnings: list[str] = []
+    source_format = _resolve_dataset_source_format(dataset)
+    scalebar_attempted = False
+
+    prefer_scalebar = _to_bool(params.get("prefer_scalebar"), default=None)
+    if prefer_scalebar is None:
+        auto_non_dm = _to_bool(params.get("auto_scalebar_for_non_dm"), default=True)
+        prefer_scalebar = bool(auto_non_dm) and source_format not in _DM_SOURCE_FORMATS
 
     explicit = _to_float(params.get("pixel_size_nm"))
     if explicit is not None and explicit > 0:
@@ -535,6 +581,56 @@ def resolve_pixel_size_measurement(
             confidence=0.95,
         )
         return measurement, "parameter.pixel_size_nm", warnings
+
+    ref_length = ref.get("reference_length", ref.get("known_length"))
+    ref_pixels = ref.get("reference_pixels", ref.get("pixel_span"))
+    if ref_length is not None and ref_pixels is not None:
+        ref_unit = str(ref.get("reference_unit", ref.get("known_length_unit", "nm")))
+        try:
+            pixel_nm = manual_pixel_size_from_reference(
+                reference_length=ref_length,
+                reference_pixels=ref_pixels,
+                reference_unit=ref_unit,
+            )
+        except ValueError as exc:
+            warnings.append(f"Manual pixel calibration is invalid: {exc}")
+        else:
+            measurement = Measurement(
+                value=float(pixel_nm),
+                unit="nm/pixel",
+                method="manual_reference_length",
+                provenance={"source": "calibration.reference"},
+                confidence=0.9,
+            )
+            return measurement, "manual_reference_length", warnings
+
+    if prefer_scalebar:
+        scalebar_attempted = True
+        image = _load_dataset_image(dataset)
+        if image is None:
+            warnings.append(
+                "Scale-bar auto detection skipped because image data cannot be loaded from current source."
+            )
+        else:
+            pixel_nm, source, scale_warnings = infer_pixel_size_from_scalebar(
+                image,
+                metadata=dataset.metadata if isinstance(dataset.metadata, dict) else None,
+                file_hint=dataset.source_path,
+            )
+            warnings.extend(scale_warnings)
+            if pixel_nm is not None and pixel_nm > 0:
+                measurement = Measurement(
+                    value=float(pixel_nm),
+                    unit="nm/pixel",
+                    method="scalebar",
+                    provenance={"source": source},
+                    confidence=0.75,
+                    warnings=list(scale_warnings),
+                )
+                return measurement, source, warnings
+            warnings.append(
+                "Scale-bar auto detection did not lock a valid pixel size; fallback to metadata/other calibration."
+            )
 
     if dataset.pixel_size is not None:
         unit = dataset.pixel_size.unit or "nm"
@@ -563,46 +659,25 @@ def resolve_pixel_size_measurement(
             )
             return measurement, "metadata.normalized.pixel_size_nm", warnings
 
-    ref_length = ref.get("reference_length", ref.get("known_length"))
-    ref_pixels = ref.get("reference_pixels", ref.get("pixel_span"))
-    if ref_length is not None and ref_pixels is not None:
-        ref_unit = str(ref.get("reference_unit", ref.get("known_length_unit", "nm")))
-        try:
-            pixel_nm = manual_pixel_size_from_reference(
-                reference_length=ref_length,
-                reference_pixels=ref_pixels,
-                reference_unit=ref_unit,
+    if not scalebar_attempted:
+        image = _load_dataset_image(dataset)
+        if image is not None:
+            pixel_nm, source, scale_warnings = infer_pixel_size_from_scalebar(
+                image,
+                metadata=dataset.metadata if isinstance(dataset.metadata, dict) else None,
+                file_hint=dataset.source_path,
             )
-        except ValueError as exc:
-            warnings.append(f"Manual pixel calibration is invalid: {exc}")
-        else:
-            measurement = Measurement(
-                value=float(pixel_nm),
-                unit="nm/pixel",
-                method="manual_reference_length",
-                provenance={"source": "calibration.reference"},
-                confidence=0.9,
-            )
-            return measurement, "manual_reference_length", warnings
-
-    image = _load_dataset_image(dataset)
-    if image is not None:
-        pixel_nm, source, scale_warnings = infer_pixel_size_from_scalebar(
-            image,
-            metadata=dataset.metadata if isinstance(dataset.metadata, dict) else None,
-            file_hint=dataset.source_path,
-        )
-        warnings.extend(scale_warnings)
-        if pixel_nm is not None and pixel_nm > 0:
-            measurement = Measurement(
-                value=float(pixel_nm),
-                unit="nm/pixel",
-                method="scalebar",
-                provenance={"source": source},
-                confidence=0.75,
-                warnings=list(scale_warnings),
-            )
-            return measurement, source, warnings
+            warnings.extend(scale_warnings)
+            if pixel_nm is not None and pixel_nm > 0:
+                measurement = Measurement(
+                    value=float(pixel_nm),
+                    unit="nm/pixel",
+                    method="scalebar",
+                    provenance={"source": source},
+                    confidence=0.75,
+                    warnings=list(scale_warnings),
+                )
+                return measurement, source, warnings
 
     warnings.append("Pixel size could not be resolved from parameters, metadata, or scalebar.")
     return None, "unresolved", warnings

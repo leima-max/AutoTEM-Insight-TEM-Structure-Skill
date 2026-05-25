@@ -1,0 +1,50 @@
+workflow:
+  name: hrtem_fft_phase
+  description: HRTEM FFT, d-spacing, indexing, and phase-candidate workflow with B1 calibration controls.
+  steps:
+    - load
+    - assess_quality
+    - calibrate
+    - preprocess
+    - fft
+    - diffraction_peaks
+    - index_diffraction
+    - phase_match
+    - report
+  parameters:
+    calibration:
+      method: reference
+      diffraction_calibration_engine: internal
+      voltage_kv: 200
+      pixel_size_nm: 0.02
+      pixel_size_uncertainty_nm: 0.001
+      known_d_spacing: 0.213
+      known_d_spacing_unit: nm
+      known_d_uncertainty_nm: 0.002
+      measured_radius_px: 46.5
+      measured_radius_uncertainty_px: 0.25
+      detector_pixel_size_um: 15.0
+      reference:
+        material: Si
+        reflection: "220"
+        note: Replace known_d_spacing and measured_radius_px with your calibration reference.
+        # Optional adapter choices: internal, py4dstem, pyxem, auto
+    preprocessing:
+      recipe: min_max
+      clip_percentile_low: 1.0
+      clip_percentile_high: 99.0
+    diffraction:
+      top_k_peaks: 24
+      min_peak_distance: 3.0
+      center_exclusion_radius: 3.0
+      phase_top_n: 3
+      candidate_phases:
+        - Silicon
+        - Titanium Dioxide
+
+outputs:
+  formats:
+    - json
+    - csv
+    - html
+  save_intermediates: true

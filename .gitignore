@@ -13,6 +13,7 @@ dist/
 
 # Test and tooling caches
 .pytest_cache/
+pytest-of-*/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -22,6 +23,7 @@ htmlcov/
 outputs/
 results/
 reports/
+runs/
 *.h5
 *.hdf5
 *.zarr/
