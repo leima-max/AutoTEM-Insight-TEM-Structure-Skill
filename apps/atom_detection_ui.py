@@ -161,14 +161,39 @@ def _sample_intensity(image: np.ndarray, y: float, x: float) -> float:
     return float(image[yi, xi])
 
 
-def _render_overlay(image_norm: np.ndarray, coords: np.ndarray, roi_mask: np.ndarray | None):
+def _render_overlay(
+    image_norm: np.ndarray,
+    coords: np.ndarray,
+    roi_mask: np.ndarray | None,
+    reference_atom_mask: np.ndarray | None = None,
+):
     fig, ax = plt.subplots(figsize=(6.8, 6.8), dpi=160)
     ax.imshow(image_norm, cmap="gray")
     if roi_mask is not None:
         roi_show = np.ma.masked_where(~roi_mask, roi_mask)
         ax.imshow(roi_show, cmap="spring", alpha=0.28, interpolation="none")
     if len(coords) > 0:
-        ax.scatter(coords[:, 1], coords[:, 0], s=14, c="red", marker="o", linewidths=0.35)
+        ax.scatter(
+            coords[:, 1],
+            coords[:, 0],
+            s=14,
+            c="red",
+            marker="o",
+            linewidths=0.35,
+            label="edited atoms",
+        )
+        if reference_atom_mask is not None and np.any(reference_atom_mask):
+            ref_mask = np.asarray(reference_atom_mask, dtype=bool)
+            ax.scatter(
+                coords[ref_mask, 1],
+                coords[ref_mask, 0],
+                s=28,
+                facecolors="none",
+                edgecolors="#00ffff",
+                linewidths=0.8,
+                label="ideal lattice reference",
+            )
+            ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
     ax.set_title(f"Editable atoms: {len(coords)}")
     ax.axis("off")
     fig.tight_layout()
@@ -208,11 +233,16 @@ def _atom_strain_csv(
     displacement_unit: str,
     strain_scale: float,
     strain_unit: str,
+    custom_components: dict[str, np.ndarray] | None = None,
 ) -> str:
     buffer = io.StringIO()
     buffer.write(f"displacement_unit,{displacement_unit}\n")
     buffer.write(f"strain_unit,{strain_unit}\n")
-    buffer.write("atom_index,y,x,ux,uy,exx,eyy,exy,rotation,uncertainty,valid_fit\n")
+    header = ["atom_index", "y", "x", "ux", "uy", "exx", "eyy", "exy"]
+    if custom_components is not None:
+        header.extend(["eaa", "ebb", "eab"])
+    header.extend(["rotation", "uncertainty", "valid_fit"])
+    buffer.write(",".join(header) + "\n")
     for idx, (coord, disp_xy, exx, eyy, exy, rot, unc, valid) in enumerate(
         zip(
             coords,
@@ -232,11 +262,26 @@ def _atom_strain_csv(
         exx_scaled = float(exx) * strain_scale
         eyy_scaled = float(eyy) * strain_scale
         exy_scaled = float(exy) * strain_scale
-        buffer.write(
-            f"{idx},{float(y):.6f},{float(x):.6f},{ux:.6f},{uy:.6f},"
-            f"{exx_scaled:.6f},{eyy_scaled:.6f},{exy_scaled:.6f},"
-            f"{float(rot):.6f},{float(unc):.6f},{int(bool(valid))}\n"
-        )
+        row = [
+            f"{idx}",
+            f"{float(y):.6f}",
+            f"{float(x):.6f}",
+            f"{ux:.6f}",
+            f"{uy:.6f}",
+            f"{exx_scaled:.6f}",
+            f"{eyy_scaled:.6f}",
+            f"{exy_scaled:.6f}",
+        ]
+        if custom_components is not None:
+            row.extend(
+                [
+                    f"{float(custom_components['eaa'][idx]) * strain_scale:.6f}",
+                    f"{float(custom_components['ebb'][idx]) * strain_scale:.6f}",
+                    f"{float(custom_components['eab'][idx]) * strain_scale:.6f}",
+                ]
+            )
+        row.extend([f"{float(rot):.6f}", f"{float(unc):.6f}", f"{int(bool(valid))}"])
+        buffer.write(",".join(row) + "\n")
     return buffer.getvalue()
 
 
@@ -305,6 +350,43 @@ def _render_atom_strain_maps(
     return fig
 
 
+def _render_custom_basis_strain_maps(
+    eaa_map: np.ndarray,
+    ebb_map: np.ndarray,
+    eab_map: np.ndarray,
+    *,
+    strain_unit: str,
+    auto_color_range: bool,
+    strain_abs_limit: float,
+) -> plt.Figure:
+    eaa = np.asarray(eaa_map, dtype=np.float64)
+    ebb = np.asarray(ebb_map, dtype=np.float64)
+    eab = np.asarray(eab_map, dtype=np.float64)
+    if auto_color_range:
+        lim = max(
+            _symmetric_limit(eaa),
+            _symmetric_limit(ebb),
+            _symmetric_limit(eab),
+            1e-6,
+        )
+    else:
+        lim = max(float(strain_abs_limit), 1e-6)
+    fig, axes = plt.subplots(1, 3, figsize=(11.8, 4.2), dpi=150)
+    panels = [
+        (eaa, f"eaa [{strain_unit}]"),
+        (ebb, f"ebb [{strain_unit}]"),
+        (eab, f"eab [{strain_unit}]"),
+    ]
+    for ax, (arr, title) in zip(axes.flat, panels, strict=False):
+        im = ax.imshow(arr, cmap="coolwarm", vmin=-lim, vmax=lim)
+        ax.set_title(title, fontsize=10)
+        ax.axis("off")
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+        cbar.set_label(strain_unit, rotation=90)
+    fig.tight_layout()
+    return fig
+
+
 def _render_atom_strain_overlay(
     image_norm: np.ndarray,
     coords: np.ndarray,
@@ -362,12 +444,101 @@ def _figure_png_bytes(fig: plt.Figure) -> bytes:
 def _invalidate_atom_strain_state() -> None:
     st.session_state.atom_strain_fields = None
     st.session_state.atom_strain_meta = None
+    _invalidate_custom_basis_state()
+
+
+def _invalidate_custom_basis_state() -> None:
+    st.session_state.custom_basis_indices = {"base": None, "a": None, "b": None}
+    st.session_state.custom_basis_stage = 0
+    st.session_state.custom_basis_canvas_nonce = int(
+        st.session_state.get("custom_basis_canvas_nonce", 0)
+    ) + 1
+    st.session_state.custom_basis_message = ""
+
+
+def _disable_custom_basis_state() -> None:
+    st.session_state.custom_basis_enabled = False
+    _invalidate_custom_basis_state()
+
+
+def _coords_inside_roi_mask(coords: np.ndarray, roi_mask: np.ndarray | None) -> np.ndarray | None:
+    if roi_mask is None or len(coords) == 0:
+        return None
+    mask = np.asarray(roi_mask, dtype=bool)
+    yi = np.clip(np.round(coords[:, 0]).astype(int), 0, mask.shape[0] - 1)
+    xi = np.clip(np.round(coords[:, 1]).astype(int), 0, mask.shape[1] - 1)
+    return mask[yi, xi]
+
+
+def _project_strain_to_custom_basis(
+    exx: np.ndarray,
+    eyy: np.ndarray,
+    exy: np.ndarray,
+    *,
+    a_vec_yx: np.ndarray,
+    b_vec_yx: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    a_xy = np.array([float(a_vec_yx[1]), float(a_vec_yx[0])], dtype=np.float64)
+    b_xy = np.array([float(b_vec_yx[1]), float(b_vec_yx[0])], dtype=np.float64)
+    a_norm = float(np.linalg.norm(a_xy))
+    b_norm = float(np.linalg.norm(b_xy))
+    if a_norm <= 1e-9 or b_norm <= 1e-9:
+        raise ValueError("Custom basis vectors must have non-zero length.")
+    a_hat = a_xy / a_norm
+    b_hat = b_xy / b_norm
+    exx = np.asarray(exx, dtype=np.float64)
+    eyy = np.asarray(eyy, dtype=np.float64)
+    exy = np.asarray(exy, dtype=np.float64)
+    eaa = (a_hat[0] ** 2) * exx + 2.0 * a_hat[0] * a_hat[1] * exy + (a_hat[1] ** 2) * eyy
+    ebb = (b_hat[0] ** 2) * exx + 2.0 * b_hat[0] * b_hat[1] * exy + (b_hat[1] ** 2) * eyy
+    eab = (
+        a_hat[0] * b_hat[0] * exx
+        + (a_hat[0] * b_hat[1] + a_hat[1] * b_hat[0]) * exy
+        + a_hat[1] * b_hat[1] * eyy
+    )
+    return eaa, ebb, eab
+
+
+def _custom_basis_info(
+    coords: np.ndarray,
+    basis_indices: dict[str, int | None],
+) -> dict[str, Any] | None:
+    base_idx = basis_indices.get("base")
+    a_idx = basis_indices.get("a")
+    b_idx = basis_indices.get("b")
+    if base_idx is None or a_idx is None or b_idx is None:
+        return None
+    if any(idx < 0 or idx >= len(coords) for idx in (base_idx, a_idx, b_idx)):
+        return None
+    base = np.asarray(coords[base_idx], dtype=np.float64)
+    a_vec = np.asarray(coords[a_idx], dtype=np.float64) - base
+    b_vec = np.asarray(coords[b_idx], dtype=np.float64) - base
+    a_xy = np.array([a_vec[1], a_vec[0]], dtype=np.float64)
+    b_xy = np.array([b_vec[1], b_vec[0]], dtype=np.float64)
+    a_norm = float(np.linalg.norm(a_xy))
+    b_norm = float(np.linalg.norm(b_xy))
+    if a_norm <= 1e-9 or b_norm <= 1e-9:
+        return None
+    cosang = float(np.clip(np.dot(a_xy, b_xy) / (a_norm * b_norm), -1.0, 1.0))
+    angle_deg = float(np.degrees(np.arccos(cosang)))
+    return {
+        "base_idx": int(base_idx),
+        "a_idx": int(a_idx),
+        "b_idx": int(b_idx),
+        "base_yx": base,
+        "a_vec_yx": a_vec,
+        "b_vec_yx": b_vec,
+        "a_length_px": float(np.linalg.norm(a_vec)),
+        "b_length_px": float(np.linalg.norm(b_vec)),
+        "angle_deg": angle_deg,
+    }
 
 
 def _to_display_image(
     image_norm: np.ndarray,
     coords: np.ndarray,
     roi_mask: np.ndarray | None = None,
+    basis_markers: dict[str, tuple[float, float]] | None = None,
     max_side: int = 900,
 ) -> tuple[Image.Image, float, float]:
     h, w = image_norm.shape
@@ -401,6 +572,30 @@ def _to_display_image(
                 outline=(255, 48, 48),
                 width=1,
             )
+
+    if basis_markers:
+        color_map = {
+            "base": (0, 255, 255),
+            "a": (255, 220, 0),
+            "b": (255, 0, 255),
+        }
+        disp_points: dict[str, tuple[float, float]] = {}
+        for label, (y, x) in basis_markers.items():
+            cx = float(x / (w / disp_w))
+            cy = float(y / (h / disp_h))
+            disp_points[label] = (cx, cy)
+            rr = max(4, int(round(5.5 * scale)))
+            color = color_map.get(label, (0, 255, 255))
+            draw.ellipse(
+                (cx - rr, cy - rr, cx + rr, cy + rr),
+                outline=color,
+                width=2,
+            )
+            draw.text((cx + rr + 2, cy - rr - 2), label, fill=color)
+        if "base" in disp_points and "a" in disp_points:
+            draw.line([disp_points["base"], disp_points["a"]], fill=color_map["a"], width=2)
+        if "base" in disp_points and "b" in disp_points:
+            draw.line([disp_points["base"], disp_points["b"]], fill=color_map["b"], width=2)
 
     sx = w / disp_w
     sy = h / disp_h
@@ -468,6 +663,11 @@ for key, default in [
     ("last_run_summary", None),
     ("atom_strain_fields", None),
     ("atom_strain_meta", None),
+    ("custom_basis_indices", {"base": None, "a": None, "b": None}),
+    ("custom_basis_stage", 0),
+    ("custom_basis_canvas_nonce", 0),
+    ("custom_basis_message", ""),
+    ("custom_basis_enabled", False),
     ("distance_pixel_size", 0.02),
     ("distance_unit", "nm"),
     ("pixel_size_auto_nm", None),
@@ -627,14 +827,17 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Atom-Position Strain")
-    atom_strain_reference_mode = st.selectbox(
-        "Reference source",
-        ["Whole edited atom set", "Current ROI mask"],
-        index=0,
+    atom_strain_use_roi_reference = st.checkbox(
+        "Use current ROI as ideal lattice region",
+        value=False,
         help=(
-            "AI-STEM-inspired atom-column strain uses the current edited coordinates. "
-            "Use ROI mask when you want one local region to define the reference lattice."
+            "If enabled, the ROI drawn on the image will define the ideal/reference lattice "
+            "for atom-position strain, without forcing you to keep/remove atoms."
         ),
+    )
+    st.caption(
+        "Draw ROI in the image panel when you want a custom ideal-lattice reference area. "
+        "Leave this OFF to use the whole edited atom set as the reference."
     )
     atom_strain_neighbor_k = st.slider(
         "Atom strain neighbors", min_value=6, max_value=20, value=10, step=1
@@ -734,7 +937,12 @@ params = {
     "use_physical_unit": bool(use_physical_unit),
     "pixel_size": float(pixel_size),
     "distance_unit": str(distance_unit),
-    "atom_strain_reference_mode": str(atom_strain_reference_mode),
+    "atom_strain_reference_mode": (
+        "Current ROI mask"
+        if bool(atom_strain_use_roi_reference)
+        else "Whole edited atom set"
+    ),
+    "atom_strain_use_roi_reference": bool(atom_strain_use_roi_reference),
     "atom_strain_neighbor_k": int(atom_strain_neighbor_k),
     "atom_strain_tolerance_deg": float(atom_strain_tolerance_deg),
     "atom_strain_grid_step": int(atom_strain_grid_step),
@@ -904,7 +1112,8 @@ tool = st.radio(
 delete_radius = st.slider("Delete radius (px)", min_value=0.5, max_value=20.0, value=3.0, step=0.5)
 st.caption(
     "Usage: click/draw on image. "
-    "For ROI mode, `Keep/Remove` can auto-apply current ROI drawing."
+    "For ROI mode, `Keep/Remove` can auto-apply current ROI drawing. "
+    "The same ROI can also be reused as the ideal-lattice reference area in atom strain."
 )
 
 roi_action_col1, roi_action_col2 = st.columns(2)
@@ -1053,10 +1262,19 @@ if keep_inside or remove_inside:
         st.success(msg)
         st.rerun()
 
+prospective_reference_atom_mask = None
+if params["atom_strain_use_roi_reference"]:
+    prospective_reference_atom_mask = _coords_inside_roi_mask(coords, roi_mask)
+
 left, right = st.columns([1.45, 1.0])
 with left:
     st.subheader("Overlay")
-    fig = _render_overlay(norm, coords, roi_mask=roi_mask)
+    fig = _render_overlay(
+        norm,
+        coords,
+        roi_mask=roi_mask,
+        reference_atom_mask=prospective_reference_atom_mask,
+    )
     st.pyplot(fig)
 
 with right:
@@ -1132,6 +1350,19 @@ with right:
             st.code("\n".join(result.warnings), language="text")
     else:
         st.success("No warnings.")
+    if params["atom_strain_use_roi_reference"]:
+        if roi_mask is None:
+            st.info("Ideal lattice reference: ROI mode is ON. Draw/apply ROI to define it.")
+        elif prospective_reference_atom_mask is None or not np.any(prospective_reference_atom_mask):
+            st.warning(
+                "Current ROI will be used as ideal lattice region, "
+                "but no edited atoms are inside it yet."
+            )
+        else:
+            st.success(
+                "Current ROI will be used as ideal lattice region. "
+                f"Reference atoms: {int(np.sum(prospective_reference_atom_mask))}"
+            )
 
 st.subheader("Atom-Position Strain (AI-STEM inspired)")
 st.caption(
@@ -1151,6 +1382,19 @@ atom_strain_info_col.caption(
     f"tol={params['atom_strain_tolerance_deg']:.1f} deg | "
     f"grid step={params['atom_strain_grid_step']}"
 )
+if params["atom_strain_use_roi_reference"]:
+    if roi_mask is None:
+        st.info("Current ROI will be used as ideal lattice region after you draw/apply ROI.")
+    else:
+        ref_count = (
+            int(np.sum(prospective_reference_atom_mask))
+            if prospective_reference_atom_mask is not None
+            else 0
+        )
+        st.info(
+            "Current ROI will be used as ideal lattice region. "
+            f"Atoms participating in reference fit: {ref_count}"
+        )
 
 if run_atom_strain_button:
     if len(coords) < 6:
@@ -1336,6 +1580,163 @@ else:
             },
         )
 
+    st.subheader("Custom a-b Basis Strain")
+    st.caption(
+        "Optional. Click to enable only when you want to define a custom "
+        "base-a-b strain basis from atom picks."
+    )
+    custom_components: dict[str, np.ndarray] | None = None
+    if not bool(st.session_state.custom_basis_enabled):
+        if st.button("Enable a-b Basis Picking", use_container_width=False):
+            st.session_state.custom_basis_enabled = True
+            _invalidate_custom_basis_state()
+            st.session_state.custom_basis_message = (
+                "Click the base atom for the custom a-b basis."
+            )
+            st.rerun()
+        st.info("Custom a-b basis strain is currently off.")
+    else:
+        basis_button_col1, basis_button_col2 = st.columns([0.34, 0.34])
+        if basis_button_col1.button("Start / Reset a-b Picking", use_container_width=True):
+            _invalidate_custom_basis_state()
+            st.session_state.custom_basis_message = (
+                "Click the base atom for the custom a-b basis."
+            )
+            st.rerun()
+        if basis_button_col2.button("Turn Off a-b Basis", use_container_width=True):
+            _disable_custom_basis_state()
+            st.rerun()
+
+        basis_indices = dict(st.session_state.custom_basis_indices)
+        basis_stage = int(st.session_state.custom_basis_stage)
+        stage_prompts = {
+            0: "Waiting for base atom click.",
+            1: "Base selected. Click the atom that defines the a vector.",
+            2: "a-vector atom selected. Click the atom that defines the b vector.",
+            3: "Custom a-b basis is ready.",
+        }
+        if st.session_state.custom_basis_message:
+            st.info(st.session_state.custom_basis_message)
+        else:
+            st.caption(stage_prompts.get(basis_stage, ""))
+
+        basis_markers: dict[str, tuple[float, float]] = {}
+        for key_name in ("base", "a", "b"):
+            idx = basis_indices.get(key_name)
+            if idx is not None and 0 <= int(idx) < len(coords):
+                yx = np.asarray(coords[int(idx)], dtype=np.float64)
+                basis_markers[key_name] = (float(yx[0]), float(yx[1]))
+
+        basis_canvas_image, basis_sx, basis_sy = _to_display_image(
+            norm,
+            coords=coords,
+            roi_mask=roi_mask,
+            basis_markers=basis_markers,
+            max_side=900,
+        )
+        basis_canvas = st_canvas(
+            fill_color="rgba(255, 255, 0, 0.25)",
+            stroke_width=2,
+            stroke_color="#00ffff",
+            background_image=basis_canvas_image,
+            drawing_mode="point",
+            point_display_radius=5,
+            display_toolbar=True,
+            update_streamlit=True,
+            height=basis_canvas_image.height,
+            width=basis_canvas_image.width,
+            key=f"basis-canvas-{st.session_state.custom_basis_canvas_nonce}",
+        )
+
+        if basis_stage < 3:
+            basis_draw_mask = _canvas_draw_mask(basis_canvas)
+            if basis_draw_mask is not None and np.any(basis_draw_mask):
+                disp_points = _mask_centroids(basis_draw_mask, min_pixels=2)
+                raw_points = _map_display_to_raw(disp_points, sx=basis_sx, sy=basis_sy)
+                if len(raw_points) > 0:
+                    y_click, x_click = raw_points[0]
+                    d2 = (coords[:, 0] - y_click) ** 2 + (coords[:, 1] - x_click) ** 2
+                    nearest_idx = int(np.argmin(d2))
+                    target_name = ("base", "a", "b")[basis_stage]
+                    if target_name == "a" and nearest_idx == basis_indices.get("base"):
+                        st.session_state.custom_basis_message = (
+                            "The a-vector atom must be different from the base atom."
+                        )
+                    elif target_name == "b" and nearest_idx in {
+                        basis_indices.get("base"),
+                        basis_indices.get("a"),
+                    }:
+                        st.session_state.custom_basis_message = (
+                            "The b-vector atom must be different from both base and a atoms."
+                        )
+                    else:
+                        basis_indices[target_name] = nearest_idx
+                        st.session_state.custom_basis_indices = basis_indices
+                        st.session_state.custom_basis_stage = basis_stage + 1
+                        if basis_stage == 0:
+                            st.session_state.custom_basis_message = (
+                                "Base selected. Now click the atom that defines the a vector."
+                            )
+                        elif basis_stage == 1:
+                            st.session_state.custom_basis_message = (
+                                "a-vector atom selected. "
+                                "Now click the atom that defines the b vector."
+                            )
+                        else:
+                            st.session_state.custom_basis_message = "Custom a-b basis is ready."
+                    st.session_state.custom_basis_canvas_nonce = (
+                        int(st.session_state.custom_basis_canvas_nonce) + 1
+                    )
+                    st.rerun()
+
+        custom_basis = _custom_basis_info(coords, dict(st.session_state.custom_basis_indices))
+        if custom_basis is not None:
+            st.write(
+                "Custom basis atoms:",
+                {
+                    "base_idx": custom_basis["base_idx"],
+                    "a_idx": custom_basis["a_idx"],
+                    "b_idx": custom_basis["b_idx"],
+                    "a_length_px": round(float(custom_basis["a_length_px"]), 4),
+                    "b_length_px": round(float(custom_basis["b_length_px"]), 4),
+                    "angle_deg": round(float(custom_basis["angle_deg"]), 3),
+                },
+            )
+            if not (5.0 < float(custom_basis["angle_deg"]) < 175.0):
+                st.warning(
+                    "Custom a and b vectors are nearly collinear. Please re-pick the basis."
+                )
+            else:
+                eaa_atom, ebb_atom, eab_atom = _project_strain_to_custom_basis(
+                    atom_strain_fields.atom_strain_xx,
+                    atom_strain_fields.atom_strain_yy,
+                    atom_strain_fields.atom_strain_xy,
+                    a_vec_yx=np.asarray(custom_basis["a_vec_yx"], dtype=np.float64),
+                    b_vec_yx=np.asarray(custom_basis["b_vec_yx"], dtype=np.float64),
+                )
+                eaa_map, ebb_map, eab_map = _project_strain_to_custom_basis(
+                    atom_strain_fields.strain_xx_map,
+                    atom_strain_fields.strain_yy_map,
+                    atom_strain_fields.strain_xy_map,
+                    a_vec_yx=np.asarray(custom_basis["a_vec_yx"], dtype=np.float64),
+                    b_vec_yx=np.asarray(custom_basis["b_vec_yx"], dtype=np.float64),
+                )
+                custom_components = {
+                    "eaa": np.asarray(eaa_atom, dtype=np.float64),
+                    "ebb": np.asarray(ebb_atom, dtype=np.float64),
+                    "eab": np.asarray(eab_atom, dtype=np.float64),
+                }
+                custom_fig = _render_custom_basis_strain_maps(
+                    eaa_map * strain_scale,
+                    ebb_map * strain_scale,
+                    eab_map * strain_scale,
+                    strain_unit=strain_unit,
+                    auto_color_range=params["atom_strain_auto_color_range"],
+                    strain_abs_limit=params["atom_strain_strain_abs"],
+                )
+                st.pyplot(custom_fig)
+                plt.close(custom_fig)
+
     st.subheader("Atom-Position Strain Preview")
     atom_preview_count = min(len(coords), 500)
     if atom_preview_count > 0:
@@ -1363,6 +1764,16 @@ else:
             "uncertainty": atom_strain_fields.atom_uncertainty[:atom_preview_count],
             "valid_fit": atom_strain_fields.valid_atom_mask[:atom_preview_count].astype(np.int32),
         }
+        if custom_components is not None:
+            atom_preview[f"eaa [{strain_unit}]"] = (
+                custom_components["eaa"][:atom_preview_count] * strain_scale
+            )
+            atom_preview[f"ebb [{strain_unit}]"] = (
+                custom_components["ebb"][:atom_preview_count] * strain_scale
+            )
+            atom_preview[f"eab [{strain_unit}]"] = (
+                custom_components["eab"][:atom_preview_count] * strain_scale
+            )
         st.dataframe(atom_preview, use_container_width=True)
     atom_strain_csv_text = _atom_strain_csv(
         coords=coords,
@@ -1371,6 +1782,7 @@ else:
         displacement_unit=displacement_unit,
         strain_scale=strain_scale,
         strain_unit=strain_unit,
+        custom_components=custom_components,
     )
     st.download_button(
         label="Download atom-position strain CSV",
