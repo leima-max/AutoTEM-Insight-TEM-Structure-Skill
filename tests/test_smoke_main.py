@@ -51,7 +51,10 @@ def test_smoke_minimal_workflow_run(tmp_path: Path) -> None:
 
 
 @pytest.mark.smoke
-def test_smoke_cli_analyze_with_minimal_workflow(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_smoke_cli_analyze_with_minimal_workflow(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     input_path = tmp_path / "cli_smoke.npy"
     np.save(input_path, np.zeros((8, 8), dtype=np.float32))
 

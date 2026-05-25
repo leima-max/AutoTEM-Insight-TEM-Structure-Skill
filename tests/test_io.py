@@ -18,6 +18,8 @@ from autotem.io.readers import (
     read_series_as_temdataset,
 )
 
+pytestmark = pytest.mark.smoke
+
 
 def _write_gray_image(path: Path, fmt: str) -> np.ndarray:
     data = (np.arange(64).reshape(8, 8) * 2).astype(np.uint8)

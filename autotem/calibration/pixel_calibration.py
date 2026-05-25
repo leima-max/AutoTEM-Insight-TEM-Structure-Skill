@@ -609,7 +609,8 @@ def resolve_pixel_size_measurement(
         image = _load_dataset_image(dataset)
         if image is None:
             warnings.append(
-                "Scale-bar auto detection skipped because image data cannot be loaded from current source."
+                "Scale-bar auto detection skipped because image data cannot be loaded "
+                "from current source."
             )
         else:
             pixel_nm, source, scale_warnings = infer_pixel_size_from_scalebar(
@@ -629,7 +630,8 @@ def resolve_pixel_size_measurement(
                 )
                 return measurement, source, warnings
             warnings.append(
-                "Scale-bar auto detection did not lock a valid pixel size; fallback to metadata/other calibration."
+                "Scale-bar auto detection did not lock a valid pixel size; fallback "
+                "to metadata/other calibration."
             )
 
     if dataset.pixel_size is not None:
