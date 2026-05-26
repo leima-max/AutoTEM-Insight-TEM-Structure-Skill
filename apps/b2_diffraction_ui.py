@@ -12,7 +12,7 @@ import numpy as np
 import streamlit as st
 import streamlit.elements.image as st_image
 import yaml
-from PIL import Image
+from PIL import Image, ImageDraw
 from scipy.optimize import least_squares
 from streamlit_drawable_canvas import st_canvas
 
@@ -51,7 +51,7 @@ if not hasattr(st_image, "image_to_url"):
 
 
 _APP_TITLE = "AutoTEM B1-B3 Interactive Preview"
-_UI_BUILD_TAG = "b1_b3_interactive_v6_backup_mode_controls_2026-05-26"
+_UI_BUILD_TAG = "b1_b3_interactive_v23_vector_aux_edit_2026-05-27"
 _WORKFLOW_TEMPLATE = "configs/hrtem_b1_b3.yaml"
 _OUTPUT_ROOT_ENV = "AUTOTEM_UI_OUTPUT_ROOT"
 
@@ -671,19 +671,38 @@ def _to_fft_display_image(
     fft_image_norm: np.ndarray,
     *,
     max_side: int = 900,
-) -> tuple[Image.Image, float, float]:
+    zoom: float = 1.0,
+    center_xy: tuple[float, float] | None = None,
+) -> tuple[Image.Image, float, float, float, float]:
     h, w = fft_image_norm.shape
-    scale = min(max_side / max(h, w), 1.0)
-    disp_h = max(1, int(round(h * scale)))
-    disp_w = max(1, int(round(w * scale)))
-    arr = (np.clip(fft_image_norm, 0.0, 1.0) * 255.0).astype(np.uint8)
+    zoom = max(1.0, float(zoom))
+    if center_xy is None or zoom <= 1.0:
+        x0, y0, x1, y1 = 0, 0, int(w), int(h)
+    else:
+        crop_w = max(1, min(int(w), int(round(float(w) / zoom))))
+        crop_h = max(1, min(int(h), int(round(float(h) / zoom))))
+        cx = float(np.clip(float(center_xy[0]), 0.0, max(0.0, float(w - 1))))
+        cy = float(np.clip(float(center_xy[1]), 0.0, max(0.0, float(h - 1))))
+        x0 = int(round(cx - 0.5 * crop_w))
+        y0 = int(round(cy - 0.5 * crop_h))
+        x0 = max(0, min(x0, int(w) - crop_w))
+        y0 = max(0, min(y0, int(h) - crop_h))
+        x1 = int(x0 + crop_w)
+        y1 = int(y0 + crop_h)
+
+    crop = np.asarray(fft_image_norm[y0:y1, x0:x1], dtype=np.float32)
+    crop_h_actual, crop_w_actual = crop.shape
+    scale = max(0.05, float(max_side) / max(crop_h_actual, crop_w_actual))
+    disp_h = max(1, int(round(crop_h_actual * scale)))
+    disp_w = max(1, int(round(crop_w_actual * scale)))
+    arr = (np.clip(crop, 0.0, 1.0) * 255.0).astype(np.uint8)
     img = Image.fromarray(arr, mode="L").convert("RGB").resize(
         (disp_w, disp_h),
         resample=Image.BILINEAR,
     )
-    sx = w / disp_w
-    sy = h / disp_h
-    return img, sx, sy
+    sx = crop_w_actual / disp_w
+    sy = crop_h_actual / disp_h
+    return img, sx, sy, float(x0), float(y0)
 
 
 def _extract_canvas_points_xy(
@@ -691,6 +710,8 @@ def _extract_canvas_points_xy(
     *,
     sx: float,
     sy: float,
+    x_offset: float = 0.0,
+    y_offset: float = 0.0,
 ) -> list[tuple[float, float]]:
     json_data = getattr(canvas_result, "json_data", None)
     if not isinstance(json_data, dict):
@@ -731,8 +752,172 @@ def _extract_canvas_points_xy(
         else:
             disp_x = left
             disp_y = top
-        points.append((disp_x * sx, disp_y * sy))
+        points.append((float(x_offset) + disp_x * sx, float(y_offset) + disp_y * sy))
     return points
+
+
+def _draw_auto_points_on_canvas_image(
+    image: Image.Image,
+    *,
+    auto_points_xy: list[tuple[float, float]],
+    center_xy: tuple[float, float],
+    sx: float,
+    sy: float,
+    x_offset: float,
+    y_offset: float,
+    removed_auto_peak_ids: set[int] | None = None,
+    manual_points_xy: list[tuple[float, float]] | None = None,
+) -> Image.Image:
+    out = image.copy()
+    draw = ImageDraw.Draw(out)
+    width, height = out.size
+    removed_ids = set(removed_auto_peak_ids or set())
+    for idx, (x, y) in enumerate(auto_points_xy):
+        dx = (float(x) - float(x_offset)) / max(float(sx), 1e-12)
+        dy = (float(y) - float(y_offset)) / max(float(sy), 1e-12)
+        if not (-8.0 <= dx <= float(width + 8) and -8.0 <= dy <= float(height + 8)):
+            continue
+        if int(idx) in removed_ids:
+            draw.ellipse((dx - 5, dy - 5, dx + 5, dy + 5), outline="red", width=2)
+            draw.line((dx - 5, dy - 5, dx + 5, dy + 5), fill="red", width=2)
+            draw.line((dx - 5, dy + 5, dx + 5, dy - 5), fill="red", width=2)
+            draw.text((dx + 6, dy - 11), str(idx), fill="red")
+        else:
+            draw.ellipse((dx - 4, dy - 4, dx + 4, dy + 4), outline="cyan", width=2)
+            draw.text((dx + 5, dy - 10), str(idx), fill="cyan")
+
+    for idx, (x, y) in enumerate(manual_points_xy or []):
+        dx = (float(x) - float(x_offset)) / max(float(sx), 1e-12)
+        dy = (float(y) - float(y_offset)) / max(float(sy), 1e-12)
+        if not (-8.0 <= dx <= float(width + 8) and -8.0 <= dy <= float(height + 8)):
+            continue
+        draw.rectangle((dx - 5, dy - 5, dx + 5, dy + 5), outline="magenta", width=2)
+        draw.text((dx + 6, dy - 11), f"M{idx}", fill="magenta")
+
+    cx = (float(center_xy[0]) - float(x_offset)) / max(float(sx), 1e-12)
+    cy = (float(center_xy[1]) - float(y_offset)) / max(float(sy), 1e-12)
+    if -8.0 <= cx <= float(width + 8) and -8.0 <= cy <= float(height + 8):
+        draw.line((cx - 6, cy, cx + 6, cy), fill="yellow", width=2)
+        draw.line((cx, cy - 6, cx, cy + 6), fill="yellow", width=2)
+    return out
+
+
+def _normalize_points_xy(raw_points: Any) -> list[tuple[float, float]]:
+    if not isinstance(raw_points, list):
+        return []
+    points: list[tuple[float, float]] = []
+    for item in raw_points:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            x = float(item[0])
+            y = float(item[1])
+        except (TypeError, ValueError):
+            continue
+        points.append((x, y))
+    return points
+
+
+def _nearest_point_index(
+    points_xy: list[tuple[float, float]],
+    target_xy: tuple[float, float],
+    *,
+    hit_radius_px: float,
+) -> tuple[int, float | None]:
+    radius = max(0.1, float(hit_radius_px))
+    best_idx = -1
+    best_dist = radius + 1e-9
+    tx, ty = target_xy
+    for idx, (px, py) in enumerate(points_xy):
+        dist = float(np.hypot(float(tx) - float(px), float(ty) - float(py)))
+        if dist <= radius and dist < best_dist:
+            best_idx = int(idx)
+            best_dist = dist
+    return best_idx, (None if best_idx < 0 else float(best_dist))
+
+
+def _append_manual_canvas_points(
+    existing_points_xy: list[tuple[float, float]],
+    clicks_xy: list[tuple[float, float]],
+    *,
+    manual_min_distance_px: float,
+    max_points: int,
+) -> tuple[list[tuple[float, float]], dict[str, Any]]:
+    selected = list(existing_points_xy)
+    added_count = 0
+    duplicate_count = 0
+    capacity_count = 0
+    min_distance = max(0.1, float(manual_min_distance_px))
+    limit = max(1, int(max_points))
+
+    for x, y in clicks_xy:
+        point = (float(x), float(y))
+        if any(
+            float(np.hypot(point[0] - old_x, point[1] - old_y)) < min_distance
+            for old_x, old_y in selected
+        ):
+            duplicate_count += 1
+            continue
+        if len(selected) >= limit:
+            capacity_count += 1
+            continue
+        selected.append(point)
+        added_count += 1
+
+    return selected, {
+        "mode": "add",
+        "click_count": int(len(clicks_xy)),
+        "manual_add_count": int(added_count),
+        "duplicate_click_count": int(duplicate_count),
+        "capacity_skip_count": int(capacity_count),
+    }
+
+
+def _resolve_delete_canvas_clicks(
+    clicks_xy: list[tuple[float, float]],
+    *,
+    auto_points_xy: list[tuple[float, float]],
+    manual_points_xy: list[tuple[float, float]],
+    hit_radius_px: float,
+) -> tuple[list[int], list[int], dict[str, Any]]:
+    remove_auto_ids: set[int] = set()
+    remove_manual_ids: set[int] = set()
+    missed_count = 0
+
+    for x, y in clicks_xy:
+        point = (float(x), float(y))
+        auto_idx, auto_dist = _nearest_point_index(
+            auto_points_xy,
+            point,
+            hit_radius_px=float(hit_radius_px),
+        )
+        manual_idx, manual_dist = _nearest_point_index(
+            manual_points_xy,
+            point,
+            hit_radius_px=float(hit_radius_px),
+        )
+        if manual_idx >= 0 and (
+            auto_idx < 0
+            or (
+                manual_dist is not None
+                and auto_dist is not None
+                and float(manual_dist) <= float(auto_dist)
+            )
+        ):
+            remove_manual_ids.add(int(manual_idx))
+        elif auto_idx >= 0:
+            remove_auto_ids.add(int(auto_idx))
+        else:
+            missed_count += 1
+
+    return sorted(remove_auto_ids), sorted(remove_manual_ids), {
+        "mode": "delete",
+        "click_count": int(len(clicks_xy)),
+        "removed_auto_peak_ids": sorted(int(item) for item in remove_auto_ids),
+        "removed_manual_point_ids": sorted(int(item) for item in remove_manual_ids),
+        "missed_click_count": int(missed_count),
+        "hit_radius_px": float(max(0.1, float(hit_radius_px))),
+    }
 
 
 def _deduplicate_points(
@@ -757,6 +942,25 @@ def _round_points_for_signature(
         [round(float(x), digits), round(float(y), digits)]
         for x, y in points_xy
     ]
+
+
+def _sort_points_by_fft_intensity(
+    points_xy: list[tuple[float, float]],
+    fft_log_magnitude: np.ndarray,
+) -> list[tuple[float, float]]:
+    h, w = fft_log_magnitude.shape
+
+    def _score(point: tuple[float, float]) -> float:
+        x, y = point
+        xx = int(np.clip(round(float(x)), 0, w - 1))
+        yy = int(np.clip(round(float(y)), 0, h - 1))
+        return float(fft_log_magnitude[yy, xx])
+
+    return sorted(
+        [(float(x), float(y)) for x, y in points_xy],
+        key=_score,
+        reverse=True,
+    )
 
 
 def _generate_lattice_points_from_two_basis(
@@ -856,7 +1060,6 @@ def _synthesize_points_from_two_basis(
     basis_points_xy: list[tuple[float, float]],
     shape_hw: tuple[int, int],
     fft_log_magnitude: np.ndarray,
-    auto_points_xy: list[tuple[float, float]],
     max_order: int,
     min_distance_px: float,
     snap_mode: str,
@@ -911,14 +1114,13 @@ def _synthesize_points_from_two_basis(
         local_threshold = float("-inf")
 
     mode = str(snap_mode).strip().lower()
-    if mode not in {"none", "auto_peak_nearest", "local_max", "hybrid"}:
-        mode = "hybrid"
-    used_auto: set[int] = set()
+    if mode not in {"none", "local_max"}:
+        mode = "local_max"
     snapped_points: list[tuple[float, float]] = []
     source_counts: dict[str, int] = {
         "basis_keep": 0,
-        "auto_peak_nearest": 0,
         "local_max": 0,
+        "lattice_seed": 0,
     }
     dropped_non_basis = 0
     pairs: list[dict[str, Any]] = []
@@ -929,25 +1131,7 @@ def _synthesize_points_from_two_basis(
         best_dist = float("inf")
         best_src = ""
 
-        if mode in {"auto_peak_nearest", "hybrid"} and auto_points_xy:
-            # Find nearest unused auto point.
-            nearest_idx = -1
-            nearest_dist = float(snap_radius_px) + 1e-9
-            for ai, (ax, ay) in enumerate(auto_points_xy):
-                if ai in used_auto:
-                    continue
-                dist = float(np.hypot(float(ax) - float(px), float(ay) - float(py)))
-                if dist <= float(snap_radius_px) and dist < nearest_dist:
-                    nearest_dist = dist
-                    nearest_idx = int(ai)
-            if nearest_idx >= 0:
-                ax, ay = auto_points_xy[nearest_idx]
-                best_pt = (float(ax), float(ay))
-                best_dist = float(nearest_dist)
-                best_src = "auto_peak_nearest"
-                used_auto.add(nearest_idx)
-
-        if mode in {"local_max", "hybrid"}:
+        if mode == "local_max":
             local_hit = _find_local_max_near_point(
                 image,
                 x=float(px),
@@ -961,6 +1145,10 @@ def _synthesize_points_from_two_basis(
                         best_pt = (float(lx), float(ly))
                         best_dist = float(ld)
                         best_src = "local_max"
+        elif mode == "none":
+            best_pt = (float(px), float(py))
+            best_dist = 0.0
+            best_src = "basis_keep" if is_basis else "lattice_seed"
 
         if best_pt is None:
             if is_basis:
@@ -1750,8 +1938,14 @@ def _run_b1b3_pipeline(
 
 
 def _render_mode_selector(mode_options: list[str]) -> str:
-    selection_mode = _render_mode_selector(mode_options)
-    return str(selection_mode)
+    return str(
+        st.radio(
+            "Spot source mode",
+            options=mode_options,
+            horizontal=True,
+            key="b1b3_selection_mode_main",
+        )
+    )
 
 
 def _render_preview_metrics(
@@ -1852,10 +2046,19 @@ def main() -> None:
         if local_file_path:
             st.session_state["b1b3_local_file_path"] = local_file_path
 
-    output_root_raw = st.sidebar.text_input("Output root", value=str(_default_output_root()))
+    if "b1b3_output_root_value" not in st.session_state:
+        st.session_state["b1b3_output_root_value"] = str(_default_output_root())
+    if "b1b3_run_name_value" not in st.session_state:
+        st.session_state["b1b3_run_name_value"] = (
+            f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+    output_root_raw = st.sidebar.text_input(
+        "Output root",
+        key="b1b3_output_root_value",
+    )
     run_name = st.sidebar.text_input(
         "Run folder name",
-        value=f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        key="b1b3_run_name_value",
     )
     auto_rerun = st.sidebar.checkbox("Auto rerun on parameter change", value=True)
 
@@ -2248,7 +2451,7 @@ def main() -> None:
     overlay_label_mode = st.sidebar.selectbox(
         "Overlay numbering",
         options=["Auto peaks", "Selected points", "Both", "Off"],
-        index=0,
+        index=1,
     )
     manual_min_distance = st.sidebar.slider("Manual dedup distance (px)", 0.5, 12.0, 2.0, 0.1)
     manual_max_points = st.sidebar.slider("Manual max points", 2, 256, 64, 1)
@@ -2262,8 +2465,13 @@ def main() -> None:
         )
         vector_snap_mode = st.selectbox(
             "Vector snap method",
-            options=["hybrid", "auto_peak_nearest", "local_max", "none"],
+            options=["none", "local_max"],
             index=0,
+            help=(
+                "`none` keeps strict lattice coordinates from the two basis vectors. "
+                "`local_max` optionally shifts synthesized points to nearby FFT maxima. "
+                "Pipeline auto peaks are never used in vector mode."
+            ),
         )
         vector_snap_radius_px = st.slider(
             "Vector snap radius (px)",
@@ -2287,7 +2495,15 @@ def main() -> None:
             step=1,
         )
     with st.sidebar.expander("Manual point refine", expanded=False):
-        manual_refine_enabled = st.checkbox("Enable refine", value=True)
+        manual_refine_enabled = st.checkbox(
+            "Enable refine",
+            value=True,
+            help=(
+                "On refines clicked basis points with Gaussian/centroid fitting before "
+                "vector synthesis. With Vector snap method = none, generated lattice "
+                "spots remain strict vector combinations after basis refinement."
+            ),
+        )
         manual_refine_method = st.selectbox(
             "Refine method",
             options=["gaussian", "centroid", "none"],
@@ -2534,12 +2750,7 @@ def main() -> None:
         st.session_state["b1b3_selection_mode_main"] = mode_options[0]
 
     st.subheader("Spot Selection Mode")
-    selection_mode = st.radio(
-        "Spot source mode",
-        options=mode_options,
-        horizontal=True,
-        key="b1b3_selection_mode_main",
-    )
+    selection_mode = _render_mode_selector(mode_options)
     if selection_mode == MODE_AUTO_EDIT:
         st.caption(
             "Mode 1 mirrors the backup UI: run the pipeline detector first, then review "
@@ -2600,6 +2811,20 @@ def main() -> None:
                     return
             else:
                 st.session_state["b1b3_last_signature"] = signature
+                st.session_state["b1b3_auto_manual_points_xy"] = []
+                st.session_state["b1b3_auto_removed_peak_ids"] = []
+                st.session_state["b1b3_auto_remove_peak_ids_main"] = []
+                st.session_state["b1b3_auto_canvas_action_signature"] = ""
+                st.session_state["b1b3_vector_aux_points_xy"] = []
+                st.session_state["b1b3_vector_removed_point_ids"] = []
+                st.session_state["b1b3_vector_synth_signature"] = ""
+                st.session_state["b1b3_vector_edit_action_signature"] = ""
+                st.session_state["b1b3_vector_edit_canvas_nonce"] = int(
+                    st.session_state.get("b1b3_vector_edit_canvas_nonce", 0)
+                ) + 1
+                st.session_state["b1b3_auto_manual_delete_nonce"] = int(
+                    st.session_state.get("b1b3_auto_manual_delete_nonce", 0)
+                ) + 1
 
     cache = st.session_state.get("b1b3_analysis_cache")
     if not isinstance(cache, dict):
@@ -2629,12 +2854,51 @@ def main() -> None:
         st.session_state["b1b3_last_canvas_points_xy"] = []
     if "b1b3_manual_points_bank_xy" not in st.session_state:
         st.session_state["b1b3_manual_points_bank_xy"] = []
+    if "b1b3_auto_manual_points_xy" not in st.session_state:
+        st.session_state["b1b3_auto_manual_points_xy"] = []
+    if "b1b3_auto_removed_peak_ids" not in st.session_state:
+        st.session_state["b1b3_auto_removed_peak_ids"] = []
+    if "b1b3_last_canvas_zoom_signature" not in st.session_state:
+        st.session_state["b1b3_last_canvas_zoom_signature"] = ""
+    if "b1b3_auto_canvas_nonce" not in st.session_state:
+        st.session_state["b1b3_auto_canvas_nonce"] = 0
+    if "b1b3_auto_last_canvas_zoom_signature" not in st.session_state:
+        st.session_state["b1b3_auto_last_canvas_zoom_signature"] = ""
+    if "b1b3_auto_canvas_action_signature" not in st.session_state:
+        st.session_state["b1b3_auto_canvas_action_signature"] = ""
+    if "b1b3_auto_manual_delete_nonce" not in st.session_state:
+        st.session_state["b1b3_auto_manual_delete_nonce"] = 0
+    if "b1b3_vector_aux_points_xy" not in st.session_state:
+        st.session_state["b1b3_vector_aux_points_xy"] = []
+    if "b1b3_vector_removed_point_ids" not in st.session_state:
+        st.session_state["b1b3_vector_removed_point_ids"] = []
+    if "b1b3_vector_synth_signature" not in st.session_state:
+        st.session_state["b1b3_vector_synth_signature"] = ""
+    if "b1b3_vector_edit_canvas_nonce" not in st.session_state:
+        st.session_state["b1b3_vector_edit_canvas_nonce"] = 0
+    if "b1b3_vector_edit_action_signature" not in st.session_state:
+        st.session_state["b1b3_vector_edit_action_signature"] = ""
+    if "b1b3_vector_aux_delete_nonce" not in st.session_state:
+        st.session_state["b1b3_vector_aux_delete_nonce"] = 0
     if st.session_state.get("b1b3_last_selection_mode") != selection_mode:
         st.session_state["b1b3_last_selection_mode"] = selection_mode
         st.session_state["b1b3_canvas_nonce"] = int(st.session_state["b1b3_canvas_nonce"]) + 1
+        st.session_state["b1b3_auto_canvas_nonce"] = int(
+            st.session_state["b1b3_auto_canvas_nonce"]
+        ) + 1
         st.session_state["b1b3_last_clicked_points_xy"] = []
         st.session_state["b1b3_last_canvas_points_xy"] = []
         st.session_state["b1b3_manual_points_bank_xy"] = []
+        st.session_state["b1b3_auto_manual_points_xy"] = []
+        st.session_state["b1b3_auto_removed_peak_ids"] = []
+        st.session_state["b1b3_auto_remove_peak_ids_main"] = []
+        st.session_state["b1b3_vector_aux_points_xy"] = []
+        st.session_state["b1b3_vector_removed_point_ids"] = []
+        st.session_state["b1b3_vector_synth_signature"] = ""
+        st.session_state["b1b3_last_canvas_zoom_signature"] = ""
+        st.session_state["b1b3_auto_last_canvas_zoom_signature"] = ""
+        st.session_state["b1b3_auto_canvas_action_signature"] = ""
+        st.session_state["b1b3_vector_edit_action_signature"] = ""
 
     _render_preview_metrics(
         quality=quality,
@@ -2664,34 +2928,312 @@ def main() -> None:
     vector_synth_warnings: list[str] = []
     vector_synth_diagnostics: dict[str, Any] = {"enabled": False, "mode": "none"}
     auto_remove_peak_ids: list[int] = []
+    auto_canvas_diagnostics: dict[str, Any] = {"enabled": False}
     if selection_mode == MODE_AUTO_EDIT:
         st.subheader("Auto Peak Review")
         st.caption(
-            "Backup-style auto mode keeps the pipeline detector as the active spot source. "
-            "Use the exclusion list only for obvious false positives."
+            "Choose a canvas action first: add mode records missed spots, delete mode "
+            "removes the nearest auto or manual point."
         )
-        review_cols = st.columns(4)
-        review_cols[0].metric("Pipeline peaks", str(len(auto_points_xy)))
-        review_cols[1].metric("Manual points", "off")
-        review_cols[2].metric("Basis points", "n/a")
-        review_cols[3].metric("Mode", "Auto")
+
+        manual_points_state = _normalize_points_xy(
+            st.session_state.get("b1b3_auto_manual_points_xy", [])
+        )
+        auto_remove_state = sorted(
+            {
+                int(item)
+                for item in st.session_state.get("b1b3_auto_removed_peak_ids", [])
+                if isinstance(item, int | float)
+            }
+        )
+        auto_canvas_col, auto_status_col = st.columns([1.05, 0.95])
+        with auto_status_col:
+            st.subheader("Auto Edit")
+            action_options = ["Add point", "Delete point"]
+            current_action = st.session_state.get("b1b3_auto_canvas_action_mode")
+            action_index = (
+                action_options.index(str(current_action))
+                if str(current_action) in action_options
+                else 0
+            )
+            auto_canvas_action = st.radio(
+                "Canvas click action",
+                options=action_options,
+                index=action_index,
+                horizontal=True,
+                key="b1b3_auto_canvas_action_mode",
+            )
+            auto_canvas_zoom = st.slider(
+                "Auto edit zoom",
+                min_value=1.0,
+                max_value=6.0,
+                value=1.0,
+                step=0.1,
+                help=(
+                    "Zoom into the FFT center while keeping the edit canvas visible. "
+                    "Changing zoom clears current canvas clicks."
+                ),
+                key="b1b3_auto_canvas_zoom_inline",
+            )
+            auto_hit_radius_px = st.slider(
+                "Delete hit radius (px)",
+                min_value=1.0,
+                max_value=20.0,
+                value=6.0,
+                step=0.5,
+                help="Click within this radius of an existing point in delete mode.",
+                key="b1b3_auto_hit_radius_px",
+            )
+
+        auto_action_signature = f"{auto_canvas_action}|{float(auto_canvas_zoom):.2f}"
+        if (
+            st.session_state.get("b1b3_auto_canvas_action_signature")
+            != auto_action_signature
+        ):
+            st.session_state["b1b3_auto_canvas_action_signature"] = auto_action_signature
+            st.session_state["b1b3_auto_canvas_nonce"] = int(
+                st.session_state.get("b1b3_auto_canvas_nonce", 0)
+            ) + 1
+
+        auto_canvas_bg, auto_sx, auto_sy, auto_x_offset, auto_y_offset = _to_fft_display_image(
+            fft_image_norm,
+            max_side=900,
+            zoom=float(auto_canvas_zoom),
+            center_xy=(float(fft_analysis.center[0]), float(fft_analysis.center[1])),
+        )
+        auto_canvas_bg = _draw_auto_points_on_canvas_image(
+            auto_canvas_bg,
+            auto_points_xy=list(auto_points_xy),
+            center_xy=(float(fft_analysis.center[0]), float(fft_analysis.center[1])),
+            sx=float(auto_sx),
+            sy=float(auto_sy),
+            x_offset=float(auto_x_offset),
+            y_offset=float(auto_y_offset),
+            removed_auto_peak_ids=set(auto_remove_state),
+            manual_points_xy=list(manual_points_state),
+        )
+        with auto_canvas_col:
+            st.write(
+                f"{auto_canvas_action} on FFT (zoom x{float(auto_canvas_zoom):.1f}):"
+            )
+            auto_canvas_key = (
+                f"b1b3-auto-edit-canvas-"
+                f"{int(st.session_state.get('b1b3_auto_canvas_nonce', 0))}"
+            )
+            auto_canvas_result = st_canvas(
+                fill_color="rgba(255,255,255,0.25)",
+                stroke_width=2,
+                stroke_color=(
+                    "#00ffaa" if str(auto_canvas_action) == "Add point" else "#ff3333"
+                ),
+                background_image=auto_canvas_bg,
+                drawing_mode="point",
+                point_display_radius=4,
+                display_toolbar=True,
+                update_streamlit=True,
+                height=auto_canvas_bg.height,
+                width=auto_canvas_bg.width,
+                key=auto_canvas_key,
+            )
+            if st.button("Clear Auto Canvas Edits", key="b1b3_clear_auto_canvas_edits_btn"):
+                st.session_state["b1b3_auto_manual_points_xy"] = []
+                st.session_state["b1b3_auto_removed_peak_ids"] = []
+                st.session_state["b1b3_auto_remove_peak_ids_main"] = []
+                st.session_state["b1b3_auto_canvas_nonce"] = int(
+                    st.session_state.get("b1b3_auto_canvas_nonce", 0)
+                ) + 1
+                st.session_state["b1b3_auto_manual_delete_nonce"] = int(
+                    st.session_state.get("b1b3_auto_manual_delete_nonce", 0)
+                ) + 1
+                st.rerun()
+
+        auto_canvas_clicks_xy = _extract_canvas_points_xy(
+            auto_canvas_result,
+            sx=float(auto_sx),
+            sy=float(auto_sy),
+            x_offset=float(auto_x_offset),
+            y_offset=float(auto_y_offset),
+        )
+        if auto_canvas_clicks_xy:
+            if str(auto_canvas_action) == "Add point":
+                manual_points_state, auto_canvas_diagnostics = _append_manual_canvas_points(
+                    manual_points_state,
+                    auto_canvas_clicks_xy,
+                    manual_min_distance_px=float(manual_min_distance),
+                    max_points=int(manual_max_points),
+                )
+            else:
+                (
+                    canvas_remove_peak_ids,
+                    canvas_remove_manual_ids,
+                    auto_canvas_diagnostics,
+                ) = _resolve_delete_canvas_clicks(
+                    auto_canvas_clicks_xy,
+                    auto_points_xy=list(auto_points_xy),
+                    manual_points_xy=list(manual_points_state),
+                    hit_radius_px=float(auto_hit_radius_px),
+                )
+                auto_remove_state = sorted(
+                    {int(item) for item in list(auto_remove_state) + list(canvas_remove_peak_ids)}
+                )
+                remove_manual_set = {int(item) for item in canvas_remove_manual_ids}
+                manual_points_state = [
+                    point
+                    for idx, point in enumerate(manual_points_state)
+                    if int(idx) not in remove_manual_set
+                ]
+            st.session_state["b1b3_auto_manual_points_xy"] = list(manual_points_state)
+            st.session_state["b1b3_auto_removed_peak_ids"] = list(auto_remove_state)
+            st.session_state["b1b3_auto_remove_peak_ids_main"] = list(auto_remove_state)
+            st.session_state["b1b3_auto_canvas_nonce"] = int(
+                st.session_state.get("b1b3_auto_canvas_nonce", 0)
+            ) + 1
+            st.rerun()
+
+        manual_points_state = _normalize_points_xy(
+            st.session_state.get("b1b3_auto_manual_points_xy", [])
+        )
+        auto_remove_state = sorted(
+            {
+                int(item)
+                for item in st.session_state.get("b1b3_auto_removed_peak_ids", [])
+                if isinstance(item, int | float)
+            }
+        )
+
         auto_options = list(range(len(auto_points_xy)))
-        auto_remove_peak_ids = st.multiselect(
-            "Exclude auto peak ids",
-            options=auto_options,
-            default=[],
-            format_func=lambda idx: (
-                f"{int(idx)}: x={float(auto_points_xy[int(idx)][0]):.1f}, "
-                f"y={float(auto_points_xy[int(idx)][1]):.1f}"
-            ),
-            key="b1b3_auto_remove_peak_ids_main",
+        auto_remove_key = "b1b3_auto_remove_peak_ids_main"
+        if st.session_state.get(auto_remove_key) != auto_remove_state:
+            st.session_state[auto_remove_key] = list(auto_remove_state)
+        with auto_status_col.expander("Auto peak deletion list", expanded=False):
+            list_remove_peak_ids = st.multiselect(
+                "Delete auto peak ids",
+                options=auto_options,
+                format_func=lambda idx: (
+                    f"{int(idx)}: x={float(auto_points_xy[int(idx)][0]):.1f}, "
+                    f"y={float(auto_points_xy[int(idx)][1]):.1f}"
+                ),
+                key=auto_remove_key,
+            )
+        auto_remove_peak_ids = sorted({int(item) for item in list_remove_peak_ids})
+        st.session_state["b1b3_auto_removed_peak_ids"] = list(auto_remove_peak_ids)
+
+        manual_rows = [
+            {
+                "manual_id": f"M{idx}",
+                "x": round(float(point[0]), 4),
+                "y": round(float(point[1]), 4),
+            }
+            for idx, point in enumerate(manual_points_state)
+        ]
+        with auto_status_col.expander("Manual added point list", expanded=bool(manual_rows)):
+            if manual_rows:
+                st.dataframe(manual_rows, use_container_width=True, hide_index=True, height=160)
+                manual_delete_key = (
+                    "b1b3_auto_manual_delete_ids_"
+                    f"{int(st.session_state.get('b1b3_auto_manual_delete_nonce', 0))}"
+                )
+                manual_delete_ids = st.multiselect(
+                    "Delete manual point ids",
+                    options=list(range(len(manual_points_state))),
+                    format_func=lambda idx: (
+                        f"M{int(idx)}: x={float(manual_points_state[int(idx)][0]):.1f}, "
+                        f"y={float(manual_points_state[int(idx)][1]):.1f}"
+                    ),
+                    key=manual_delete_key,
+                )
+                if st.button(
+                    "Delete selected manual points",
+                    disabled=not manual_delete_ids,
+                    key="b1b3_delete_selected_manual_points_btn",
+                ):
+                    delete_set = {int(item) for item in manual_delete_ids}
+                    st.session_state["b1b3_auto_manual_points_xy"] = [
+                        point
+                        for idx, point in enumerate(manual_points_state)
+                        if int(idx) not in delete_set
+                    ]
+                    st.session_state["b1b3_auto_manual_delete_nonce"] = int(
+                        st.session_state.get("b1b3_auto_manual_delete_nonce", 0)
+                    ) + 1
+                    st.session_state["b1b3_auto_canvas_nonce"] = int(
+                        st.session_state.get("b1b3_auto_canvas_nonce", 0)
+                    ) + 1
+                    st.rerun()
+            else:
+                st.info("No manual points added.")
+
+        manual_points_state = _normalize_points_xy(
+            st.session_state.get("b1b3_auto_manual_points_xy", [])
         )
-        if auto_remove_peak_ids:
-            st.caption(
-                f"{len(auto_remove_peak_ids)} auto peak(s) excluded from the active spot set."
+
+        manual_points_xy = _deduplicate_points(
+            list(manual_points_state),
+            min_distance_px=float(manual_min_distance),
+        )
+        if len(manual_points_xy) > int(manual_max_points):
+            manual_points_xy = manual_points_xy[: int(manual_max_points)]
+        st.session_state["b1b3_auto_manual_points_xy"] = list(manual_points_xy)
+        manual_points_refined_xy = list(manual_points_xy)
+        refine_active = bool(manual_refine_enabled) and str(manual_refine_method) != "none"
+        if refine_active and manual_points_xy:
+            (
+                manual_points_refined_xy,
+                manual_refine_diagnostics,
+                manual_refine_warnings,
+            ) = _refine_manual_points(
+                manual_points_xy,
+                fft_log_magnitude=np.asarray(fft_analysis.log_magnitude, dtype=np.float64),
+                method=str(manual_refine_method),
+                window_radius=int(manual_refine_window_radius),
+                max_shift_px=float(manual_refine_max_shift_px),
+            )
+            manual_points_refined_xy = _deduplicate_points(
+                manual_points_refined_xy,
+                min_distance_px=float(manual_min_distance),
             )
         else:
-            st.caption("No auto peaks excluded.")
+            manual_refine_diagnostics = {
+                "enabled": bool(refine_active),
+                "method": str(manual_refine_method),
+                "point_count": int(len(manual_points_xy)),
+                "refined_count": int(len(manual_points_refined_xy)),
+                "mean_shift_px": 0.0,
+                "max_shift_px": 0.0,
+                "fallback_count": 0,
+            }
+
+        with auto_status_col:
+            review_cols = st.columns(4)
+            review_cols[0].metric("Auto peaks", str(len(auto_points_xy)))
+            review_cols[1].metric("Removed", str(len(auto_remove_peak_ids)))
+            review_cols[2].metric("Added", str(len(manual_points_refined_xy)))
+            review_cols[3].metric("Mode", "Auto edit")
+            if auto_remove_peak_ids:
+                st.caption(
+                    f"Removed auto peak id(s): {', '.join(str(i) for i in auto_remove_peak_ids)}"
+                )
+            if manual_points_refined_xy:
+                status_rows = []
+                for idx, raw_point in enumerate(manual_points_xy):
+                    refined_point = (
+                        manual_points_refined_xy[idx]
+                        if idx < len(manual_points_refined_xy)
+                        else raw_point
+                    )
+                    status_rows.append(
+                        {
+                            "manual_id": f"M{idx}",
+                            "raw_x": round(float(raw_point[0]), 3),
+                            "raw_y": round(float(raw_point[1]), 3),
+                            "refined_x": round(float(refined_point[0]), 3),
+                            "refined_y": round(float(refined_point[1]), 3),
+                        }
+                    )
+                st.dataframe(status_rows, use_container_width=True, hide_index=True, height=170)
+            st.caption(
+                "Canvas auto ids are cyan/red; manual ids are magenta labels M0, M1, ..."
+            )
 
     if selection_mode == MODE_TWO_VECTOR:
         st.subheader("Manual Basis Selection On FFT")
@@ -2699,11 +3241,60 @@ def main() -> None:
             "Click two basis points directly on the FFT image. The app immediately "
             "synthesizes lattice spots from those two vectors, matching the backup UI flow."
         )
+        if str(vector_snap_mode) == "none" and not bool(manual_refine_enabled):
+            st.caption(
+                "Strict mode is active: clicked basis points stay fixed and synthesized "
+                "spots are exact integer combinations of g1/g2."
+            )
+        elif str(vector_snap_mode) == "none" and bool(manual_refine_enabled):
+            st.caption(
+                "Gaussian basis calibration is active: clicked g1/g2 are refined first, "
+                "then synthesized spots stay on strict integer combinations of refined g1/g2."
+            )
+        elif str(vector_snap_mode) == "local_max":
+            st.caption(
+                "Local-max snap is active: synthesized spots may shift to nearby FFT maxima."
+            )
 
-        canvas_bg, sx, sy = _to_fft_display_image(fft_image_norm, max_side=900)
         canvas_col, status_col = st.columns([1.05, 0.95])
+        with status_col:
+            st.subheader("Canvas View")
+            fft_canvas_zoom = st.slider(
+                "FFT canvas zoom",
+                min_value=1.0,
+                max_value=6.0,
+                value=1.0,
+                step=0.1,
+                help=(
+                    "Zoom into a center-cropped FFT view for more precise clicks while "
+                    "keeping the canvas fully visible. Changing this value resets the "
+                    "current canvas marks."
+                ),
+                key="b1b3_fft_canvas_zoom_inline",
+            )
+            st.caption(
+                "Zoom crops around the FFT center and keeps the canvas fixed on screen. "
+                "Changing zoom clears current marks so coordinates stay aligned."
+            )
+
+        canvas_zoom_signature = f"{float(fft_canvas_zoom):.2f}"
+        if st.session_state.get("b1b3_last_canvas_zoom_signature") != canvas_zoom_signature:
+            st.session_state["b1b3_last_canvas_zoom_signature"] = canvas_zoom_signature
+            st.session_state["b1b3_canvas_nonce"] = int(
+                st.session_state.get("b1b3_canvas_nonce", 0)
+            ) + 1
+            st.session_state["b1b3_last_clicked_points_xy"] = []
+            st.session_state["b1b3_last_canvas_points_xy"] = []
+            st.session_state["b1b3_manual_points_bank_xy"] = []
+
+        canvas_bg, sx, sy, canvas_x_offset, canvas_y_offset = _to_fft_display_image(
+            fft_image_norm,
+            max_side=900,
+            zoom=float(fft_canvas_zoom),
+            center_xy=(float(fft_analysis.center[0]), float(fft_analysis.center[1])),
+        )
         with canvas_col:
-            st.write("Click two FFT basis points:")
+            st.write(f"Click two FFT basis points (zoom x{float(fft_canvas_zoom):.1f}):")
             canvas_key = (
                 f"b1b3-fft-basis-canvas-"
                 f"{int(st.session_state.get('b1b3_canvas_nonce', 0))}"
@@ -2728,9 +3319,21 @@ def main() -> None:
                 st.session_state["b1b3_last_clicked_points_xy"] = []
                 st.session_state["b1b3_last_canvas_points_xy"] = []
                 st.session_state["b1b3_manual_points_bank_xy"] = []
+                st.session_state["b1b3_vector_aux_points_xy"] = []
+                st.session_state["b1b3_vector_removed_point_ids"] = []
+                st.session_state["b1b3_vector_synth_signature"] = ""
+                st.session_state["b1b3_vector_edit_canvas_nonce"] = int(
+                    st.session_state.get("b1b3_vector_edit_canvas_nonce", 0)
+                ) + 1
                 st.rerun()
 
-        clicked_points_xy = _extract_canvas_points_xy(canvas_result, sx=sx, sy=sy)
+        clicked_points_xy = _extract_canvas_points_xy(
+            canvas_result,
+            sx=sx,
+            sy=sy,
+            x_offset=float(canvas_x_offset),
+            y_offset=float(canvas_y_offset),
+        )
         if clicked_points_xy:
             st.session_state["b1b3_last_clicked_points_xy"] = list(clicked_points_xy)
             st.session_state["b1b3_last_canvas_points_xy"] = list(clicked_points_xy)
@@ -2816,6 +3419,10 @@ def main() -> None:
             list(auto_kept_points_xy) + list(manual_points_refined_xy),
             min_distance_px=float(manual_min_distance),
         )
+        selected_points_xy = _sort_points_by_fft_intensity(
+            selected_points_xy,
+            np.asarray(fft_analysis.log_magnitude, dtype=np.float64),
+        )
     elif selection_mode == MODE_TWO_VECTOR:
         basis_candidates = (
             list(manual_points_refined_xy)
@@ -2842,7 +3449,6 @@ def main() -> None:
                 basis_points_xy=vector_basis_points_xy,
                 shape_hw=(int(h), int(w)),
                 fft_log_magnitude=np.asarray(fft_analysis.log_magnitude, dtype=np.float64),
-                auto_points_xy=list(auto_points_xy),
                 max_order=int(vector_expand_order),
                 min_distance_px=float(manual_min_distance),
                 snap_mode=str(vector_snap_mode),
@@ -2850,7 +3456,34 @@ def main() -> None:
                 local_intensity_percentile=float(vector_local_intensity_percentile),
                 max_points=int(vector_max_points),
             )
-            selected_points_xy = list(vector_synth_points_xy)
+            vector_synth_signature = _json_signature(
+                {
+                    "basis": _round_points_for_signature(vector_basis_points_xy),
+                    "synth": _round_points_for_signature(vector_synth_points_xy),
+                    "snap_mode": str(vector_snap_mode),
+                    "expand_order": int(vector_expand_order),
+                    "manual_refine": manual_refine_diagnostics,
+                }
+            )
+            if st.session_state.get("b1b3_vector_synth_signature") != vector_synth_signature:
+                st.session_state["b1b3_vector_synth_signature"] = vector_synth_signature
+                st.session_state["b1b3_vector_aux_points_xy"] = []
+                st.session_state["b1b3_vector_removed_point_ids"] = []
+                st.session_state["b1b3_vector_edit_action_signature"] = ""
+                st.session_state["b1b3_vector_edit_canvas_nonce"] = int(
+                    st.session_state.get("b1b3_vector_edit_canvas_nonce", 0)
+                ) + 1
+
+            vector_aux_points_xy = _normalize_points_xy(
+                st.session_state.get("b1b3_vector_aux_points_xy", [])
+            )
+            vector_removed_ids = sorted(
+                {
+                    int(item)
+                    for item in st.session_state.get("b1b3_vector_removed_point_ids", [])
+                    if isinstance(item, int | float)
+                }
+            )
             if vector_synth_diagnostics.get("enabled"):
                 st.caption(
                     "Vector synthesis: "
@@ -2866,6 +3499,245 @@ def main() -> None:
                         use_container_width=True,
                         height=200,
                     )
+
+            st.subheader("Vector Point Review")
+            st.caption(
+                "After two-point synthesis, add missed spots or delete synthesized/auxiliary "
+                "spots. The reviewed points are merged and sorted before B3/B4 metrics."
+            )
+            vector_edit_canvas_col, vector_edit_status_col = st.columns([1.05, 0.95])
+            with vector_edit_status_col:
+                vector_action_options = ["Add point", "Delete point"]
+                current_vector_action = st.session_state.get("b1b3_vector_edit_action_mode")
+                vector_action_index = (
+                    vector_action_options.index(str(current_vector_action))
+                    if str(current_vector_action) in vector_action_options
+                    else 0
+                )
+                vector_edit_action = st.radio(
+                    "Vector canvas action",
+                    options=vector_action_options,
+                    index=vector_action_index,
+                    horizontal=True,
+                    key="b1b3_vector_edit_action_mode",
+                )
+                vector_edit_zoom = st.slider(
+                    "Vector edit zoom",
+                    min_value=1.0,
+                    max_value=6.0,
+                    value=float(fft_canvas_zoom),
+                    step=0.1,
+                    key="b1b3_vector_edit_zoom",
+                    help="Zoomed center crop for reviewing synthesized vector points.",
+                )
+                vector_hit_radius_px = st.slider(
+                    "Vector delete hit radius (px)",
+                    min_value=1.0,
+                    max_value=20.0,
+                    value=6.0,
+                    step=0.5,
+                    key="b1b3_vector_hit_radius_px",
+                )
+
+            vector_action_signature = (
+                f"{vector_edit_action}|{float(vector_edit_zoom):.2f}|"
+                f"{float(vector_hit_radius_px):.2f}"
+            )
+            if (
+                st.session_state.get("b1b3_vector_edit_action_signature")
+                != vector_action_signature
+            ):
+                st.session_state["b1b3_vector_edit_action_signature"] = vector_action_signature
+                st.session_state["b1b3_vector_edit_canvas_nonce"] = int(
+                    st.session_state.get("b1b3_vector_edit_canvas_nonce", 0)
+                ) + 1
+
+            (
+                vector_edit_bg,
+                vector_edit_sx,
+                vector_edit_sy,
+                vector_edit_x_offset,
+                vector_edit_y_offset,
+            ) = _to_fft_display_image(
+                fft_image_norm,
+                max_side=900,
+                zoom=float(vector_edit_zoom),
+                center_xy=(float(fft_analysis.center[0]), float(fft_analysis.center[1])),
+            )
+            vector_edit_bg = _draw_auto_points_on_canvas_image(
+                vector_edit_bg,
+                auto_points_xy=list(vector_synth_points_xy),
+                center_xy=(float(fft_analysis.center[0]), float(fft_analysis.center[1])),
+                sx=float(vector_edit_sx),
+                sy=float(vector_edit_sy),
+                x_offset=float(vector_edit_x_offset),
+                y_offset=float(vector_edit_y_offset),
+                removed_auto_peak_ids=set(vector_removed_ids),
+                manual_points_xy=list(vector_aux_points_xy),
+            )
+            with vector_edit_canvas_col:
+                st.write(
+                    f"{vector_edit_action} synthesized points "
+                    f"(zoom x{float(vector_edit_zoom):.1f}):"
+                )
+                vector_edit_canvas_result = st_canvas(
+                    fill_color="rgba(255,255,255,0.25)",
+                    stroke_width=2,
+                    stroke_color=(
+                        "#00ffaa" if str(vector_edit_action) == "Add point" else "#ff3333"
+                    ),
+                    background_image=vector_edit_bg,
+                    drawing_mode="point",
+                    point_display_radius=4,
+                    display_toolbar=True,
+                    update_streamlit=True,
+                    height=vector_edit_bg.height,
+                    width=vector_edit_bg.width,
+                    key=(
+                        "b1b3-vector-edit-canvas-"
+                        f"{int(st.session_state.get('b1b3_vector_edit_canvas_nonce', 0))}"
+                    ),
+                )
+                if st.button("Clear Vector Point Edits", key="b1b3_clear_vector_edits_btn"):
+                    st.session_state["b1b3_vector_aux_points_xy"] = []
+                    st.session_state["b1b3_vector_removed_point_ids"] = []
+                    st.session_state["b1b3_vector_aux_delete_nonce"] = int(
+                        st.session_state.get("b1b3_vector_aux_delete_nonce", 0)
+                    ) + 1
+                    st.session_state["b1b3_vector_edit_canvas_nonce"] = int(
+                        st.session_state.get("b1b3_vector_edit_canvas_nonce", 0)
+                    ) + 1
+                    st.rerun()
+
+            vector_edit_clicks_xy = _extract_canvas_points_xy(
+                vector_edit_canvas_result,
+                sx=float(vector_edit_sx),
+                sy=float(vector_edit_sy),
+                x_offset=float(vector_edit_x_offset),
+                y_offset=float(vector_edit_y_offset),
+            )
+            if vector_edit_clicks_xy:
+                if str(vector_edit_action) == "Add point":
+                    vector_aux_points_xy, _vector_edit_diag = _append_manual_canvas_points(
+                        vector_aux_points_xy,
+                        vector_edit_clicks_xy,
+                        manual_min_distance_px=float(manual_min_distance),
+                        max_points=int(manual_max_points),
+                    )
+                else:
+                    (
+                        canvas_remove_synth_ids,
+                        canvas_remove_aux_ids,
+                        _vector_edit_diag,
+                    ) = _resolve_delete_canvas_clicks(
+                        vector_edit_clicks_xy,
+                        auto_points_xy=list(vector_synth_points_xy),
+                        manual_points_xy=list(vector_aux_points_xy),
+                        hit_radius_px=float(vector_hit_radius_px),
+                    )
+                    vector_removed_ids = sorted(
+                        {
+                            int(item)
+                            for item in list(vector_removed_ids)
+                            + list(canvas_remove_synth_ids)
+                        }
+                    )
+                    remove_aux_set = {int(item) for item in canvas_remove_aux_ids}
+                    vector_aux_points_xy = [
+                        point
+                        for idx, point in enumerate(vector_aux_points_xy)
+                        if int(idx) not in remove_aux_set
+                    ]
+                st.session_state["b1b3_vector_aux_points_xy"] = list(vector_aux_points_xy)
+                st.session_state["b1b3_vector_removed_point_ids"] = list(vector_removed_ids)
+                st.session_state["b1b3_vector_edit_canvas_nonce"] = int(
+                    st.session_state.get("b1b3_vector_edit_canvas_nonce", 0)
+                ) + 1
+                st.rerun()
+
+            vector_aux_points_xy = _normalize_points_xy(
+                st.session_state.get("b1b3_vector_aux_points_xy", [])
+            )
+            vector_removed_ids = sorted(
+                {
+                    int(item)
+                    for item in st.session_state.get("b1b3_vector_removed_point_ids", [])
+                    if isinstance(item, int | float)
+                }
+            )
+            with vector_edit_status_col:
+                synth_delete_key = "b1b3_vector_removed_point_ids_widget"
+                if st.session_state.get(synth_delete_key) != vector_removed_ids:
+                    st.session_state[synth_delete_key] = list(vector_removed_ids)
+                synth_delete_ids = st.multiselect(
+                    "Delete synthesized point ids",
+                    options=list(range(len(vector_synth_points_xy))),
+                    format_func=lambda idx: (
+                        f"{int(idx)}: x={float(vector_synth_points_xy[int(idx)][0]):.1f}, "
+                        f"y={float(vector_synth_points_xy[int(idx)][1]):.1f}"
+                    ),
+                    key=synth_delete_key,
+                )
+                vector_removed_ids = sorted({int(item) for item in synth_delete_ids})
+                st.session_state["b1b3_vector_removed_point_ids"] = list(vector_removed_ids)
+
+                aux_rows = [
+                    {
+                        "aux_id": f"M{idx}",
+                        "x": round(float(point[0]), 4),
+                        "y": round(float(point[1]), 4),
+                    }
+                    for idx, point in enumerate(vector_aux_points_xy)
+                ]
+                if aux_rows:
+                    st.dataframe(aux_rows, use_container_width=True, hide_index=True, height=150)
+                    aux_delete_key = (
+                        "b1b3_vector_aux_delete_ids_"
+                        f"{int(st.session_state.get('b1b3_vector_aux_delete_nonce', 0))}"
+                    )
+                    aux_delete_ids = st.multiselect(
+                        "Delete auxiliary point ids",
+                        options=list(range(len(vector_aux_points_xy))),
+                        format_func=lambda idx: (
+                            f"M{int(idx)}: x={float(vector_aux_points_xy[int(idx)][0]):.1f}, "
+                            f"y={float(vector_aux_points_xy[int(idx)][1]):.1f}"
+                        ),
+                        key=aux_delete_key,
+                    )
+                    if st.button(
+                        "Delete selected auxiliary points",
+                        disabled=not aux_delete_ids,
+                        key="b1b3_delete_vector_aux_points_btn",
+                    ):
+                        aux_delete_set = {int(item) for item in aux_delete_ids}
+                        st.session_state["b1b3_vector_aux_points_xy"] = [
+                            point
+                            for idx, point in enumerate(vector_aux_points_xy)
+                            if int(idx) not in aux_delete_set
+                        ]
+                        st.session_state["b1b3_vector_aux_delete_nonce"] = int(
+                            st.session_state.get("b1b3_vector_aux_delete_nonce", 0)
+                        ) + 1
+                        st.session_state["b1b3_vector_edit_canvas_nonce"] = int(
+                            st.session_state.get("b1b3_vector_edit_canvas_nonce", 0)
+                        ) + 1
+                        st.rerun()
+                else:
+                    st.caption("No auxiliary points added.")
+
+            synth_kept_points_xy = [
+                (float(point[0]), float(point[1]))
+                for idx, point in enumerate(vector_synth_points_xy)
+                if int(idx) not in set(vector_removed_ids)
+            ]
+            selected_points_xy = _deduplicate_points(
+                list(synth_kept_points_xy) + list(vector_aux_points_xy),
+                min_distance_px=float(manual_min_distance),
+            )
+            selected_points_xy = _sort_points_by_fft_intensity(
+                selected_points_xy,
+                np.asarray(fft_analysis.log_magnitude, dtype=np.float64),
+            )
     else:
         selected_points_xy = list(auto_points_xy)
 
@@ -2919,10 +3791,20 @@ def main() -> None:
             "result": manual_result,
         }
 
+    if selection_mode == MODE_AUTO_EDIT:
+        annotate_auto_ids = overlay_label_mode == "Both"
+        annotate_selected_ids = overlay_label_mode != "Off"
+    elif selection_mode == MODE_TWO_VECTOR:
+        annotate_auto_ids = False
+        annotate_selected_ids = overlay_label_mode != "Off"
+    else:
+        annotate_auto_ids = False
+        annotate_selected_ids = overlay_label_mode in {"Selected points", "Both"}
+
     overlay_fig = _plot_peak_overlay(
         fft_image_norm,
         center_xy=(float(fft_analysis.center[0]), float(fft_analysis.center[1])),
-        auto_points_xy=auto_points_xy,
+        auto_points_xy=(auto_points_xy if selection_mode == MODE_AUTO_EDIT else []),
         selected_points_xy=selected_points_xy,
         manual_raw_points_xy=(
             manual_points_xy if selection_mode in {MODE_AUTO_EDIT, MODE_TWO_VECTOR} else []
@@ -2931,14 +3813,20 @@ def main() -> None:
             manual_points_refined_xy if selection_mode in {MODE_AUTO_EDIT, MODE_TWO_VECTOR} else []
         ),
         basis_points_xy=(vector_basis_points_xy if selection_mode == MODE_TWO_VECTOR else []),
-        annotate_auto_ids=overlay_label_mode in {"Auto peaks", "Both"},
-        annotate_selected_ids=overlay_label_mode in {"Selected points", "Both"},
+        annotate_auto_ids=annotate_auto_ids,
+        annotate_selected_ids=annotate_selected_ids,
     )
     st.pyplot(overlay_fig, clear_figure=True)
-    st.caption(
-        "Overlay number equals table `peak_id`: `auto` -> `Auto (pipeline)`, "
-        "`selected` -> `Selected points`."
-    )
+    if selection_mode == MODE_AUTO_EDIT:
+        st.caption(
+            "Red `selected` labels are the active table `peak_id` after canvas edits "
+            "and intensity sorting."
+        )
+    else:
+        st.caption(
+            "Vector-mode overlay hides pipeline auto peaks; selected markers come only "
+            "from two-point vector synthesis."
+        )
     st.caption(
         "The red `selected` markers are the active spot set for the selected mode."
     )
@@ -2995,31 +3883,22 @@ def main() -> None:
         if selection_mode == MODE_AUTO_EDIT
         else "Vector synthesis set"
     )
-    tab_auto, tab_selected, tab_manual_align, tab_b1, tab_diag = st.tabs(
+    tab_selected, tab_auto, tab_manual_align, tab_b1, tab_diag = st.tabs(
         [
-            "Auto (pipeline)",
             selected_tab_label,
+            "Auto (pipeline)",
             "Manual table align",
             "B1 details",
             "Warnings / Provenance",
         ]
     )
 
-    with tab_auto:
-        st.caption("Current main pipeline output (`run_diffraction_analysis`).")
-        st.dataframe(auto_rows, use_container_width=True, height=300)
-        st.subheader("Auto Phase Candidates")
-        st.dataframe(
-            _build_phase_rows(list(diffraction_auto.phase_candidates)),
-            use_container_width=True,
-        )
-
     with tab_selected:
         if selection_mode == MODE_AUTO_EDIT:
             st.caption(
-                "Active auto-mode spot set after applying the exclusion list. "
-                "This keeps the backup UI's clear separation between pipeline peaks "
-                "and review output."
+                "Active peak set after applying canvas edits. Auto-detected and manually "
+                "added spots are merged, intensity-sorted, and analyzed through the same B3/B4 "
+                "metric path."
             )
         else:
             st.caption(
@@ -3030,6 +3909,15 @@ def main() -> None:
         st.subheader("Selected Phase Candidates")
         st.dataframe(
             _build_phase_rows(list(manual_result["phase_candidates"])),
+            use_container_width=True,
+        )
+
+    with tab_auto:
+        st.caption("Original pipeline output (`run_diffraction_analysis`) before review edits.")
+        st.dataframe(auto_rows, use_container_width=True, height=300)
+        st.subheader("Auto Phase Candidates")
+        st.dataframe(
+            _build_phase_rows(list(diffraction_auto.phase_candidates)),
             use_container_width=True,
         )
 
