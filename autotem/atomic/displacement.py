@@ -41,6 +41,7 @@ def compute_atomic_displacement_from_basis(
     b_index: int,
     reference_mask: np.ndarray | None = None,
     lattice_index_tolerance: float = 0.40,
+    manual_lattice_indices: dict[int, tuple[int, int]] | None = None,
 ) -> AtomicDisplacementResult:
     """Fit an ideal 2D lattice from custom basis picks and compute atom displacements."""
     coords = np.asarray(coordinates, dtype=np.float64)
@@ -75,6 +76,22 @@ def compute_atomic_displacement_from_basis(
     valid_mask[int(base_index)] = True
     valid_mask[int(a_index)] = True
     valid_mask[int(b_index)] = True
+    manual_mask = np.zeros(n_atoms, dtype=bool)
+    if manual_lattice_indices:
+        for atom_index, lattice_ij in manual_lattice_indices.items():
+            atom_idx = int(atom_index)
+            if atom_idx < 0 or atom_idx >= n_atoms:
+                raise ValueError(
+                    f"manual_lattice_indices contains atom index {atom_idx}, "
+                    f"but valid range is [0, {n_atoms - 1}]."
+                )
+            ij = np.asarray(lattice_ij, dtype=np.int32)
+            if ij.shape != (2,):
+                raise ValueError("Each manual lattice index must be a pair (i, j).")
+            lattice_indices[atom_idx] = ij
+            assignment_residual[atom_idx] = 0.0
+            valid_mask[atom_idx] = True
+            manual_mask[atom_idx] = True
 
     if np.sum(valid_mask) < 3:
         raise ValueError(
@@ -83,7 +100,7 @@ def compute_atomic_displacement_from_basis(
         )
 
     ref_mask = _normalize_reference_mask(reference_mask, n_atoms)
-    fit_mask = valid_mask & ref_mask
+    fit_mask = (valid_mask & ref_mask) | manual_mask
     fit_mask = _ensure_fit_mask(
         coords=coords,
         lattice_indices=lattice_indices,
@@ -151,6 +168,7 @@ def compute_atomic_displacement_from_basis(
         "source": "autotem.atomic.displacement.compute_atomic_displacement_from_basis",
         "parameters": {
             "lattice_index_tolerance": float(lattice_index_tolerance),
+            "manual_lattice_index_count": int(np.sum(manual_mask)),
         },
         "basis_indices": {
             "base_index": int(base_index),
@@ -163,6 +181,14 @@ def compute_atomic_displacement_from_basis(
             "assignment_residual_median": assign_med,
             "reference_atom_count": int(np.sum(ref_mask)),
             "fit_atom_count": int(np.sum(fit_mask)),
+            "manual_anchor_count": int(np.sum(manual_mask)),
+        },
+        "manual_lattice_indices": {
+            str(int(atom_idx)): [
+                int(lattice_indices[int(atom_idx), 0]),
+                int(lattice_indices[int(atom_idx), 1]),
+            ]
+            for atom_idx in np.flatnonzero(manual_mask)
         },
     }
 

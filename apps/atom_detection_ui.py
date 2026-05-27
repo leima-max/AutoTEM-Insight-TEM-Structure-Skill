@@ -571,6 +571,182 @@ def _render_atomic_displacement_overlay(
     return fig
 
 
+def _render_atomic_displacement_vector_map(
+    image_norm: np.ndarray,
+    result: AtomicDisplacementResult,
+    *,
+    displacement_scale: float,
+    displacement_unit: str,
+    show_image: bool,
+    marker_size: float = 26.0,
+    arrow_display_scale: float = 1.0,
+    max_arrows: int = 1200,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(7.0, 7.0), dpi=180)
+    h, w = image_norm.shape
+    if show_image:
+        ax.imshow(image_norm, cmap="gray")
+    else:
+        ax.set_facecolor("white")
+        ax.set_xlim(0, w)
+        ax.set_ylim(h, 0)
+        ax.set_aspect("equal")
+
+    valid = np.asarray(result.valid_atom_mask, dtype=bool)
+    obs = np.asarray(result.coordinates_observed_yx, dtype=np.float64)
+    ideal = np.asarray(result.coordinates_ideal_yx, dtype=np.float64)
+    disp = np.asarray(result.displacement_yx, dtype=np.float64)
+    mag = np.asarray(result.displacement_magnitude, dtype=np.float64) * displacement_scale
+
+    if np.any(valid):
+        vmax = max(_symmetric_limit(mag[valid], percentile=98.0, fallback=1.0), 1e-6)
+        sc = ax.scatter(
+            obs[valid, 1],
+            obs[valid, 0],
+            c=mag[valid],
+            s=marker_size,
+            cmap="viridis",
+            vmin=0.0,
+            vmax=vmax,
+            edgecolors="white" if show_image else "#212121",
+            linewidths=0.25,
+            zorder=3,
+        )
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.03)
+        cbar.set_label(f"|u| [{displacement_unit}]", rotation=90)
+
+        valid_idx = np.flatnonzero(valid)
+        if len(valid_idx) > max_arrows:
+            stride = max(int(np.ceil(len(valid_idx) / max_arrows)), 1)
+            valid_idx = valid_idx[::stride]
+        ax.quiver(
+            ideal[valid_idx, 1],
+            ideal[valid_idx, 0],
+            disp[valid_idx, 1] * float(arrow_display_scale),
+            disp[valid_idx, 0] * float(arrow_display_scale),
+            angles="xy",
+            scale_units="xy",
+            scale=1.0,
+            color="#ffca28" if show_image else "#263238",
+            width=0.0024,
+            zorder=4,
+        )
+
+    ax.set_title("Atomic displacement vector map")
+    ax.axis("off")
+    fig.tight_layout()
+    return fig
+
+
+def _render_atomic_displacement_component_maps(
+    image_norm: np.ndarray,
+    result: AtomicDisplacementResult,
+    *,
+    displacement_scale: float,
+    displacement_unit: str,
+    marker_size: float = 24.0,
+) -> plt.Figure:
+    h, w = image_norm.shape
+    valid = np.asarray(result.valid_atom_mask, dtype=bool)
+    obs = np.asarray(result.coordinates_observed_yx, dtype=np.float64)
+    uy = np.asarray(result.displacement_yx[:, 0], dtype=np.float64) * displacement_scale
+    ux = np.asarray(result.displacement_yx[:, 1], dtype=np.float64) * displacement_scale
+    mag = np.asarray(result.displacement_magnitude, dtype=np.float64) * displacement_scale
+
+    disp_lim = max(_symmetric_limit(ux[valid]), _symmetric_limit(uy[valid]), 1e-6)
+    mag_lim = max(_symmetric_limit(mag[valid], percentile=98.0, fallback=1.0), 1e-6)
+
+    fig, axes = plt.subplots(1, 3, figsize=(12.2, 4.2), dpi=170)
+    panels = [
+        (ux, f"ux [{displacement_unit}]", "coolwarm", -disp_lim, disp_lim),
+        (uy, f"uy [{displacement_unit}]", "coolwarm", -disp_lim, disp_lim),
+        (mag, f"|u| [{displacement_unit}]", "viridis", 0.0, mag_lim),
+    ]
+    for ax, (values, title, cmap, vmin, vmax) in zip(axes, panels, strict=False):
+        ax.set_facecolor("white")
+        ax.set_xlim(0, w)
+        ax.set_ylim(h, 0)
+        ax.set_aspect("equal")
+        if np.any(valid):
+            sc = ax.scatter(
+                obs[valid, 1],
+                obs[valid, 0],
+                c=values[valid],
+                s=marker_size,
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                edgecolors="#212121",
+                linewidths=0.2,
+            )
+            cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.03)
+            cbar.set_label(title, rotation=90)
+        ax.set_title(title)
+        ax.axis("off")
+    fig.tight_layout()
+    return fig
+
+
+def _render_atomic_displacement_invalid_map(
+    image_norm: np.ndarray,
+    result: AtomicDisplacementResult,
+    *,
+    marker_size: float = 28.0,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(7.0, 7.0), dpi=180)
+    ax.imshow(image_norm, cmap="gray")
+
+    obs = np.asarray(result.coordinates_observed_yx, dtype=np.float64)
+    valid = np.asarray(result.valid_atom_mask, dtype=bool)
+    residual = np.asarray(result.assignment_residual, dtype=np.float64)
+    invalid = ~valid
+
+    if np.any(valid):
+        ax.scatter(
+            obs[valid, 1],
+            obs[valid, 0],
+            s=max(marker_size * 0.55, 10.0),
+            c="#64b5f6",
+            alpha=0.65,
+            edgecolors="white",
+            linewidths=0.2,
+            label="valid assignment",
+        )
+    if np.any(invalid):
+        vmax = max(float(np.nanmax(residual[invalid])), 1e-6)
+        sc = ax.scatter(
+            obs[invalid, 1],
+            obs[invalid, 0],
+            c=residual[invalid],
+            s=marker_size,
+            cmap="magma",
+            vmin=0.0,
+            vmax=vmax,
+            marker="x",
+            linewidths=0.95,
+            label="invalid assignment",
+        )
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.03)
+        cbar.set_label("assignment residual", rotation=90)
+    if np.any(result.fit_atom_mask):
+        ax.scatter(
+            obs[result.fit_atom_mask, 1],
+            obs[result.fit_atom_mask, 0],
+            s=max(marker_size * 1.1, 16.0),
+            facecolors="none",
+            edgecolors="#00ff66",
+            linewidths=0.75,
+            label="fit/reference atoms",
+        )
+    ax.set_title("Invalid assignment QA map")
+    ax.axis("off")
+    handles, _ = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(loc="upper right", fontsize=7, framealpha=0.82)
+    fig.tight_layout()
+    return fig
+
+
 def _render_custom_basis_context(
     image_norm: np.ndarray,
     coords: np.ndarray,
@@ -681,6 +857,9 @@ def _invalidate_custom_basis_state() -> None:
     st.session_state.custom_basis_picker_nonce = int(
         st.session_state.get("custom_basis_picker_nonce", 0)
     ) + 1
+    st.session_state.atomic_displacement_manual_pairs = {}
+    st.session_state.atomic_displacement_manual_atom = None
+    st.session_state.atomic_displacement_manual_site = None
     _invalidate_atomic_displacement_state()
 
 
@@ -763,7 +942,12 @@ def _apply_custom_basis_clicks(
     return changed, message
 
 
-def _extract_altair_atom_pick(event_state: Any, selection_name: str = "basis_pick") -> int | None:
+def _extract_altair_pick_value(
+    event_state: Any,
+    *,
+    selection_name: str,
+    field_name: str,
+) -> Any | None:
     if event_state is None:
         return None
     selection = getattr(event_state, "selection", None)
@@ -772,20 +956,47 @@ def _extract_altair_atom_pick(event_state: Any, selection_name: str = "basis_pic
     selection_state = selection.get(selection_name, {})
     if isinstance(selection_state, list) and selection_state:
         first = selection_state[0]
-        if isinstance(first, dict) and "atom_index" in first:
-            atom_index = first.get("atom_index")
-            if isinstance(atom_index, list) and atom_index:
-                return int(atom_index[0])
-            if isinstance(atom_index, (int, float)):
-                return int(atom_index)
+        if isinstance(first, dict) and field_name in first:
+            value = first.get(field_name)
+            if isinstance(value, list) and value:
+                return value[0]
+            return value
     if not isinstance(selection_state, dict):
         return None
-    atom_index = selection_state.get("atom_index")
+    value = selection_state.get(field_name)
+    if isinstance(value, list) and value:
+        return value[0]
+    return value
+
+
+def _extract_altair_atom_pick(event_state: Any, selection_name: str = "basis_pick") -> int | None:
+    atom_index = _extract_altair_pick_value(
+        event_state,
+        selection_name=selection_name,
+        field_name="atom_index",
+    )
     if isinstance(atom_index, list) and atom_index:
         return int(atom_index[0])
     if isinstance(atom_index, (int, float)):
         return int(atom_index)
     return None
+
+
+def _extract_altair_site_pick(
+    event_state: Any, selection_name: str = "manual_site_pick"
+) -> tuple[int, int] | None:
+    site_key = _extract_altair_pick_value(
+        event_state,
+        selection_name=selection_name,
+        field_name="site_key",
+    )
+    if not isinstance(site_key, str) or "," not in site_key:
+        return None
+    i_text, j_text = site_key.split(",", maxsplit=1)
+    try:
+        return int(i_text), int(j_text)
+    except ValueError:
+        return None
 
 
 def _render_custom_basis_picker_chart(
@@ -794,6 +1005,7 @@ def _render_custom_basis_picker_chart(
     basis_indices: dict[str, int | None],
     *,
     max_side: int = 900,
+    chart_max_side: int = 620,
 ):
     image_only, sx, sy = _to_display_image(
         image_norm,
@@ -803,6 +1015,9 @@ def _render_custom_basis_picker_chart(
         max_side=max_side,
     )
     disp_w, disp_h = image_only.size
+    chart_scale = min(1.0, float(chart_max_side) / max(disp_w, disp_h))
+    chart_w = max(260, int(round(disp_w * chart_scale)))
+    chart_h = max(260, int(round(disp_h * chart_scale)))
 
     role_lookup = {int(v): k for k, v in basis_indices.items() if v is not None}
     point_df = pd.DataFrame(
@@ -844,10 +1059,328 @@ def _render_custom_basis_picker_chart(
     )
     chart = (
         alt.layer(points)
-        .properties(width=disp_w, height=disp_h)
+        .properties(width=chart_w, height=chart_h)
         .configure_view(stroke=None)
     )
     return chart
+
+
+def _render_manual_observed_picker_chart(
+    image_norm: np.ndarray,
+    result: AtomicDisplacementResult,
+    manual_pairs: dict[int, tuple[int, int]],
+    *,
+    max_side: int = 900,
+    chart_max_side: int = 520,
+):
+    image_only, sx, sy = _to_display_image(
+        image_norm,
+        coords=np.empty((0, 2), dtype=np.float64),
+        roi_mask=None,
+        basis_markers=None,
+        max_side=max_side,
+    )
+    disp_w, disp_h = image_only.size
+    chart_scale = min(1.0, float(chart_max_side) / max(disp_w, disp_h))
+    chart_w = max(240, int(round(disp_w * chart_scale)))
+    chart_h = max(240, int(round(disp_h * chart_scale)))
+    obs = np.asarray(result.coordinates_observed_yx, dtype=np.float64)
+    valid = np.asarray(result.valid_atom_mask, dtype=bool)
+    manual_set = {int(k) for k in manual_pairs}
+    roles = [
+        "manual" if idx in manual_set else ("valid" if bool(valid[idx]) else "invalid")
+        for idx in range(len(obs))
+    ]
+    point_df = pd.DataFrame(
+        {
+            "atom_index": np.arange(len(obs), dtype=int),
+            "x": np.asarray(obs[:, 1] / sx, dtype=np.float64),
+            "y": np.asarray(obs[:, 0] / sy, dtype=np.float64),
+            "role": roles,
+        }
+    )
+    point_df["color"] = point_df["role"].map(
+        {"manual": "#ffd54f", "invalid": "#ff5252", "valid": "#64b5f6"}
+    )
+    point_df["size"] = point_df["role"].map({"manual": 95, "invalid": 75, "valid": 45})
+    picker = alt.selection_point(
+        name="manual_atom_pick",
+        fields=["atom_index"],
+        nearest=True,
+        on="click",
+        clear=False,
+    )
+    return (
+        alt.Chart(point_df)
+        .mark_circle(stroke="white", strokeWidth=0.45, opacity=0.9)
+        .encode(
+            x=alt.X("x:Q", axis=None, scale=alt.Scale(domain=[0, disp_w])),
+            y=alt.Y("y:Q", axis=None, scale=alt.Scale(domain=[disp_h, 0])),
+            color=alt.Color("color:N", scale=None, legend=None),
+            size=alt.Size("size:Q", legend=None),
+            tooltip=[
+                alt.Tooltip("atom_index:Q", title="atom index"),
+                alt.Tooltip("role:N", title="role"),
+            ],
+            fillOpacity=alt.condition(picker, alt.value(1.0), alt.value(0.82)),
+        )
+        .add_params(picker)
+        .properties(width=chart_w, height=chart_h)
+        .configure_view(stroke=None)
+    )
+
+
+def _render_manual_ideal_site_picker_chart(
+    image_norm: np.ndarray,
+    result: AtomicDisplacementResult,
+    manual_pairs: dict[int, tuple[int, int]],
+    *,
+    max_side: int = 900,
+    chart_max_side: int = 520,
+):
+    image_only, sx, sy = _to_display_image(
+        image_norm,
+        coords=np.empty((0, 2), dtype=np.float64),
+        roi_mask=None,
+        basis_markers=None,
+        max_side=max_side,
+    )
+    disp_w, disp_h = image_only.size
+    chart_scale = min(1.0, float(chart_max_side) / max(disp_w, disp_h))
+    chart_w = max(240, int(round(disp_w * chart_scale)))
+    chart_h = max(240, int(round(disp_h * chart_scale)))
+    h, w = image_norm.shape
+    origin = np.asarray(result.fitted_origin_yx, dtype=np.float64)
+    basis = np.asarray(result.fitted_basis_yx, dtype=np.float64)
+    indices = np.asarray(result.lattice_indices_ij, dtype=np.int32)
+    i_min, j_min = np.min(indices, axis=0) - 2
+    i_max, j_max = np.max(indices, axis=0) + 2
+    manual_sites = {tuple(map(int, pair)) for pair in manual_pairs.values()}
+
+    rows: list[dict[str, Any]] = []
+    for i in range(int(i_min), int(i_max) + 1):
+        for j in range(int(j_min), int(j_max) + 1):
+            yx = origin + i * basis[:, 0] + j * basis[:, 1]
+            y, x = float(yx[0]), float(yx[1])
+            if y < -20 or y > h + 20 or x < -20 or x > w + 20:
+                continue
+            rows.append(
+                {
+                    "site_key": f"{i},{j}",
+                    "lattice_i": i,
+                    "lattice_j": j,
+                    "x": x / sx,
+                    "y": y / sy,
+                    "role": "manual target" if (i, j) in manual_sites else "ideal site",
+                }
+            )
+    site_df = pd.DataFrame(rows)
+    if site_df.empty:
+        site_df = pd.DataFrame(
+            {
+                "site_key": [],
+                "lattice_i": [],
+                "lattice_j": [],
+                "x": [],
+                "y": [],
+                "role": [],
+            }
+        )
+    site_df["color"] = site_df["role"].map(
+        {"manual target": "#ffd54f", "ideal site": "#00bcd4"}
+    )
+    site_df["size"] = site_df["role"].map({"manual target": 95, "ideal site": 48})
+    picker = alt.selection_point(
+        name="manual_site_pick",
+        fields=["site_key"],
+        nearest=True,
+        on="click",
+        clear=False,
+    )
+    return (
+        alt.Chart(site_df)
+        .mark_circle(stroke="#263238", strokeWidth=0.45, opacity=0.9)
+        .encode(
+            x=alt.X("x:Q", axis=None, scale=alt.Scale(domain=[0, disp_w])),
+            y=alt.Y("y:Q", axis=None, scale=alt.Scale(domain=[disp_h, 0])),
+            color=alt.Color("color:N", scale=None, legend=None),
+            size=alt.Size("size:Q", legend=None),
+            tooltip=[
+                alt.Tooltip("site_key:N", title="site"),
+                alt.Tooltip("role:N", title="role"),
+            ],
+            fillOpacity=alt.condition(picker, alt.value(1.0), alt.value(0.82)),
+        )
+        .add_params(picker)
+        .properties(width=chart_w, height=chart_h)
+        .configure_view(stroke=None)
+    )
+
+
+def _ideal_site_rows_for_result(
+    image_norm: np.ndarray,
+    result: AtomicDisplacementResult,
+    manual_pairs: dict[int, tuple[int, int]],
+    *,
+    sx: float,
+    sy: float,
+) -> list[dict[str, Any]]:
+    h, w = image_norm.shape
+    origin = np.asarray(result.fitted_origin_yx, dtype=np.float64)
+    basis = np.asarray(result.fitted_basis_yx, dtype=np.float64)
+    indices = np.asarray(result.lattice_indices_ij, dtype=np.int32)
+    i_min, j_min = np.min(indices, axis=0) - 2
+    i_max, j_max = np.max(indices, axis=0) + 2
+    manual_sites = {tuple(map(int, pair)) for pair in manual_pairs.values()}
+    rows: list[dict[str, Any]] = []
+    for i in range(int(i_min), int(i_max) + 1):
+        for j in range(int(j_min), int(j_max) + 1):
+            yx = origin + i * basis[:, 0] + j * basis[:, 1]
+            y, x = float(yx[0]), float(yx[1])
+            if y < -20 or y > h + 20 or x < -20 or x > w + 20:
+                continue
+            rows.append(
+                {
+                    "site_key": f"{i},{j}",
+                    "lattice_i": i,
+                    "lattice_j": j,
+                    "x": x / sx,
+                    "y": y / sy,
+                    "role": "manual target" if (i, j) in manual_sites else "ideal site",
+                }
+            )
+    return rows
+
+
+def _render_manual_pair_overlay_chart(
+    image_norm: np.ndarray,
+    result: AtomicDisplacementResult,
+    manual_pairs: dict[int, tuple[int, int]],
+    *,
+    pick_mode: str,
+    max_side: int = 900,
+    chart_max_side: int = 760,
+):
+    image_only, sx, sy = _to_display_image(
+        image_norm,
+        coords=np.empty((0, 2), dtype=np.float64),
+        roi_mask=None,
+        basis_markers=None,
+        max_side=max_side,
+    )
+    disp_w, disp_h = image_only.size
+    chart_scale = min(1.0, float(chart_max_side) / max(disp_w, disp_h))
+    chart_w = max(320, int(round(disp_w * chart_scale)))
+    chart_h = max(320, int(round(disp_h * chart_scale)))
+
+    obs = np.asarray(result.coordinates_observed_yx, dtype=np.float64)
+    valid = np.asarray(result.valid_atom_mask, dtype=bool)
+    manual_set = {int(k) for k in manual_pairs}
+    atom_df = pd.DataFrame(
+        {
+            "atom_index": np.arange(len(obs), dtype=int),
+            "x": np.asarray(obs[:, 1] / sx, dtype=np.float64),
+            "y": np.asarray(obs[:, 0] / sy, dtype=np.float64),
+            "role": [
+                "manual atom"
+                if idx in manual_set
+                else ("valid atom" if bool(valid[idx]) else "invalid atom")
+                for idx in range(len(obs))
+            ],
+        }
+    )
+    atom_df["color"] = atom_df["role"].map(
+        {"manual atom": "#ffd54f", "invalid atom": "#ff5252", "valid atom": "#64b5f6"}
+    )
+    atom_df["size"] = atom_df["role"].map(
+        {"manual atom": 115, "invalid atom": 92, "valid atom": 62}
+    )
+
+    site_rows = _ideal_site_rows_for_result(
+        image_norm,
+        result,
+        manual_pairs,
+        sx=sx,
+        sy=sy,
+    )
+    site_df = pd.DataFrame(site_rows)
+    if site_df.empty:
+        site_df = pd.DataFrame(
+            {
+                "site_key": [],
+                "lattice_i": [],
+                "lattice_j": [],
+                "x": [],
+                "y": [],
+                "role": [],
+            }
+        )
+    site_df["color"] = site_df["role"].map(
+        {"manual target": "#ffd54f", "ideal site": "#00bcd4"}
+    )
+    site_df["size"] = site_df["role"].map({"manual target": 110, "ideal site": 70})
+
+    atom_picker = alt.selection_point(
+        name="manual_atom_pick",
+        fields=["atom_index"],
+        nearest=True,
+        on="click",
+        clear=False,
+    )
+    site_picker = alt.selection_point(
+        name="manual_site_pick",
+        fields=["site_key"],
+        nearest=True,
+        on="click",
+        clear=False,
+    )
+    atom_points = (
+        alt.Chart(atom_df)
+        .mark_circle(stroke="white", strokeWidth=0.45, opacity=0.82)
+        .encode(
+            x=alt.X("x:Q", axis=None, scale=alt.Scale(domain=[0, disp_w])),
+            y=alt.Y("y:Q", axis=None, scale=alt.Scale(domain=[disp_h, 0])),
+            color=alt.Color("color:N", scale=None, legend=None),
+            size=alt.Size("size:Q", legend=None),
+            tooltip=[
+                alt.Tooltip("atom_index:Q", title="atom index"),
+                alt.Tooltip("role:N", title="role"),
+            ],
+        )
+    )
+    site_points = (
+        alt.Chart(site_df)
+        .mark_point(
+            shape="cross",
+            strokeWidth=1.25,
+            filled=False,
+            opacity=0.88,
+        )
+        .encode(
+            x=alt.X("x:Q", axis=None, scale=alt.Scale(domain=[0, disp_w])),
+            y=alt.Y("y:Q", axis=None, scale=alt.Scale(domain=[disp_h, 0])),
+            color=alt.Color("color:N", scale=None, legend=None),
+            size=alt.Size("size:Q", legend=None),
+            tooltip=[
+                alt.Tooltip("site_key:N", title="site"),
+                alt.Tooltip("role:N", title="role"),
+            ],
+        )
+    )
+    if pick_mode == "Observed atom":
+        atom_points = atom_points.add_params(atom_picker).encode(
+            fillOpacity=alt.condition(atom_picker, alt.value(1.0), alt.value(0.82))
+        )
+    else:
+        site_points = site_points.add_params(site_picker).encode(
+            opacity=alt.condition(site_picker, alt.value(1.0), alt.value(0.88))
+        )
+
+    return (
+        alt.layer(site_points, atom_points)
+        .properties(width=chart_w, height=chart_h)
+        .configure_view(stroke=None)
+    )
 
 
 def _project_strain_to_custom_basis(
@@ -1052,6 +1585,9 @@ for key, default in [
     ("atomic_displacement_result", None),
     ("atomic_displacement_meta", None),
     ("atomic_displacement_tolerance", 0.40),
+    ("atomic_displacement_manual_pairs", {}),
+    ("atomic_displacement_manual_atom", None),
+    ("atomic_displacement_manual_site", None),
     ("distance_pixel_size", 0.02),
     ("distance_unit", "nm"),
     ("pixel_size_auto_nm", None),
@@ -1319,6 +1855,34 @@ with st.sidebar:
             "from the nearest integer lattice site are marked as invalid assignment."
         ),
     )
+    atomic_displacement_vector_show_image = st.checkbox(
+        "Vector map overlay original image",
+        value=True,
+        help="If OFF, show the displacement vector map on a clean white background.",
+    )
+    atomic_displacement_arrow_scale = st.slider(
+        "Vector arrow display scale",
+        min_value=0.2,
+        max_value=8.0,
+        value=1.0,
+        step=0.2,
+        help="Only changes arrow length in the figure; it does not change measured values.",
+    )
+    atomic_displacement_marker_size = st.slider(
+        "Displacement marker size",
+        min_value=8.0,
+        max_value=80.0,
+        value=26.0,
+        step=2.0,
+    )
+    atomic_displacement_max_arrows = st.slider(
+        "Max arrows to draw",
+        min_value=100,
+        max_value=3000,
+        value=1200,
+        step=100,
+        help="Large atom maps are downsampled only for arrow display speed.",
+    )
 
 params = {
     "mode": mode,
@@ -1360,6 +1924,10 @@ params = {
     "atom_strain_overlay_max": float(atom_strain_overlay_max),
     "atom_strain_overlay_marker_size": float(atom_strain_overlay_marker_size),
     "atomic_displacement_tolerance": float(atomic_displacement_tolerance),
+    "atomic_displacement_vector_show_image": bool(atomic_displacement_vector_show_image),
+    "atomic_displacement_arrow_scale": float(atomic_displacement_arrow_scale),
+    "atomic_displacement_marker_size": float(atomic_displacement_marker_size),
+    "atomic_displacement_max_arrows": int(atomic_displacement_max_arrows),
 }
 
 sig = _signature(current_file_sig, params)
@@ -1504,48 +2072,16 @@ distance_stats = compute_distance_statistics(
 )
 
 st.subheader("Direct Image Interaction")
-tool = st.radio(
-    "Tool",
-    [
-        "Add atom by click",
-        "Delete atom by click",
-        "Draw irregular ROI (right-click to close)",
-    ],
-    horizontal=True,
-)
-delete_radius = st.slider("Delete radius (px)", min_value=0.5, max_value=20.0, value=3.0, step=0.5)
-st.caption(
-    "Usage: click/draw on image. "
-    "For ROI mode, `Keep/Remove` can auto-apply current ROI drawing. "
-    "The same ROI can also be reused as the ideal-lattice reference area in atom strain."
+enable_canvas_interaction = st.checkbox(
+    "Enable canvas editing / ROI drawing",
+    value=False,
+    help=(
+        "Turn this on only when you need manual add/delete/ROI editing. "
+        "Keeping it off avoids the drawable-canvas frontend remount issue."
+    ),
 )
 
-roi_action_col1, roi_action_col2 = st.columns(2)
-keep_inside = roi_action_col1.button("Keep Atoms Inside ROI", use_container_width=True)
-remove_inside = roi_action_col2.button("Remove Atoms Inside ROI", use_container_width=True)
-
-canvas_image, sx, sy = _to_display_image(norm, coords=coords, roi_mask=roi_mask, max_side=900)
-draw_mode = "point" if "Draw irregular ROI" not in tool else "polygon"
-canvas_key = f"canvas-{tool}-{st.session_state.canvas_nonce}"
-canvas_result = st_canvas(
-    fill_color="rgba(255, 0, 0, 0.25)",
-    stroke_width=2,
-    stroke_color="#00ffaa",
-    background_image=canvas_image,
-    drawing_mode=draw_mode,
-    point_display_radius=4,
-    display_toolbar=True,
-    update_streamlit=True,
-    height=canvas_image.height,
-    width=canvas_image.width,
-    key=canvas_key,
-)
-
-act_col1, act_col2, act_col3 = st.columns([1, 1, 1])
-apply_action = act_col1.button("Apply Canvas Action", type="primary")
-clear_canvas = act_col2.button("Clear Canvas")
-reset_auto = act_col3.button("Reset to Auto Detection")
-
+reset_auto = st.button("Reset to Auto Detection", use_container_width=False)
 if reset_auto:
     if st.session_state.auto_coords is not None and st.session_state.auto_intensities is not None:
         st.session_state.edited_coords = np.asarray(st.session_state.auto_coords).copy()
@@ -1560,68 +2096,151 @@ if reset_auto:
     roi_mask = None
     st.success("Reset to automatic result.")
 
-if clear_canvas:
-    st.session_state.canvas_nonce = int(st.session_state.canvas_nonce) + 1
-    st.rerun()
+if enable_canvas_interaction:
+    tool = st.radio(
+        "Tool",
+        [
+            "Add atom by click",
+            "Delete atom by click",
+            "Draw irregular ROI (right-click to close)",
+        ],
+        horizontal=True,
+    )
+    delete_radius = st.slider(
+        "Delete radius (px)", min_value=0.5, max_value=20.0, value=3.0, step=0.5
+    )
+    st.caption(
+        "Usage: click/draw on image. "
+        "For ROI mode, `Keep/Remove` can auto-apply current ROI drawing. "
+        "The same ROI can also be reused as the ideal-lattice reference area in atom strain."
+    )
 
-if apply_action:
-    draw_mask_disp = _canvas_draw_mask(canvas_result)
-    if draw_mask_disp is None or not np.any(draw_mask_disp):
-        st.warning("No drawing detected on canvas.")
-    else:
-        if tool == "Add atom by click":
-            disp_points = _mask_centroids(draw_mask_disp, min_pixels=2)
-            raw_points = _map_display_to_raw(disp_points, sx=sx, sy=sy)
-            if len(raw_points) == 0:
-                st.warning("No clicked points found.")
-            else:
-                for y, x in raw_points:
-                    coords = (
-                        np.vstack([coords, np.array([[y, x]], dtype=np.float64)])
-                        if len(coords)
-                        else np.array([[y, x]])
-                    )
-                    intensities = np.append(intensities, _sample_intensity(raw, y, x))
-                st.session_state.edited_coords = coords
-                st.session_state.edited_intensities = intensities
-                _invalidate_atom_strain_state()
-                st.success(f"Added {len(raw_points)} points.")
+    roi_action_col1, roi_action_col2 = st.columns(2)
+    keep_inside = roi_action_col1.button("Keep Atoms Inside ROI", use_container_width=True)
+    remove_inside = roi_action_col2.button("Remove Atoms Inside ROI", use_container_width=True)
 
-        elif tool == "Delete atom by click":
-            disp_points = _mask_centroids(draw_mask_disp, min_pixels=2)
-            raw_points = _map_display_to_raw(disp_points, sx=sx, sy=sy)
-            if len(raw_points) == 0:
-                st.warning("No clicked points found.")
-            elif len(coords) == 0:
-                st.warning("No atom points to delete.")
-            else:
-                removed = 0
-                for y, x in raw_points:
-                    if len(coords) == 0:
-                        break
-                    d2 = (coords[:, 0] - y) ** 2 + (coords[:, 1] - x) ** 2
-                    idx = int(np.argmin(d2))
-                    d = float(np.sqrt(d2[idx]))
-                    if d <= float(delete_radius):
-                        coords = np.delete(coords, idx, axis=0)
-                        intensities = np.delete(intensities, idx, axis=0)
-                        removed += 1
-                st.session_state.edited_coords = coords
-                st.session_state.edited_intensities = intensities
-                _invalidate_atom_strain_state()
-                st.success(f"Removed {removed} points.")
+    canvas_image, sx, sy = _to_display_image(norm, coords=coords, roi_mask=roi_mask, max_side=900)
+    draw_mode = "point" if "Draw irregular ROI" not in tool else "polygon"
+    canvas_key = f"canvas-direct-interaction-{st.session_state.canvas_nonce}"
+    canvas_result = st_canvas(
+        fill_color="rgba(255, 0, 0, 0.25)",
+        stroke_width=2,
+        stroke_color="#00ffaa",
+        background_image=canvas_image,
+        drawing_mode=draw_mode,
+        point_display_radius=4,
+        display_toolbar=True,
+        update_streamlit=True,
+        height=canvas_image.height,
+        width=canvas_image.width,
+        key=canvas_key,
+    )
 
-        else:
-            # Polygon drawing may return border + fill; fill holes to get stable ROI area.
-            roi_disp = ndi.binary_fill_holes(draw_mask_disp)
-            mask = _resize_mask_to_raw(roi_disp, raw.shape)
-            st.session_state.roi_mask = mask
-            _invalidate_atom_strain_state()
-            roi_mask = mask
-            st.success("ROI updated.")
+    act_col1, act_col2 = st.columns([1, 1])
+    apply_action = act_col1.button("Apply Canvas Action", type="primary")
+    clear_canvas = act_col2.button("Clear Canvas")
 
+    if clear_canvas:
         st.session_state.canvas_nonce = int(st.session_state.canvas_nonce) + 1
         st.rerun()
+
+    if apply_action:
+        draw_mask_disp = _canvas_draw_mask(canvas_result)
+        if draw_mask_disp is None or not np.any(draw_mask_disp):
+            st.warning("No drawing detected on canvas.")
+        else:
+            if tool == "Add atom by click":
+                disp_points = _mask_centroids(draw_mask_disp, min_pixels=2)
+                raw_points = _map_display_to_raw(disp_points, sx=sx, sy=sy)
+                if len(raw_points) == 0:
+                    st.warning("No clicked points found.")
+                else:
+                    for y, x in raw_points:
+                        coords = (
+                            np.vstack([coords, np.array([[y, x]], dtype=np.float64)])
+                            if len(coords)
+                            else np.array([[y, x]])
+                        )
+                        intensities = np.append(intensities, _sample_intensity(raw, y, x))
+                    st.session_state.edited_coords = coords
+                    st.session_state.edited_intensities = intensities
+                    _invalidate_atom_strain_state()
+                    st.success(f"Added {len(raw_points)} points.")
+
+            elif tool == "Delete atom by click":
+                disp_points = _mask_centroids(draw_mask_disp, min_pixels=2)
+                raw_points = _map_display_to_raw(disp_points, sx=sx, sy=sy)
+                if len(raw_points) == 0:
+                    st.warning("No clicked points found.")
+                elif len(coords) == 0:
+                    st.warning("No atom points to delete.")
+                else:
+                    removed = 0
+                    for y, x in raw_points:
+                        if len(coords) == 0:
+                            break
+                        d2 = (coords[:, 0] - y) ** 2 + (coords[:, 1] - x) ** 2
+                        idx = int(np.argmin(d2))
+                        d = float(np.sqrt(d2[idx]))
+                        if d <= float(delete_radius):
+                            coords = np.delete(coords, idx, axis=0)
+                            intensities = np.delete(intensities, idx, axis=0)
+                            removed += 1
+                    st.session_state.edited_coords = coords
+                    st.session_state.edited_intensities = intensities
+                    _invalidate_atom_strain_state()
+                    st.success(f"Removed {removed} points.")
+
+            else:
+                # Polygon drawing may return border + fill; fill holes to get stable ROI area.
+                roi_disp = ndi.binary_fill_holes(draw_mask_disp)
+                mask = _resize_mask_to_raw(roi_disp, raw.shape)
+                st.session_state.roi_mask = mask
+                _invalidate_atom_strain_state()
+                roi_mask = mask
+                st.success("ROI updated.")
+
+            st.session_state.canvas_nonce = int(st.session_state.canvas_nonce) + 1
+            st.rerun()
+
+    if keep_inside or remove_inside:
+        effective_roi_mask = roi_mask
+        if effective_roi_mask is None and "Draw irregular ROI" in tool:
+            draw_mask_disp = _canvas_draw_mask(canvas_result)
+            if draw_mask_disp is not None and np.any(draw_mask_disp):
+                roi_disp = ndi.binary_fill_holes(draw_mask_disp)
+                effective_roi_mask = _resize_mask_to_raw(roi_disp, raw.shape)
+                st.session_state.roi_mask = effective_roi_mask
+                _invalidate_atom_strain_state()
+                roi_mask = effective_roi_mask
+                st.info("ROI auto-applied from current drawing.")
+
+        if effective_roi_mask is None:
+            st.warning("No ROI available. Draw ROI first.")
+        elif len(coords) == 0:
+            st.warning("No atom points to filter.")
+        else:
+            yi = np.clip(
+                np.round(coords[:, 0]).astype(int), 0, effective_roi_mask.shape[0] - 1
+            )
+            xi = np.clip(
+                np.round(coords[:, 1]).astype(int), 0, effective_roi_mask.shape[1] - 1
+            )
+            inside_mask = effective_roi_mask[yi, xi]
+            if keep_inside:
+                select_mask = inside_mask
+                msg = "Kept ROI-inside atoms."
+            else:
+                select_mask = ~inside_mask
+                msg = "Removed ROI-inside atoms."
+
+            st.session_state.edited_coords = coords[select_mask]
+            st.session_state.edited_intensities = intensities[select_mask]
+            _invalidate_atom_strain_state()
+            st.success(msg)
+            st.rerun()
+else:
+    st.caption("Canvas editor is off. Existing atom coordinates and ROI remain unchanged.")
 
 if roi_mask is not None:
     inside = 0
@@ -1629,42 +2248,7 @@ if roi_mask is not None:
         yi = np.clip(np.round(coords[:, 0]).astype(int), 0, roi_mask.shape[0] - 1)
         xi = np.clip(np.round(coords[:, 1]).astype(int), 0, roi_mask.shape[1] - 1)
         inside = int(np.sum(roi_mask[yi, xi]))
-    st.info(
-        f"ROI pixels: {int(np.sum(roi_mask))} | Atoms inside ROI: {inside}"
-    )
-
-if keep_inside or remove_inside:
-    effective_roi_mask = roi_mask
-    if effective_roi_mask is None and "Draw irregular ROI" in tool:
-        draw_mask_disp = _canvas_draw_mask(canvas_result)
-        if draw_mask_disp is not None and np.any(draw_mask_disp):
-            roi_disp = ndi.binary_fill_holes(draw_mask_disp)
-            effective_roi_mask = _resize_mask_to_raw(roi_disp, raw.shape)
-            st.session_state.roi_mask = effective_roi_mask
-            _invalidate_atom_strain_state()
-            roi_mask = effective_roi_mask
-            st.info("ROI auto-applied from current drawing.")
-
-    if effective_roi_mask is None:
-        st.warning("No ROI available. Draw ROI first.")
-    elif len(coords) == 0:
-        st.warning("No atom points to filter.")
-    else:
-        yi = np.clip(np.round(coords[:, 0]).astype(int), 0, effective_roi_mask.shape[0] - 1)
-        xi = np.clip(np.round(coords[:, 1]).astype(int), 0, effective_roi_mask.shape[1] - 1)
-        inside_mask = effective_roi_mask[yi, xi]
-        if keep_inside:
-            select_mask = inside_mask
-            msg = "Kept ROI-inside atoms."
-        else:
-            select_mask = ~inside_mask
-            msg = "Removed ROI-inside atoms."
-
-        st.session_state.edited_coords = coords[select_mask]
-        st.session_state.edited_intensities = intensities[select_mask]
-        _invalidate_atom_strain_state()
-        st.success(msg)
-        st.rerun()
+    st.info(f"ROI pixels: {int(np.sum(roi_mask))} | Atoms inside ROI: {inside}")
 
 prospective_reference_atom_mask = None
 if params["atom_strain_use_roi_reference"]:
@@ -2147,11 +2731,16 @@ run_atomic_displacement = disp_button_col.button(
     use_container_width=False,
     disabled=not custom_basis_ready,
 )
+manual_displacement_pairs = {
+    int(atom_idx): (int(pair[0]), int(pair[1]))
+    for atom_idx, pair in dict(st.session_state.atomic_displacement_manual_pairs).items()
+}
 if custom_basis_ready:
     disp_info_col.caption(
         "Reference source: "
         f"{params['atom_strain_reference_mode']} | "
-        f"lattice index tolerance={params['atomic_displacement_tolerance']:.2f}"
+        f"lattice index tolerance={params['atomic_displacement_tolerance']:.2f} | "
+        f"manual pairs={len(manual_displacement_pairs)}"
     )
 elif bool(st.session_state.custom_basis_enabled):
     disp_info_col.caption(
@@ -2178,6 +2767,7 @@ if run_atomic_displacement and custom_basis_ready and custom_basis is not None:
             b_index=int(custom_basis["b_idx"]),
             reference_mask=reference_atom_mask_for_fit,
             lattice_index_tolerance=float(params["atomic_displacement_tolerance"]),
+            manual_lattice_indices=manual_displacement_pairs or None,
         )
     except Exception as exc:
         _invalidate_atomic_displacement_state()
@@ -2195,6 +2785,7 @@ if run_atomic_displacement and custom_basis_ready and custom_basis is not None:
             },
             "reference_source": params["atom_strain_reference_mode"],
             "method": "ideal_lattice_from_custom_ab_basis",
+            "manual_lattice_pair_count": len(manual_displacement_pairs),
         }
         displacement_meta = st.session_state.atomic_displacement_meta
         st.success("Atomic displacement finished.")
@@ -2203,96 +2794,312 @@ if displacement_meta is not None:
     st.write("Atomic displacement settings:", displacement_meta)
 
 if displacement_result is not None:
-    disp_left, disp_right = st.columns([1.45, 1.0])
-    with disp_left:
-        disp_fig = _render_atomic_displacement_overlay(
+    vector_tab, component_tab, qa_tab, debug_tab = st.tabs(
+        ["Vector map", "Component maps", "Invalid QA", "Debug"]
+    )
+
+    with vector_tab:
+        vector_fig = _render_atomic_displacement_vector_map(
             norm,
             displacement_result,
             displacement_scale=displacement_scale,
             displacement_unit=displacement_unit,
+            show_image=params["atomic_displacement_vector_show_image"],
+            marker_size=params["atomic_displacement_marker_size"],
+            arrow_display_scale=params["atomic_displacement_arrow_scale"],
+            max_arrows=params["atomic_displacement_max_arrows"],
         )
-        st.pyplot(disp_fig)
-        disp_png = _figure_png_bytes(disp_fig)
+        st.pyplot(vector_fig)
+        vector_png = _figure_png_bytes(vector_fig)
         st.download_button(
-            label="Download atomic displacement overlay PNG",
-            data=disp_png,
-            file_name=f"{Path(uploaded.name).stem}_atomic_displacement_overlay.png",
+            label="Download displacement vector map PNG",
+            data=vector_png,
+            file_name=f"{Path(uploaded.name).stem}_atomic_displacement_vector_map.png",
             mime="image/png",
         )
-        plt.close(disp_fig)
-    with disp_right:
-        fit_stats = displacement_result.provenance.get("fit_statistics", {})
-        disp_valid = np.asarray(displacement_result.valid_atom_mask, dtype=bool)
-        invalid_mask = ~disp_valid
-        invalid_count = int(np.sum(invalid_mask))
-        invalid_ratio = float(invalid_count / max(len(coords), 1))
-        invalid_residual = displacement_result.assignment_residual[invalid_mask]
-        st.write(
-            "Atomic displacement summary:",
-            {
-                "confidence": round(float(displacement_result.confidence), 3),
-                "mean_|u|": float(
-                    np.mean(displacement_result.displacement_magnitude[disp_valid])
-                    * displacement_scale
-                ),
-                "max_|u|": float(
-                    np.max(displacement_result.displacement_magnitude[disp_valid])
-                    * displacement_scale
-                ),
-                "invalid_assignment_count": invalid_count,
-                "invalid_assignment_ratio": invalid_ratio,
-                "valid_atom_ratio": fit_stats.get("valid_ratio"),
-                "fit_rms_px": fit_stats.get("fit_rms_px"),
-                "fit_atom_count": fit_stats.get("fit_atom_count"),
-            },
+        plt.close(vector_fig)
+
+    with component_tab:
+        component_fig = _render_atomic_displacement_component_maps(
+            norm,
+            displacement_result,
+            displacement_scale=displacement_scale,
+            displacement_unit=displacement_unit,
+            marker_size=params["atomic_displacement_marker_size"],
         )
-        if custom_basis is not None:
-            basis_fig = _render_custom_basis_context(norm, coords, custom_basis)
-            st.pyplot(basis_fig)
-            plt.close(basis_fig)
-            st.caption(
-                "This is the current base / a / b lattice definition used by atomic displacement."
+        st.pyplot(component_fig)
+        component_png = _figure_png_bytes(component_fig)
+        st.download_button(
+            label="Download displacement component maps PNG",
+            data=component_png,
+            file_name=f"{Path(uploaded.name).stem}_atomic_displacement_components.png",
+            mime="image/png",
+        )
+        plt.close(component_fig)
+
+    with qa_tab:
+        qa_left, qa_right = st.columns([1.35, 1.0])
+        with qa_left:
+            qa_fig = _render_atomic_displacement_invalid_map(
+                norm,
+                displacement_result,
+                marker_size=params["atomic_displacement_marker_size"],
             )
-        st.info(
-            "Why invalid assignment appears: under the current base-a-b ideal lattice, "
-            "an atom is first converted to fractional lattice coordinates and then matched "
-            "to the nearest integer lattice site. If the distance to that nearest integer site "
-            "is larger than `lattice index tolerance`, the atom is marked as invalid assignment."
-        )
-        st.write(
-            "Invalid-assignment diagnostics:",
-            {
-                "lattice_index_tolerance": float(params["atomic_displacement_tolerance"]),
-                "assignment_residual_median": fit_stats.get("assignment_residual_median"),
-                "invalid_residual_mean": (
-                    float(np.mean(invalid_residual)) if invalid_count > 0 else None
+            st.pyplot(qa_fig)
+            qa_png = _figure_png_bytes(qa_fig)
+            st.download_button(
+                label="Download invalid-assignment QA PNG",
+                data=qa_png,
+                file_name=f"{Path(uploaded.name).stem}_atomic_displacement_invalid_qa.png",
+                mime="image/png",
+            )
+            plt.close(qa_fig)
+            enable_manual_adjustment = st.checkbox(
+                "Enable manual ideal-lattice adjustment",
+                value=False,
+                help=(
+                    "Use this when invalid atoms need manual observed-atom to ideal-site "
+                    "matching before recalculating displacement."
                 ),
-                "invalid_residual_max": (
-                    float(np.max(invalid_residual)) if invalid_count > 0 else None
-                ),
-            },
-        )
-        if invalid_count > 0:
-            invalid_idx = np.flatnonzero(invalid_mask)
-            top_order = np.argsort(displacement_result.assignment_residual[invalid_mask])[::-1]
-            top_invalid = invalid_idx[top_order[: min(10, invalid_count)]]
-            invalid_preview = {
-                "atom_index": top_invalid.astype(int),
-                "y": coords[top_invalid, 0],
-                "x": coords[top_invalid, 1],
-                "assignment_residual": displacement_result.assignment_residual[top_invalid],
-                "lattice_i": displacement_result.lattice_indices_ij[top_invalid, 0],
-                "lattice_j": displacement_result.lattice_indices_ij[top_invalid, 1],
-            }
-            with st.expander("Show top invalid-assignment atoms"):
-                st.dataframe(invalid_preview, use_container_width=True)
-        if displacement_result.warnings:
-            summary = _warning_summary_lines(displacement_result.warnings)
-            st.warning("\n".join(summary))
-            with st.expander("Show full atomic-displacement warnings"):
-                st.code("\n".join(displacement_result.warnings), language="text")
-        else:
-            st.success("No atomic-displacement warnings.")
+            )
+            if enable_manual_adjustment:
+                manual_pairs = {
+                    int(atom_idx): (int(pair[0]), int(pair[1]))
+                    for atom_idx, pair in dict(
+                        st.session_state.atomic_displacement_manual_pairs
+                    ).items()
+                }
+                manual_pick_mode = st.radio(
+                    "Manual pick mode",
+                    ["Observed atom", "Ideal lattice site"],
+                    horizontal=True,
+                )
+                manual_overlay_chart = _render_manual_pair_overlay_chart(
+                    norm,
+                    displacement_result,
+                    manual_pairs,
+                    pick_mode=manual_pick_mode,
+                )
+                manual_event = st.altair_chart(
+                    manual_overlay_chart,
+                    key=f"manual-pair-overlay-{manual_pick_mode}",
+                    on_select="rerun",
+                    selection_mode=(
+                        "manual_atom_pick"
+                        if manual_pick_mode == "Observed atom"
+                        else "manual_site_pick"
+                    ),
+                    use_container_width=False,
+                )
+                if manual_pick_mode == "Observed atom":
+                    observed_pick = _extract_altair_atom_pick(
+                        manual_event,
+                        selection_name="manual_atom_pick",
+                    )
+                    if observed_pick is not None:
+                        st.session_state.atomic_displacement_manual_atom = int(
+                            observed_pick
+                        )
+                else:
+                    ideal_pick = _extract_altair_site_pick(
+                        manual_event,
+                        selection_name="manual_site_pick",
+                    )
+                    if ideal_pick is not None:
+                        st.session_state.atomic_displacement_manual_site = ideal_pick
+
+                selected_atom = st.session_state.atomic_displacement_manual_atom
+                selected_site = st.session_state.atomic_displacement_manual_site
+                st.write(
+                    "Manual selection:",
+                    {
+                        "observed_atom": selected_atom,
+                        "ideal_site": selected_site,
+                        "manual_pair_count": len(manual_pairs),
+                    },
+                )
+                pair_col1, pair_col2, pair_col3 = st.columns([1, 1, 1])
+                add_pair = pair_col1.button(
+                    "Add manual pair",
+                    disabled=selected_atom is None or selected_site is None,
+                )
+                clear_pairs = pair_col2.button(
+                    "Clear manual pairs",
+                    disabled=len(manual_pairs) == 0,
+                )
+                rerun_manual = pair_col3.button(
+                    "Re-run with manual pairs",
+                    type="primary",
+                    disabled=len(manual_pairs) == 0 or custom_basis is None,
+                )
+                if add_pair and selected_atom is not None and selected_site is not None:
+                    manual_pairs[int(selected_atom)] = (
+                        int(selected_site[0]),
+                        int(selected_site[1]),
+                    )
+                    st.session_state.atomic_displacement_manual_pairs = manual_pairs
+                    st.success(
+                        f"Added atom {int(selected_atom)} -> site "
+                        f"({int(selected_site[0])}, {int(selected_site[1])})."
+                    )
+                    st.rerun()
+                if clear_pairs:
+                    st.session_state.atomic_displacement_manual_pairs = {}
+                    st.session_state.atomic_displacement_manual_atom = None
+                    st.session_state.atomic_displacement_manual_site = None
+                    st.success("Manual lattice pairs cleared.")
+                    st.rerun()
+                if manual_pairs:
+                    pair_preview = pd.DataFrame(
+                        [
+                            {"atom_index": atom_idx, "lattice_i": ij[0], "lattice_j": ij[1]}
+                            for atom_idx, ij in sorted(manual_pairs.items())
+                        ]
+                    )
+                    st.dataframe(pair_preview, use_container_width=True)
+                if rerun_manual and custom_basis is not None:
+                    reference_atom_mask_for_fit = (
+                        prospective_reference_atom_mask
+                        if params["atom_strain_use_roi_reference"]
+                        and prospective_reference_atom_mask is not None
+                        and np.any(prospective_reference_atom_mask)
+                        else None
+                    )
+                    try:
+                        corrected = compute_atomic_displacement_from_basis(
+                            coords,
+                            base_index=int(custom_basis["base_idx"]),
+                            a_index=int(custom_basis["a_idx"]),
+                            b_index=int(custom_basis["b_idx"]),
+                            reference_mask=reference_atom_mask_for_fit,
+                            lattice_index_tolerance=float(
+                                params["atomic_displacement_tolerance"]
+                            ),
+                            manual_lattice_indices=manual_pairs,
+                        )
+                    except Exception as exc:
+                        st.error(f"Manual displacement correction failed: {exc}")
+                    else:
+                        st.session_state.atomic_displacement_result = corrected
+                        st.session_state.atomic_displacement_meta = {
+                            "lattice_index_tolerance": float(
+                                params["atomic_displacement_tolerance"]
+                            ),
+                            "basis_indices": {
+                                "base_idx": int(custom_basis["base_idx"]),
+                                "a_idx": int(custom_basis["a_idx"]),
+                                "b_idx": int(custom_basis["b_idx"]),
+                            },
+                            "reference_source": params["atom_strain_reference_mode"],
+                            "method": "ideal_lattice_from_custom_ab_basis",
+                            "manual_lattice_pair_count": len(manual_pairs),
+                        }
+                        st.success("Manual displacement correction finished.")
+                        st.rerun()
+        with qa_right:
+            fit_stats = displacement_result.provenance.get("fit_statistics", {})
+            disp_valid = np.asarray(displacement_result.valid_atom_mask, dtype=bool)
+            invalid_mask = ~disp_valid
+            invalid_count = int(np.sum(invalid_mask))
+            invalid_ratio = float(invalid_count / max(len(coords), 1))
+            invalid_residual = displacement_result.assignment_residual[invalid_mask]
+            valid_mag = displacement_result.displacement_magnitude[disp_valid]
+            st.write(
+                "Atomic displacement summary:",
+                {
+                    "confidence": round(float(displacement_result.confidence), 3),
+                    "mean_|u|": float(np.mean(valid_mag) * displacement_scale)
+                    if valid_mag.size
+                    else None,
+                    "max_|u|": float(np.max(valid_mag) * displacement_scale)
+                    if valid_mag.size
+                    else None,
+                    "invalid_assignment_count": invalid_count,
+                    "invalid_assignment_ratio": invalid_ratio,
+                    "valid_atom_ratio": fit_stats.get("valid_ratio"),
+                    "fit_rms_px": fit_stats.get("fit_rms_px"),
+                    "fit_atom_count": fit_stats.get("fit_atom_count"),
+                },
+            )
+            st.info(
+                "Invalid assignment means an atom is too far from the nearest integer "
+                "site in the current base-a-b lattice coordinates."
+            )
+            st.write(
+                "Invalid-assignment diagnostics:",
+                {
+                    "lattice_index_tolerance": float(
+                        params["atomic_displacement_tolerance"]
+                    ),
+                    "assignment_residual_median": fit_stats.get(
+                        "assignment_residual_median"
+                    ),
+                    "invalid_residual_mean": (
+                        float(np.mean(invalid_residual)) if invalid_count > 0 else None
+                    ),
+                    "invalid_residual_max": (
+                        float(np.max(invalid_residual)) if invalid_count > 0 else None
+                    ),
+                },
+            )
+            if invalid_count > 0:
+                invalid_idx = np.flatnonzero(invalid_mask)
+                top_order = np.argsort(displacement_result.assignment_residual[invalid_mask])[
+                    ::-1
+                ]
+                top_invalid = invalid_idx[top_order[: min(10, invalid_count)]]
+                invalid_preview = {
+                    "atom_index": top_invalid.astype(int),
+                    "y": coords[top_invalid, 0],
+                    "x": coords[top_invalid, 1],
+                    "assignment_residual": displacement_result.assignment_residual[
+                        top_invalid
+                    ],
+                    "lattice_i": displacement_result.lattice_indices_ij[top_invalid, 0],
+                    "lattice_j": displacement_result.lattice_indices_ij[top_invalid, 1],
+                }
+                with st.expander("Show top invalid-assignment atoms"):
+                    st.dataframe(invalid_preview, use_container_width=True)
+            if displacement_result.warnings:
+                summary = _warning_summary_lines(displacement_result.warnings)
+                st.warning("\n".join(summary))
+                with st.expander("Show full atomic-displacement warnings"):
+                    st.code("\n".join(displacement_result.warnings), language="text")
+            else:
+                st.success("No atomic-displacement warnings.")
+
+    with debug_tab:
+        debug_left, debug_right = st.columns([1.35, 1.0])
+        with debug_left:
+            disp_fig = _render_atomic_displacement_overlay(
+                norm,
+                displacement_result,
+                displacement_scale=displacement_scale,
+                displacement_unit=displacement_unit,
+                marker_size=params["atomic_displacement_marker_size"],
+                max_arrows=params["atomic_displacement_max_arrows"],
+            )
+            st.pyplot(disp_fig)
+            disp_png = _figure_png_bytes(disp_fig)
+            st.download_button(
+                label="Download atomic displacement debug PNG",
+                data=disp_png,
+                file_name=f"{Path(uploaded.name).stem}_atomic_displacement_debug.png",
+                mime="image/png",
+            )
+            plt.close(disp_fig)
+        with debug_right:
+            st.caption(
+                "This view keeps observed atoms, ideal lattice sites, reference atoms, "
+                "invalid assignments, and arrows together for algorithm diagnosis."
+            )
+            if custom_basis is not None:
+                basis_fig = _render_custom_basis_context(norm, coords, custom_basis)
+                st.pyplot(basis_fig)
+                plt.close(basis_fig)
+                st.caption(
+                    "Current base / a / b lattice definition used by atomic displacement."
+                )
 
     st.subheader("Atomic Displacement Preview")
     disp_preview_count = min(len(coords), 500)

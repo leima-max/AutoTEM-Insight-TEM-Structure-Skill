@@ -68,3 +68,23 @@ def test_atomic_displacement_rejects_collinear_basis() -> None:
             a_index=1,
             b_index=2,
         )
+
+
+def test_atomic_displacement_accepts_manual_lattice_assignment() -> None:
+    coords = _rect_lattice()
+    shifted_idx = 14
+    coords[shifted_idx] += np.array([3.5, -2.0], dtype=np.float64)
+
+    out = compute_atomic_displacement_from_basis(
+        coords,
+        base_index=0,
+        a_index=1,
+        b_index=6,
+        lattice_index_tolerance=0.20,
+        manual_lattice_indices={shifted_idx: (2, 2)},
+    )
+
+    assert out.valid_atom_mask[shifted_idx]
+    assert out.assignment_residual[shifted_idx] == pytest.approx(0.0)
+    assert np.all(out.lattice_indices_ij[shifted_idx] == np.array([2, 2]))
+    assert out.provenance["fit_statistics"]["manual_anchor_count"] == 1
