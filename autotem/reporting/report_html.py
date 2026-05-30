@@ -18,6 +18,7 @@ _DEFAULT_SECTIONS: tuple[str, ...] = (
     "workflow_steps",
     "workflow_details",
     "interface_checks",
+    "simulation",
     "figures",
     "tables",
     "warnings",
@@ -143,6 +144,224 @@ def _render_workflow_details(report: AnalysisReport, open_by_default: bool) -> s
     return "".join(blocks)
 
 
+def _as_mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _display_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    return str(value)
+
+
+def _measurement_value(value: Any) -> str:
+    measurement_value = getattr(value, "value", None)
+    unit = getattr(value, "unit", "")
+    if measurement_value is None:
+        return ""
+    text = _display_value(measurement_value)
+    return f"{text} {unit}".strip()
+
+
+def _candidate_keys(candidate: Any) -> set[str]:
+    return {
+        str(value).strip().lower()
+        for value in (
+            getattr(candidate, "identifier", None),
+            getattr(candidate, "name", None),
+        )
+        if value is not None and str(value).strip()
+    }
+
+
+def _candidate_key(candidate: Any) -> str:
+    keys = sorted(_candidate_keys(candidate))
+    return keys[0] if keys else str(id(candidate))
+
+
+def _merge_candidate_lists(report: AnalysisReport) -> list[Any]:
+    merged: list[Any] = []
+    seen: set[str] = set()
+    if report.diffraction is not None:
+        for candidate in report.diffraction.phase_candidates:
+            key = _candidate_key(candidate)
+            if key not in seen:
+                seen.add(key)
+                merged.append(candidate)
+    if report.simulation is not None:
+        for candidate in report.simulation.matched_phase_candidates:
+            key = _candidate_key(candidate)
+            if key not in seen:
+                seen.add(key)
+                merged.append(candidate)
+    return merged
+
+
+def _matched_candidate_for(report: AnalysisReport, candidate: Any) -> Any | None:
+    if report.simulation is None:
+        return None
+    keys = _candidate_keys(candidate)
+    for matched in report.simulation.matched_phase_candidates:
+        if keys.intersection(_candidate_keys(matched)):
+            return matched
+    return None
+
+
+def _phase_matching_rows_by_name(report: AnalysisReport) -> dict[str, dict[str, Any]]:
+    if report.simulation is None:
+        return {}
+    phase_matching = _as_mapping(report.simulation.provenance.get("phase_matching", {}))
+    per_phase = phase_matching.get("per_phase", [])
+    if not isinstance(per_phase, list):
+        return {}
+    rows: dict[str, dict[str, Any]] = {}
+    for row in per_phase:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("phase_name")
+        if str(name).strip():
+            rows[str(name)] = dict(row)
+    return rows
+
+
+def _candidate_mp_metadata(candidate: Any) -> dict[str, Any]:
+    lattice = _as_mapping(getattr(candidate, "lattice_parameters", {}))
+    return _as_mapping(lattice.get("materials_project", {}))
+
+
+def _render_candidate_comparison(report: AnalysisReport) -> str:
+    candidates = _merge_candidate_lists(report)
+    if not candidates:
+        return "<p>No phase candidates available for comparison.</p>"
+
+    phase_matching = (
+        _as_mapping(report.simulation.provenance.get("phase_matching", {}))
+        if report.simulation is not None
+        else {}
+    )
+    selected_phase = str(phase_matching.get("selected_phase", ""))
+    per_phase = _phase_matching_rows_by_name(report)
+    rows = ""
+    for idx, candidate in enumerate(candidates, start=1):
+        matched = _matched_candidate_for(report, candidate) or candidate
+        mp_meta = _candidate_mp_metadata(candidate)
+        phase_row = per_phase.get(str(getattr(candidate, "name", "")), {})
+        matched_spots = getattr(matched, "matched_spot_count", None)
+        if matched_spots is None:
+            matched_spots = phase_row.get("matched_spot_count", "")
+        score = getattr(matched, "score", None)
+        mean_d_error = getattr(matched, "mean_d_error", None)
+        mean_angle_error = getattr(matched, "mean_angle_error", None)
+        is_selected = (
+            "yes"
+            if selected_phase
+            and selected_phase == str(getattr(candidate, "name", ""))
+            else ""
+        )
+        rows += (
+            "<tr>"
+            f"<td>{idx}</td>"
+            f"<td>{html.escape(is_selected)}</td>"
+            f"<td>{html.escape(str(getattr(candidate, 'name', '')))}</td>"
+            f"<td>{html.escape(str(getattr(candidate, 'formula', '') or ''))}</td>"
+            f"<td>{html.escape(str(getattr(candidate, 'source', '') or ''))}</td>"
+            f"<td>{html.escape(str(getattr(candidate, 'identifier', '') or ''))}</td>"
+            f"<td>{html.escape(_display_value(mp_meta.get('rank', '')))}</td>"
+            f"<td>{html.escape(_display_value(mp_meta.get('energy_above_hull', '')))}</td>"
+            f"<td>{html.escape(_display_value(mp_meta.get('is_stable', '')))}</td>"
+            f"<td>{html.escape(_display_value(mp_meta.get('theoretical', '')))}</td>"
+            f"<td>{html.escape(_display_value(mp_meta.get('deprecated', '')))}</td>"
+            f"<td>{html.escape(_display_value(mp_meta.get('site_count', '')))}</td>"
+            f"<td>{html.escape(_display_value(score))}</td>"
+            f"<td>{html.escape(_display_value(matched_spots))}</td>"
+            f"<td>{html.escape(_measurement_value(mean_d_error))}</td>"
+            f"<td>{html.escape(_measurement_value(mean_angle_error))}</td>"
+            "</tr>"
+        )
+
+    return (
+        "<table class=\"candidate-comparison\">"
+        "<tr>"
+        "<th>#</th><th>Selected</th><th>Name</th><th>Formula</th>"
+        "<th>Crystal source</th><th>Identifier</th><th>MP rank</th>"
+        "<th>MP E above hull</th><th>MP stable</th><th>MP theoretical</th>"
+        "<th>MP deprecated</th><th>MP sites</th><th>Score</th>"
+        "<th>Matched spots</th><th>Mean d-error</th><th>Mean angle-error</th>"
+        "</tr>"
+        f"{rows}"
+        "</table>"
+    )
+
+
+def _render_simulation_phase_matching(report: AnalysisReport) -> str:
+    if report.simulation is None:
+        return "<p>No simulation result recorded.</p>"
+
+    provenance = report.simulation.provenance
+    adapter = _as_mapping(provenance.get("adapter", {}))
+    phase_matching = _as_mapping(provenance.get("phase_matching", {}))
+    best = (
+        report.simulation.matched_phase_candidates[0]
+        if report.simulation.matched_phase_candidates
+        else None
+    )
+    engine = provenance.get("method", adapter.get("adapter", ""))
+    best_name = getattr(best, "name", phase_matching.get("selected_phase", ""))
+    summary_rows = [
+        ("Simulation engine", engine),
+        ("Real adapter active", adapter.get("active", "")),
+        ("Phase matching active", phase_matching.get("active", "")),
+        ("Selected phase", best_name),
+        ("Selected zone axis", phase_matching.get("selected_zone_axis", "")),
+        ("Measured spots", phase_matching.get("measured_spot_count", "")),
+        ("Simulated patterns", phase_matching.get("simulated_pattern_count", "")),
+        ("d tolerance", phase_matching.get("d_tolerance_rel", "")),
+        ("Angle tolerance", phase_matching.get("angle_tolerance_deg", "")),
+    ]
+    summary_html = "".join(
+        "<tr>"
+        f"<th>{html.escape(label)}</th>"
+        f"<td>{html.escape(_display_value(value))}</td>"
+        "</tr>"
+        for label, value in summary_rows
+    )
+
+    candidate_rows = ""
+    for candidate in report.simulation.matched_phase_candidates:
+        candidate_rows += (
+            "<tr>"
+            f"<td>{html.escape(str(candidate.name))}</td>"
+            f"<td>{html.escape(str(candidate.formula or ''))}</td>"
+            f"<td>{html.escape(str(candidate.source or ''))}</td>"
+            f"<td>{html.escape(str(candidate.identifier or ''))}</td>"
+            f"<td>{html.escape(_display_value(candidate.score))}</td>"
+            f"<td>{html.escape(_display_value(candidate.matched_spot_count))}</td>"
+            f"<td>{html.escape(_measurement_value(candidate.mean_d_error))}</td>"
+            f"<td>{html.escape(_measurement_value(candidate.mean_angle_error))}</td>"
+            "</tr>"
+        )
+    if not candidate_rows:
+        candidate_rows = "<tr><td colspan='8'>No matched phase candidates.</td></tr>"
+
+    return (
+        "<h3>Closed-Loop Summary</h3>"
+        f"<table>{summary_html}</table>"
+        "<h3>Candidate Comparison</h3>"
+        f"{_render_candidate_comparison(report)}"
+        "<h3>Matched Phase Candidates</h3>"
+        "<table>"
+        "<tr>"
+        "<th>Name</th><th>Formula</th><th>Crystal source</th><th>Identifier</th>"
+        "<th>Score</th><th>Matched spots</th><th>Mean d-error</th>"
+        "<th>Mean angle-error</th>"
+        "</tr>"
+        f"{candidate_rows}"
+        "</table>"
+    )
+
+
 def export_html_report(
     report: AnalysisReport,
     output_dir: str | Path,
@@ -225,6 +444,7 @@ def export_html_report(
         interface_rows = "<tr><td colspan='4'>No interface checks.</td></tr>"
 
     workflow_details_html = _render_workflow_details(report, open_step_sections)
+    simulation_phase_matching_html = _render_simulation_phase_matching(report)
 
     section_blocks: list[str] = []
     if "overview" in sections:
@@ -266,6 +486,13 @@ def export_html_report(
             "<tr><th>Owner</th><th>Contract Item</th><th>Status</th><th>Detail</th></tr>"
             f"{interface_rows}"
             "</table>"
+            "</div>"
+        )
+    if "simulation" in sections:
+        section_blocks.append(
+            "<div class=\"card\">"
+            "<h2>Simulation Phase Matching</h2>"
+            f"{simulation_phase_matching_html}"
             "</div>"
         )
     if "figures" in sections:

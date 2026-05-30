@@ -102,3 +102,4 @@ def test_b1_b3_end_to_end_pipeline_outputs(tmp_path: Path) -> None:
     assert Path(report.diffraction.fft_image.uri).exists()
     assert (output_dir / "tables" / "diffraction_peaks.csv").exists()
     assert (output_dir / "tables" / "d_spacings.csv").exists()
+    assert (output_dir / "tables" / "indexed_spots.csv").exists()

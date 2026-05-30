@@ -10,7 +10,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-from autotem.validation import run_benchmark_suite_from_file
+from autotem.diffraction.phase_lookup import (
+    materials_project_api_config_path,
+    materials_project_api_setup_guidance,
+    resolve_materials_project_api_key,
+    write_materials_project_api_config,
+)
+from autotem.validation import run_benchmark_suite_from_file, run_diffsims_smoke_validation
 from autotem.workflows.pipeline import TEMAnalysisSkill
 
 EXIT_OK = 0
@@ -55,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Comma-separated HTML sections, e.g. "
-            "overview,workflow_steps,workflow_details,interface_checks,figures."
+            "overview,workflow_steps,workflow_details,interface_checks,simulation,figures."
         ),
     )
     analyze.add_argument(
@@ -109,7 +115,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     preview = subparsers.add_parser(
         "preview-b1b3",
-        help="Launch Streamlit UI for B1-B3 preview testing.",
+        aliases=["preview-b"],
+        help="Launch Streamlit UI for B1-B5 diffraction debugging.",
     )
     preview.add_argument(
         "--host",
@@ -128,6 +135,73 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Default output root directory shown in UI.",
+    )
+
+    configure_mp = subparsers.add_parser(
+        "configure-mp-api",
+        help="Configure or inspect Materials Project API key setup.",
+    )
+    configure_mp.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Optional AutoTEM Materials Project config path override.",
+    )
+    configure_mp.add_argument(
+        "--api-key-stdin",
+        action="store_true",
+        help="Read an API key from stdin and store it in the local AutoTEM config file.",
+    )
+    configure_mp.add_argument(
+        "--check",
+        action="store_true",
+        help="Check whether the API key is configured without printing the key.",
+    )
+    configure_mp.add_argument(
+        "--show",
+        action="store_true",
+        help="Show first-use setup guidance and the active config path.",
+    )
+
+    validate_diffsims = subparsers.add_parser(
+        "validate-diffsims",
+        help="Run a standalone real-diffsims simulation and phase-matching smoke check.",
+    )
+    validate_diffsims.add_argument(
+        "--materials",
+        type=str,
+        default="si,cu",
+        help="Comma-separated local built-in materials to validate (default: si,cu).",
+    )
+    validate_diffsims.add_argument(
+        "--voltage-kv",
+        type=float,
+        default=200.0,
+        help="Accelerating voltage for diffsims simulation.",
+    )
+    validate_diffsims.add_argument(
+        "--reciprocal-radius",
+        type=float,
+        default=1.5,
+        help="diffsims reciprocal radius in inverse Angstrom.",
+    )
+    validate_diffsims.add_argument(
+        "--max-simulated-spots",
+        type=int,
+        default=128,
+        help="Maximum simulated spots to extract per material.",
+    )
+    validate_diffsims.add_argument(
+        "--max-measured-spots",
+        type=int,
+        default=6,
+        help="Maximum synthetic measured spots used for closed-loop matching.",
+    )
+    validate_diffsims.add_argument(
+        "--min-matched-spots",
+        type=int,
+        default=3,
+        help="Minimum matched spots required for the closed-loop check.",
     )
 
     return parser
@@ -233,7 +307,7 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_RUNTIME_ERROR
         return EXIT_OK
 
-    if args.command == "preview-b1b3":
+    if args.command in {"preview-b1b3", "preview-b"}:
         if importlib.util.find_spec("streamlit") is None:
             print(
                 "AutoTEM preview configuration error: streamlit is not installed. "
@@ -268,7 +342,7 @@ def main(argv: list[str] | None = None) -> int:
             env["AUTOTEM_UI_OUTPUT_ROOT"] = str(args.output_root)
 
         print(
-            "Launching B1-B3 preview UI on "
+            "Launching B1-B5 diffraction debug UI on "
             f"http://{args.host}:{args.port} ...",
         )
         try:
@@ -277,6 +351,64 @@ def main(argv: list[str] | None = None) -> int:
             print(f"AutoTEM preview runtime error: {exc}", file=sys.stderr)
             return EXIT_RUNTIME_ERROR
         return EXIT_OK if completed.returncode == 0 else EXIT_RUNTIME_ERROR
+
+    if args.command == "configure-mp-api":
+        config_path = args.config or materials_project_api_config_path()
+        if args.api_key_stdin:
+            api_key = sys.stdin.read().strip()
+            if not api_key:
+                print("AutoTEM MP API configuration error: empty API key.", file=sys.stderr)
+                return EXIT_CONFIG_ERROR
+            try:
+                written_path = write_materials_project_api_config(
+                    api_key,
+                    config_path=config_path,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"AutoTEM MP API configuration error: {exc}", file=sys.stderr)
+                return EXIT_CONFIG_ERROR
+            print(f"Materials Project API key stored in {written_path}.")
+            return EXIT_OK
+
+        resolved, info = resolve_materials_project_api_key(config_path=config_path)
+        if args.check:
+            if resolved:
+                print(f"Materials Project API key configured via {info.get('source')}.")
+                return EXIT_OK
+            print(materials_project_api_setup_guidance(config_path), file=sys.stderr)
+            return EXIT_CONFIG_ERROR
+
+        print(materials_project_api_setup_guidance(config_path))
+        print(
+            "To configure without putting the key in shell history, run:\n"
+            "  autotem configure-mp-api --api-key-stdin\n"
+            "Then paste the key and press Ctrl+Z then Enter on Windows PowerShell, "
+            "or Ctrl+D on POSIX shells."
+        )
+        return EXIT_OK
+
+    if args.command == "validate-diffsims":
+        materials = [
+            item.strip()
+            for item in str(args.materials).split(",")
+            if item.strip()
+        ]
+        try:
+            result = run_diffsims_smoke_validation(
+                materials=materials,
+                voltage_kv=float(args.voltage_kv),
+                reciprocal_radius_inv_angstrom=float(args.reciprocal_radius),
+                max_simulated_spots=max(1, int(args.max_simulated_spots)),
+                max_measured_spots=max(1, int(args.max_measured_spots)),
+                min_matched_spots=max(1, int(args.min_matched_spots)),
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"AutoTEM diffsims validation runtime error: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME_ERROR
+
+        print("AutoTEM diffsims validation " + str(result["status"]) + ".")
+        print(json.dumps(result, indent=2))
+        return EXIT_OK if result.get("ok") else EXIT_RUNTIME_ERROR
 
     parser.print_help()
     return EXIT_OK

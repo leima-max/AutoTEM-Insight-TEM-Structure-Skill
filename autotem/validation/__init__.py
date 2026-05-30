@@ -13,6 +13,7 @@ from autotem.validation.cases import (
     load_benchmark_suite,
     write_benchmark_case_schemas,
 )
+from autotem.validation.diffsims_smoke import run_diffsims_smoke_validation
 from autotem.validation.metrics import collect_validation_metrics
 from autotem.validation.runner import (
     BenchmarkCaseRunResult,
@@ -32,6 +33,7 @@ __all__ = [
     "BenchmarkSuiteSpec",
     "BenchmarkCaseRunResult",
     "collect_validation_metrics",
+    "run_diffsims_smoke_validation",
     "run_validation_summary",
     "run_benchmark_summary",
     "load_benchmark_case",

@@ -1,4 +1,4 @@
-"""Streamlit entrypoint for the B1/B2/B3 preview UI.
+"""Streamlit entrypoint for the B1-B5 diffraction debug UI.
 
 The implementation still lives in ``b2_diffraction_ui`` for compatibility with
 the backup branch history and older local launch commands.

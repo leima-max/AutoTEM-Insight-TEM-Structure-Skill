@@ -5,7 +5,20 @@ import numpy as np
 import pytest
 
 from autotem import TEMAnalysisSkill
-from autotem.core import AnalysisReport, read_json
+from autotem.core import (
+    AnalysisReport,
+    DiffractionPeak,
+    DiffractionResult,
+    GVector,
+    Measurement,
+    PhaseCandidate,
+    SimulatedPattern,
+    SimulatedSpot,
+    SimulationResult,
+    read_json,
+)
+from autotem.reporting import export_csv_tables_with_models, export_html_report
+from autotem.visualization import build_core_overlays
 
 
 def test_a3_exports_figures_and_json_bundle(tmp_path: Path) -> None:
@@ -31,6 +44,79 @@ def test_a3_exports_figures_and_json_bundle(tmp_path: Path) -> None:
     manifest = json.loads(manifest_text)
     assert "directories" in manifest
     assert set(manifest["directories"]) == {"figures", "tables", "json", "intermediates"}
+
+
+def test_b5_exports_measured_simulated_diffraction_overlay(tmp_path: Path) -> None:
+    report = AnalysisReport(
+        diffraction=DiffractionResult(
+            peaks=[
+                DiffractionPeak(x=1.0, y=0.0, intensity=10.0),
+                DiffractionPeak(x=0.0, y=1.0, intensity=8.0),
+            ],
+            g_vectors=[
+                GVector(
+                    gx=Measurement(value=2.5, unit="1/nm"),
+                    gy=Measurement(value=0.0, unit="1/nm"),
+                    magnitude=Measurement(value=2.5, unit="1/nm"),
+                    source_peak_index=0,
+                ),
+                GVector(
+                    gx=Measurement(value=0.0, unit="1/nm"),
+                    gy=Measurement(value=2.5, unit="1/nm"),
+                    magnitude=Measurement(value=2.5, unit="1/nm"),
+                    source_peak_index=1,
+                ),
+            ],
+        ),
+        simulation=SimulationResult(
+            patterns=[
+                SimulatedPattern(
+                    kind="diffraction",
+                    structure_id="fake",
+                    zone_axis=(1, 1, 0),
+                    simulation_parameters={
+                        "engine": "diffsims",
+                        "phase_match": {
+                            "rotation_deg": 0.0,
+                            "matched_pairs": [
+                                {"measured_g_index": 0, "simulated_spot_index": 0},
+                                {"measured_g_index": 1, "simulated_spot_index": 1},
+                            ],
+                        },
+                    },
+                    spots=[
+                        SimulatedSpot(
+                            gx=Measurement(value=2.5, unit="1/nm"),
+                            gy=Measurement(value=0.0, unit="1/nm"),
+                        ),
+                        SimulatedSpot(
+                            gx=Measurement(value=0.0, unit="1/nm"),
+                            gy=Measurement(value=2.5, unit="1/nm"),
+                        ),
+                    ],
+                )
+            ],
+            matched_phase_candidates=[PhaseCandidate(name="fake", zone_axis=(1, 1, 0))],
+            provenance={
+                "phase_matching": {
+                    "active": True,
+                    "selected_phase": "fake",
+                    "per_phase": [{"phase_name": "fake", "best_pattern_index": 0}],
+                }
+            },
+        ),
+    )
+
+    artifacts, figures, warnings = build_core_overlays(report, tmp_path)
+
+    overlay_path = tmp_path / "figures" / "simulation_diffraction_overlay.png"
+    assert overlay_path.exists()
+    assert any(figure.figure_type == "simulation_diffraction_overlay" for figure in figures)
+    assert any(artifact.label == "Simulation diffraction overlay" for artifact in artifacts)
+    assert report.simulation is not None
+    assert report.simulation.overlays
+    assert report.simulation.overlays[0].provenance["zone_axis"] == [1, 1, 0]
+    assert not any("B5 simulation overlay skipped" in warning for warning in warnings)
 
 
 def test_a3_html_report_contains_sections(tmp_path: Path) -> None:
@@ -71,6 +157,7 @@ def test_a3_html_report_contains_sections(tmp_path: Path) -> None:
     assert "Provenance" in html_text
     assert "Workflow Step Details" in html_text
     assert "Interface Completeness (B/C)" in html_text
+    assert "Simulation Phase Matching" in html_text
     assert "class=\"step-detail\"" in html_text
 
 
@@ -230,3 +317,117 @@ def test_a3_interface_contract_json_summary_fields(tmp_path: Path) -> None:
     assert contract_payload["contract"] == "A3_BC_interface_completeness"
     assert contract_payload["summary"]["total"] >= 1
     assert "pass_rate" in contract_payload["summary"]
+
+
+def test_a3_reporting_surfaces_diffsims_closed_loop_summary(tmp_path: Path) -> None:
+    candidate = PhaseCandidate(
+        name="mp-149",
+        formula="Si",
+        source="materials_project_api",
+        identifier="mp-149",
+        score=0.99,
+        matched_spot_count=4,
+        mean_d_error=Measurement(
+            value=0.001,
+            unit="relative",
+            method="diffsims_phase_match",
+            provenance={"rotation_deg": 0.0, "raw_diffsims_score": 0.99},
+        ),
+        mean_angle_error=Measurement(value=0.2, unit="deg", method="diffsims_phase_match"),
+        lattice_parameters={
+            "materials_project": {
+                "rank": 0,
+                "energy_above_hull": 0.0,
+                "is_stable": True,
+                "theoretical": False,
+                "deprecated": False,
+                "site_count": 2,
+            }
+        },
+    )
+    alternate = PhaseCandidate(
+        name="mp-alt",
+        formula="Si",
+        source="materials_project_api",
+        identifier="mp-alt",
+        score=0.35,
+        matched_spot_count=1,
+        lattice_parameters={
+            "materials_project": {
+                "rank": 1,
+                "energy_above_hull": 0.12,
+                "is_stable": False,
+                "theoretical": True,
+                "deprecated": False,
+                "site_count": 8,
+            }
+        },
+    )
+    report = AnalysisReport(
+        diffraction=DiffractionResult(phase_candidates=[candidate, alternate]),
+        simulation=SimulationResult(
+            patterns=[
+                SimulatedPattern(
+                    kind="diffraction",
+                    structure_id="mp-149",
+                    simulation_parameters={
+                        "engine": "diffsims",
+                        "simulated_spot_count": 12,
+                        "rotation_angle_deg": 0.0,
+                        "phase_match": {
+                            "matched_spot_count": 4,
+                            "rotation_deg": 0.0,
+                        },
+                    },
+                    spots=[
+                        SimulatedSpot(
+                            gx=Measurement(value=2.5, unit="1/nm"),
+                            gy=Measurement(value=0.0, unit="1/nm"),
+                        )
+                    ],
+                )
+            ],
+            matched_phase_candidates=[candidate],
+            provenance={
+                "method": "diffsims",
+                "adapter": {"active": True},
+                "phase_matching": {
+                    "active": True,
+                    "method": "diffsims_template_spot_match",
+                    "selected_phase": "mp-149",
+                    "measured_spot_count": 4,
+                    "simulated_pattern_count": 1,
+                    "d_tolerance_rel": 0.03,
+                    "angle_tolerance_deg": 3.0,
+                    "per_phase": [
+                        {
+                            "phase_name": "mp-149",
+                            "best_pattern_index": 0,
+                            "simulated_spot_count": 12,
+                            "matched_spot_count": 4,
+                            "rotation_deg": 0.0,
+                        }
+                    ],
+                },
+            },
+        )
+    )
+
+    export_csv_tables_with_models(report, tmp_path)
+    export_html_report(report, tmp_path)
+
+    matches_csv = (tmp_path / "tables" / "simulation_phase_matches.csv").read_text(
+        encoding="utf-8"
+    )
+    assert "source,identifier,engine,adapter_active,phase_matching_active" in matches_csv
+    assert "diffsims_template_spot_match" in matches_csv
+    assert "mp-149" in matches_csv
+    html_text = (tmp_path / "report.html").read_text(encoding="utf-8")
+    assert "Simulation Phase Matching" in html_text
+    assert "Real adapter active" in html_text
+    assert "Candidate Comparison" in html_text
+    assert "MP E above hull" in html_text
+    assert "materials_project_api" in html_text
+    assert "mp-149" in html_text
+    assert "mp-alt" in html_text
+    assert "0.12" in html_text

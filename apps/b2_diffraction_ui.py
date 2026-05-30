@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 import os
 import re
 from datetime import datetime
@@ -17,7 +18,15 @@ from scipy.optimize import least_squares
 from streamlit_drawable_canvas import st_canvas
 
 from autotem.calibration import calibrate_dataset
-from autotem.core import DiffractionPeak, IndexedSpot, Measurement, PhaseCandidate
+from autotem.core import (
+    DiffractionPeak,
+    DiffractionResult,
+    IndexedSpot,
+    Measurement,
+    PhaseCandidate,
+    SimulatedPattern,
+    SimulationResult,
+)
 from autotem.diffraction.b4_indexing import run_b4_indexing
 from autotem.diffraction.basic import run_diffraction_analysis
 from autotem.diffraction.fft import compute_fft_analysis
@@ -27,8 +36,13 @@ from autotem.diffraction.peak_detection import (
     SUPPORTED_PEAK_DETECTORS,
     SUPPORTED_THRESHOLD_STRATEGIES,
 )
+from autotem.diffraction.phase_lookup import (
+    materials_project_api_setup_guidance,
+    supported_phase_lookup_sources,
+)
 from autotem.io import load_tem_dataset, read_image
 from autotem.preprocessing import SUPPORTED_DENOISE_METHODS, assess_quality, preprocess_dataset
+from autotem.simulation.basic import simulate_from_diffraction
 
 # Compatibility patch for streamlit-drawable-canvas on newer Streamlit.
 if not hasattr(st_image, "image_to_url"):
@@ -50,9 +64,9 @@ if not hasattr(st_image, "image_to_url"):
     st_image.image_to_url = _image_to_url_compat
 
 
-_APP_TITLE = "AutoTEM B1-B3 Interactive Preview"
-_UI_BUILD_TAG = "b1_b3_interactive_v23_vector_aux_edit_2026-05-27"
-_WORKFLOW_TEMPLATE = "configs/hrtem_b1_b3.yaml"
+_APP_TITLE = "AutoTEM B1-B5 Diffraction Debug UI"
+_UI_BUILD_TAG = "b1_b5_debug_ui_2026-05-30"
+_WORKFLOW_TEMPLATE = "configs/hrtem_fft_phase.yaml"
 _OUTPUT_ROOT_ENV = "AUTOTEM_UI_OUTPUT_ROOT"
 
 PHASE_OPTIONS = ["Silicon", "Gold", "Graphite", "Titanium Dioxide"]
@@ -68,6 +82,9 @@ INDEXING_MODE_LABELS: dict[str, str] = {
 SUPPORTED_BACKGROUND_METHODS = ["none", "gaussian", "rolling_ball"]
 SUPPORTED_FFT_CENTER_MODES = ["auto", "geometric"]
 SUPPORTED_INDEXING_MODES = ["auto", "baseline", "lattice_fit"]
+SUPPORTED_SIMULATION_ENGINES = ["baseline", "diffsims"]
+SUPPORTED_B5_SOURCE_MODES = ["Selected points", "Auto pipeline"]
+SUPPORTED_MP_SORT_MODES = ["stability", "energy_above_hull", "material_id", "none"]
 
 DEFAULT_B4_CANDIDATES_JSON = json.dumps(
     [
@@ -165,6 +182,42 @@ _FALLBACK_DEFAULTS: dict[str, Any] = {
         "d_tolerance_rel": 0.10,
         "angle_tolerance_deg": 12.0,
         "b4_strict_mode": False,
+        "phase_lookup_enabled": False,
+        "phase_lookup_materials": [],
+        "phase_lookup_sources": ["local_builtin"],
+        "phase_lookup_limit_per_source": 3,
+        "phase_lookup_timeout_s": 10.0,
+        "materials_project_sort_by": "stability",
+        "materials_project_include_deprecated": False,
+        "materials_project_filter_stable": False,
+        "materials_project_max_energy_above_hull": 0.0,
+        "materials_project_prefer_experimental": True,
+        "materials_project_candidate_pool_size": 20,
+    },
+    "simulation": {
+        "enabled": True,
+        "source_mode": "Selected points",
+        "simulation_engine": "baseline",
+        "voltage_kv": 200.0,
+        "reciprocal_radius_inv_angstrom": 1.0,
+        "max_candidates": 3,
+        "max_simulated_spots": 128,
+        "minimum_simulated_g_inv_nm": 0.001,
+        "with_direct_beam": True,
+        "max_excitation_error": 0.01,
+        "fallback_single_atom": True,
+        "zone_axis_candidates": [[0, 0, 1]],
+        "rotation_axis": [0, 0, 1],
+        "rotation_angles_deg": [0.0],
+        "phase_match_enabled": True,
+        "phase_match_d_tolerance_rel": 0.10,
+        "phase_match_angle_tolerance_deg": 12.0,
+        "phase_match_min_spots": 2,
+        "phase_match_top_n": 3,
+        "phase_match_previous_score_weight": 0.35,
+        "phase_match_max_rotation_candidates": 64,
+        "timeout_s": 20.0,
+        "auto_rerun": False,
     },
 }
 
@@ -232,6 +285,73 @@ def _num(value: Any, fallback: float) -> float:
 def _choice(options: list[str], value: Any, fallback: str) -> str:
     text = str(value)
     return text if text in options else fallback
+
+
+def _comma_list(raw_value: Any) -> list[str]:
+    if isinstance(raw_value, list):
+        return [str(item).strip() for item in raw_value if str(item).strip()]
+    text = str(raw_value or "")
+    return [item.strip() for item in re.split(r"[,;\n]+", text) if item.strip()]
+
+
+def _json_or_default(raw_text: str, fallback: Any) -> tuple[Any, list[str]]:
+    text = str(raw_text or "").strip()
+    if not text:
+        return fallback, []
+    try:
+        return json.loads(text), []
+    except Exception as exc:  # noqa: BLE001
+        return fallback, [f"JSON parse failed: {exc}"]
+
+
+def _zone_axis_tuple(raw_axis: Any) -> tuple[int, int, int] | None:
+    if not isinstance(raw_axis, (list, tuple)) or len(raw_axis) < 3:
+        return None
+    try:
+        axis = tuple(int(round(float(raw_axis[idx]))) for idx in range(3))
+    except (TypeError, ValueError):
+        return None
+    return None if axis == (0, 0, 0) else axis
+
+
+def _parse_zone_axis_candidates(raw_text: str) -> tuple[list[tuple[int, int, int]], list[str]]:
+    payload, warnings = _json_or_default(raw_text, [[0, 0, 1]])
+    axes: list[tuple[int, int, int]] = []
+    single_axis = _zone_axis_tuple(payload)
+    if single_axis is not None:
+        axes.append(single_axis)
+    elif isinstance(payload, list):
+        for raw_axis in payload:
+            axis = _zone_axis_tuple(raw_axis)
+            if axis is not None:
+                axes.append(axis)
+    if not axes:
+        warnings.append("zone_axis_candidates has no valid non-zero [h,k,l] rows.")
+        axes = [(0, 0, 1)]
+    unique: list[tuple[int, int, int]] = []
+    seen: set[tuple[int, int, int]] = set()
+    for axis in axes:
+        if axis in seen:
+            continue
+        seen.add(axis)
+        unique.append(axis)
+    return unique, warnings
+
+
+def _parse_float_vector(raw_text: str, fallback: list[float]) -> tuple[list[float], list[str]]:
+    payload, warnings = _json_or_default(raw_text, fallback)
+    if not isinstance(payload, list):
+        warnings.append("Expected a JSON list of numbers.")
+        return list(fallback), warnings
+    values: list[float] = []
+    for item in payload:
+        value = _to_float(item)
+        if value is not None:
+            values.append(float(value))
+    if not values:
+        warnings.append("No valid numeric values found.")
+        values = list(fallback)
+    return values, warnings
 
 
 def _to_float(value: Any) -> float | None:
@@ -1652,6 +1772,279 @@ def _build_phase_rows(phase_candidates: list[PhaseCandidate]) -> list[dict[str, 
     return rows
 
 
+def _diffraction_from_manual_result(manual_result: dict[str, Any]) -> DiffractionResult:
+    d_by_peak = [item for item in manual_result.get("d_by_peak", []) if item is not None]
+    return DiffractionResult(
+        peaks=list(manual_result.get("peaks", [])),
+        g_vectors=list(manual_result.get("g_vectors", [])),
+        d_spacings=list(d_by_peak),
+        indexed_spots=list(manual_result.get("indexed_spots", [])),
+        phase_candidates=list(manual_result.get("phase_candidates", [])),
+        provenance=dict(manual_result.get("provenance", {})),
+        warnings=list(manual_result.get("warnings", [])),
+    )
+
+
+def _simulation_worker(
+    diffraction_payload: dict[str, Any],
+    parameters: dict[str, Any],
+    queue: Any,
+) -> None:
+    try:
+        diffraction = DiffractionResult.model_validate(diffraction_payload)
+        simulation = simulate_from_diffraction(diffraction, parameters=parameters)
+        queue.put(
+            {
+                "ok": True,
+                "simulation": simulation.model_dump(mode="json"),
+                "diffraction": diffraction.model_dump(mode="json"),
+            }
+        )
+    except BaseException as exc:  # noqa: BLE001
+        queue.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+
+def _run_b5_simulation_with_timeout(
+    diffraction: DiffractionResult,
+    *,
+    parameters: dict[str, Any],
+    timeout_s: float,
+) -> tuple[SimulationResult, DiffractionResult, list[str]]:
+    engine = str(parameters.get("simulation_engine", "baseline")).strip().lower()
+    if engine != "diffsims":
+        simulation = simulate_from_diffraction(diffraction, parameters=parameters)
+        return simulation, diffraction, list(simulation.warnings)
+
+    timeout = max(1.0, float(timeout_s))
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    process = ctx.Process(
+        target=_simulation_worker,
+        args=(diffraction.model_dump(mode="json"), dict(parameters), queue),
+    )
+    process.start()
+    process.join(timeout)
+    if process.is_alive():
+        process.terminate()
+        process.join(2.0)
+        warning = (
+            "B5 diffsims simulation timed out in the UI subprocess "
+            f"after {timeout:.1f}s; reduce candidates/zone axes or use baseline mode."
+        )
+        return (
+            SimulationResult(
+                matched_phase_candidates=list(diffraction.phase_candidates),
+                warnings=[warning],
+                provenance={
+                    "method": "diffsims",
+                    "ui_timeout": True,
+                    "timeout_s": float(timeout),
+                },
+            ),
+            diffraction,
+            [warning],
+        )
+
+    if queue.empty():
+        warning = "B5 diffsims subprocess exited without returning a result."
+        return (
+            SimulationResult(
+                matched_phase_candidates=list(diffraction.phase_candidates),
+                warnings=[warning],
+                provenance={"method": "diffsims", "ui_worker_empty": True},
+            ),
+            diffraction,
+            [warning],
+        )
+
+    payload = queue.get()
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        error = str(payload.get("error", "unknown diffsims subprocess error"))
+        warning = f"B5 diffsims subprocess failed: {error}"
+        return (
+            SimulationResult(
+                matched_phase_candidates=list(diffraction.phase_candidates),
+                warnings=[warning],
+                provenance={"method": "diffsims", "ui_worker_failed": True},
+            ),
+            diffraction,
+            [warning],
+        )
+
+    simulation = SimulationResult.model_validate(payload["simulation"])
+    updated_diffraction = DiffractionResult.model_validate(payload["diffraction"])
+    return simulation, updated_diffraction, list(simulation.warnings)
+
+
+def _build_simulation_phase_rows(simulation: SimulationResult | None) -> list[dict[str, Any]]:
+    if simulation is None:
+        return []
+    rows: list[dict[str, Any]] = []
+    phase_matching = _as_mapping(simulation.provenance.get("phase_matching", {}))
+    per_phase = phase_matching.get("per_phase", [])
+    per_phase_rows = {
+        str(row.get("phase_name")): dict(row)
+        for row in per_phase
+        if isinstance(row, dict) and str(row.get("phase_name", "")).strip()
+    } if isinstance(per_phase, list) else {}
+    for candidate in simulation.matched_phase_candidates:
+        row = per_phase_rows.get(candidate.name, {})
+        rows.append(
+            {
+                "name": candidate.name,
+                "formula": candidate.formula,
+                "source": candidate.source,
+                "identifier": candidate.identifier,
+                "score": candidate.score,
+                "matched_spot_count": candidate.matched_spot_count,
+                "mean_d_error": (
+                    None
+                    if candidate.mean_d_error is None
+                    else candidate.mean_d_error.value
+                ),
+                "mean_angle_error": (
+                    None
+                    if candidate.mean_angle_error is None
+                    else candidate.mean_angle_error.value
+                ),
+                "zone_axis": candidate.zone_axis,
+                "best_pattern_index": row.get("best_pattern_index"),
+                "simulated_spot_count": row.get("simulated_spot_count"),
+                "phase_match_rotation_deg": row.get("rotation_deg"),
+            }
+        )
+    return rows
+
+
+def _build_simulated_spot_rows(simulation: SimulationResult | None) -> list[dict[str, Any]]:
+    if simulation is None:
+        return []
+    rows: list[dict[str, Any]] = []
+    for pattern_idx, pattern in enumerate(simulation.patterns):
+        for spot_idx, spot in enumerate(pattern.spots):
+            rows.append(
+                {
+                    "pattern_index": pattern_idx,
+                    "structure_id": pattern.structure_id,
+                    "zone_axis": pattern.zone_axis,
+                    "rotation_angle_deg": pattern.simulation_parameters.get(
+                        "rotation_angle_deg"
+                    ),
+                    "spot_index": spot_idx,
+                    "gx": spot.gx.value,
+                    "gy": spot.gy.value,
+                    "magnitude": None if spot.magnitude is None else spot.magnitude.value,
+                    "intensity": spot.intensity,
+                    "h": spot.h,
+                    "k": spot.k,
+                    "l": spot.l,
+                }
+            )
+    return rows
+
+
+def _best_simulation_pattern(simulation: SimulationResult | None) -> SimulatedPattern | None:
+    if simulation is None or not simulation.patterns:
+        return None
+    phase_matching = _as_mapping(simulation.provenance.get("phase_matching", {}))
+    per_phase = phase_matching.get("per_phase", [])
+    selected_phase = str(phase_matching.get("selected_phase", ""))
+    if isinstance(per_phase, list):
+        for row in per_phase:
+            if not isinstance(row, dict):
+                continue
+            if selected_phase and str(row.get("phase_name", "")) != selected_phase:
+                continue
+            idx = row.get("best_pattern_index")
+            if isinstance(idx, int) and 0 <= idx < len(simulation.patterns):
+                return simulation.patterns[idx]
+    for pattern in simulation.patterns:
+        if _as_mapping(pattern.simulation_parameters.get("phase_match", {})):
+            return pattern
+    return simulation.patterns[0]
+
+
+def _plot_b5_simulation_overlay(
+    diffraction: DiffractionResult,
+    simulation: SimulationResult | None,
+) -> Any | None:
+    pattern = _best_simulation_pattern(simulation)
+    if pattern is None or not pattern.spots or not diffraction.g_vectors:
+        return None
+
+    phase_match = _as_mapping(pattern.simulation_parameters.get("phase_match", {}))
+    rotation_deg = _num(phase_match.get("rotation_deg"), 0.0)
+    theta = np.deg2rad(float(rotation_deg))
+    cr = float(np.cos(theta))
+    sr = float(np.sin(theta))
+
+    measured: dict[int, tuple[float, float]] = {}
+    for idx, g_vector in enumerate(diffraction.g_vectors):
+        gx = _measurement_value(g_vector.gx)
+        gy = _measurement_value(g_vector.gy)
+        if gx is not None and gy is not None:
+            measured[idx] = (float(gx), float(gy))
+
+    simulated: dict[int, tuple[float, float]] = {}
+    for idx, spot in enumerate(pattern.spots):
+        gx = _measurement_value(spot.gx)
+        gy = _measurement_value(spot.gy)
+        if gx is None or gy is None:
+            continue
+        simulated[idx] = (float(gx) * cr - float(gy) * sr, float(gx) * sr + float(gy) * cr)
+
+    if not measured or not simulated:
+        return None
+
+    fig, ax = plt.subplots(figsize=(6, 6), dpi=160)
+    ax.axhline(0.0, color="0.7", linewidth=0.6)
+    ax.axvline(0.0, color="0.7", linewidth=0.6)
+    measured_xy = np.asarray(list(measured.values()), dtype=float)
+    simulated_xy = np.asarray(list(simulated.values()), dtype=float)
+    ax.scatter(
+        measured_xy[:, 0],
+        measured_xy[:, 1],
+        s=40,
+        facecolors="none",
+        edgecolors="#1f77b4",
+        linewidths=1.3,
+        label="measured",
+    )
+    ax.scatter(
+        simulated_xy[:, 0],
+        simulated_xy[:, 1],
+        s=36,
+        marker="x",
+        c="#d64b3a",
+        linewidths=1.3,
+        label="simulated",
+    )
+    pairs = phase_match.get("matched_pairs", [])
+    if isinstance(pairs, list):
+        for pair in pairs:
+            if not isinstance(pair, dict):
+                continue
+            m_idx = pair.get("measured_g_index")
+            s_idx = pair.get("simulated_spot_index")
+            if not isinstance(m_idx, int) or not isinstance(s_idx, int):
+                continue
+            if m_idx in measured and s_idx in simulated:
+                mx, my = measured[m_idx]
+                sx, sy = simulated[s_idx]
+                ax.plot([mx, sx], [my, sy], color="0.35", linewidth=0.8, alpha=0.55)
+    stacked = np.vstack([measured_xy, simulated_xy])
+    limit = max(1.0, float(np.nanmax(np.abs(stacked))) * 1.15)
+    ax.set_xlim(-limit, limit)
+    ax.set_ylim(-limit, limit)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("gx (1/nm)")
+    ax.set_ylabel("gy (1/nm)")
+    ax.set_title("B5 measured vs simulated diffraction")
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    return fig
+
+
 def _build_manual_diffraction(
     *,
     selected_points_xy: list[tuple[float, float]],
@@ -1997,8 +2390,8 @@ def main() -> None:
     st.set_page_config(page_title=_APP_TITLE, layout="wide")
     st.title(_APP_TITLE)
     st.caption(
-        "B1/B2/B3 interactive preview on current main-branch pipeline parameters "
-        "(quality, calibration, preprocessing, FFT peaks, indexing, phase match)."
+        "B1/B2/B3/B4/B5 interactive debugging for quality, calibration, "
+        "preprocessing, FFT peaks, indexing, phase lookup, and simulation matching."
     )
     st.caption(f"UI build: `{_UI_BUILD_TAG}`")
 
@@ -2007,6 +2400,7 @@ def main() -> None:
     cal_defaults = _as_mapping(merged_defaults.get("calibration"))
     prep_defaults = _as_mapping(merged_defaults.get("preprocessing"))
     diff_defaults = _as_mapping(merged_defaults.get("diffraction"))
+    sim_defaults = _as_mapping(merged_defaults.get("simulation"))
 
     st.sidebar.header("Run Setup")
     input_mode = st.sidebar.radio(
@@ -2263,7 +2657,7 @@ def main() -> None:
         )
         background_clip_zero = st.checkbox("background_clip_zero", value=False)
 
-    with st.sidebar.expander("B3 Diffraction", expanded=True):
+    with st.sidebar.expander("B3/B4 Diffraction + Indexing", expanded=True):
         auto_peak_tuning = st.checkbox(
             "auto_peak_tuning",
             value=bool(diff_defaults.get("auto_peak_tuning", True)),
@@ -2416,6 +2810,11 @@ def main() -> None:
             options=PHASE_OPTIONS,
             default=candidate_phases_default if candidate_phases_default else PHASE_OPTIONS[:3],
         )
+        extra_candidate_phases = st.text_input(
+            "extra candidate phase names",
+            value="",
+            help="Comma-separated extra phase/material labels to carry into B4 matching.",
+        )
         b4_strict_mode = st.checkbox(
             "b4_strict_mode",
             value=bool(diff_defaults.get("b4_strict_mode", False)),
@@ -2447,6 +2846,283 @@ def main() -> None:
             height=190,
         )
 
+    with st.sidebar.expander("B4 Phase Lookup / Crystal Sources", expanded=False):
+        phase_lookup_enabled = st.checkbox(
+            "phase_lookup_enabled",
+            value=bool(diff_defaults.get("phase_lookup_enabled", False)),
+        )
+        lookup_sources_all = sorted(supported_phase_lookup_sources())
+        lookup_sources_default = [
+            item
+            for item in diff_defaults.get("phase_lookup_sources", ["local_builtin"])
+            if item in lookup_sources_all
+        ]
+        phase_lookup_sources = st.multiselect(
+            "phase_lookup_sources",
+            options=lookup_sources_all,
+            default=lookup_sources_default or ["local_builtin"],
+            disabled=not phase_lookup_enabled,
+        )
+        phase_lookup_materials_text = st.text_area(
+            "phase_lookup_materials / material names",
+            value=", ".join(_comma_list(diff_defaults.get("phase_lookup_materials", []))),
+            height=80,
+            disabled=not phase_lookup_enabled,
+            help="Examples: Silicon, quartz, mp-149, TiO2.",
+        )
+        phase_lookup_formula = st.text_input(
+            "phase_lookup_formula",
+            value=str(diff_defaults.get("phase_lookup_formula", "")),
+            disabled=not phase_lookup_enabled,
+        )
+        phase_lookup_elements_text = st.text_input(
+            "phase_lookup_elements",
+            value=", ".join(_comma_list(diff_defaults.get("phase_lookup_elements", []))),
+            disabled=not phase_lookup_enabled,
+        )
+        materials_project_ids_text = st.text_input(
+            "materials_project_ids",
+            value=", ".join(_comma_list(diff_defaults.get("materials_project_ids", []))),
+            disabled=not phase_lookup_enabled,
+        )
+        materials_project_config_path = st.text_input(
+            "materials_project_config_path",
+            value=str(diff_defaults.get("materials_project_config_path", "")),
+            disabled=not phase_lookup_enabled,
+        )
+        phase_lookup_limit_per_source = st.number_input(
+            "phase_lookup_limit_per_source",
+            min_value=1,
+            value=int(_num(diff_defaults.get("phase_lookup_limit_per_source"), 3)),
+            step=1,
+            disabled=not phase_lookup_enabled,
+        )
+        phase_lookup_timeout_s = st.number_input(
+            "phase_lookup_timeout_s",
+            min_value=0.1,
+            value=_num(diff_defaults.get("phase_lookup_timeout_s"), 10.0),
+            step=0.5,
+            disabled=not phase_lookup_enabled,
+        )
+        mp_sort_by = st.selectbox(
+            "materials_project_sort_by",
+            options=SUPPORTED_MP_SORT_MODES,
+            index=SUPPORTED_MP_SORT_MODES.index(
+                _choice(
+                    SUPPORTED_MP_SORT_MODES,
+                    diff_defaults.get("materials_project_sort_by", "stability"),
+                    "stability",
+                )
+            ),
+            disabled=not phase_lookup_enabled,
+        )
+        mp_include_deprecated = st.checkbox(
+            "materials_project_include_deprecated",
+            value=bool(diff_defaults.get("materials_project_include_deprecated", False)),
+            disabled=not phase_lookup_enabled,
+        )
+        mp_filter_stable = st.checkbox(
+            "materials_project_filter_stable",
+            value=bool(diff_defaults.get("materials_project_filter_stable", False)),
+            disabled=not phase_lookup_enabled,
+        )
+        mp_max_energy = st.number_input(
+            "materials_project_max_energy_above_hull (0 disables)",
+            min_value=0.0,
+            value=_num(diff_defaults.get("materials_project_max_energy_above_hull"), 0.0),
+            step=0.01,
+            format="%.4f",
+            disabled=not phase_lookup_enabled,
+        )
+        mp_prefer_experimental = st.checkbox(
+            "materials_project_prefer_experimental",
+            value=bool(diff_defaults.get("materials_project_prefer_experimental", True)),
+            disabled=not phase_lookup_enabled,
+        )
+        mp_candidate_pool_size = st.number_input(
+            "materials_project_candidate_pool_size",
+            min_value=1,
+            value=int(_num(diff_defaults.get("materials_project_candidate_pool_size"), 20)),
+            step=1,
+            disabled=not phase_lookup_enabled,
+        )
+        if phase_lookup_enabled and any(
+            source == "materials_project_api" for source in phase_lookup_sources
+        ):
+            st.info(materials_project_api_setup_guidance(materials_project_config_path or None))
+
+    with st.sidebar.expander("B5 Simulation / Phase Matching", expanded=False):
+        b5_enabled = st.checkbox(
+            "Run B5 simulation step",
+            value=bool(sim_defaults.get("enabled", True)),
+        )
+        b5_source_mode = st.radio(
+            "B5 input source",
+            options=SUPPORTED_B5_SOURCE_MODES,
+            index=SUPPORTED_B5_SOURCE_MODES.index(
+                _choice(
+                    SUPPORTED_B5_SOURCE_MODES,
+                    sim_defaults.get("source_mode", "Selected points"),
+                    "Selected points",
+                )
+            ),
+            disabled=not b5_enabled,
+        )
+        simulation_engine = st.selectbox(
+            "simulation_engine",
+            options=SUPPORTED_SIMULATION_ENGINES,
+            index=SUPPORTED_SIMULATION_ENGINES.index(
+                _choice(
+                    SUPPORTED_SIMULATION_ENGINES,
+                    sim_defaults.get("simulation_engine", "baseline"),
+                    "baseline",
+                )
+            ),
+            disabled=not b5_enabled,
+            help=(
+                "Use baseline for quick UI debugging; diffsims runs in a "
+                "timeout-limited subprocess."
+            ),
+        )
+        b5_auto_rerun = st.checkbox(
+            "Auto rerun B5 on parameter change",
+            value=bool(sim_defaults.get("auto_rerun", False)),
+            disabled=not b5_enabled,
+        )
+        b5_timeout_s = st.number_input(
+            "diffsims timeout_s",
+            min_value=1.0,
+            value=_num(sim_defaults.get("timeout_s"), 20.0),
+            step=1.0,
+            disabled=not b5_enabled or simulation_engine != "diffsims",
+        )
+        sim_voltage_kv = st.number_input(
+            "B5 voltage_kv",
+            min_value=1.0,
+            value=_num(sim_defaults.get("voltage_kv"), 200.0),
+            step=10.0,
+            disabled=not b5_enabled,
+        )
+        reciprocal_radius = st.number_input(
+            "reciprocal_radius_inv_angstrom",
+            min_value=0.01,
+            value=_num(sim_defaults.get("reciprocal_radius_inv_angstrom"), 1.0),
+            step=0.1,
+            disabled=not b5_enabled,
+        )
+        sim_max_candidates = st.number_input(
+            "B5 max_candidates",
+            min_value=1,
+            value=int(_num(sim_defaults.get("max_candidates"), 3)),
+            step=1,
+            disabled=not b5_enabled,
+        )
+        max_simulated_spots = st.number_input(
+            "max_simulated_spots",
+            min_value=1,
+            value=int(_num(sim_defaults.get("max_simulated_spots"), 128)),
+            step=16,
+            disabled=not b5_enabled,
+        )
+        min_simulated_g = st.number_input(
+            "minimum_simulated_g_inv_nm",
+            min_value=0.0,
+            value=_num(sim_defaults.get("minimum_simulated_g_inv_nm"), 0.001),
+            step=0.001,
+            format="%.6f",
+            disabled=not b5_enabled,
+        )
+        sim_with_direct_beam = st.checkbox(
+            "with_direct_beam",
+            value=bool(sim_defaults.get("with_direct_beam", True)),
+            disabled=not b5_enabled,
+        )
+        sim_max_excitation_error = st.number_input(
+            "max_excitation_error",
+            min_value=1e-6,
+            value=_num(sim_defaults.get("max_excitation_error"), 0.01),
+            step=0.005,
+            format="%.6f",
+            disabled=not b5_enabled,
+        )
+        sim_fallback_single_atom = st.checkbox(
+            "fallback_single_atom",
+            value=bool(sim_defaults.get("fallback_single_atom", True)),
+            disabled=not b5_enabled,
+        )
+        zone_axis_text = st.text_area(
+            "zone_axis_candidates JSON",
+            value=json.dumps(
+                sim_defaults.get("zone_axis_candidates", [[0, 0, 1]]),
+                ensure_ascii=False,
+            ),
+            height=80,
+            disabled=not b5_enabled,
+        )
+        rotation_axis_text = st.text_input(
+            "rotation_axis JSON",
+            value=json.dumps(sim_defaults.get("rotation_axis", [0, 0, 1])),
+            disabled=not b5_enabled,
+        )
+        rotation_angles_text = st.text_input(
+            "rotation_angles_deg JSON",
+            value=json.dumps(sim_defaults.get("rotation_angles_deg", [0.0])),
+            disabled=not b5_enabled,
+        )
+        phase_match_enabled = st.checkbox(
+            "phase_match_enabled",
+            value=bool(sim_defaults.get("phase_match_enabled", True)),
+            disabled=not b5_enabled,
+        )
+        phase_match_d_tolerance_rel = st.number_input(
+            "phase_match_d_tolerance_rel",
+            min_value=0.001,
+            value=_num(sim_defaults.get("phase_match_d_tolerance_rel"), 0.10),
+            step=0.01,
+            format="%.3f",
+            disabled=not b5_enabled or not phase_match_enabled,
+        )
+        phase_match_angle_tolerance_deg = st.number_input(
+            "phase_match_angle_tolerance_deg",
+            min_value=0.1,
+            value=_num(sim_defaults.get("phase_match_angle_tolerance_deg"), 12.0),
+            step=0.5,
+            disabled=not b5_enabled or not phase_match_enabled,
+        )
+        phase_match_min_spots = st.number_input(
+            "phase_match_min_spots",
+            min_value=1,
+            value=int(_num(sim_defaults.get("phase_match_min_spots"), 2)),
+            step=1,
+            disabled=not b5_enabled or not phase_match_enabled,
+        )
+        phase_match_top_n = st.number_input(
+            "phase_match_top_n",
+            min_value=1,
+            value=int(_num(sim_defaults.get("phase_match_top_n"), 3)),
+            step=1,
+            disabled=not b5_enabled or not phase_match_enabled,
+        )
+        phase_match_previous_score_weight = st.number_input(
+            "phase_match_previous_score_weight",
+            min_value=0.0,
+            max_value=1.0,
+            value=_num(sim_defaults.get("phase_match_previous_score_weight"), 0.35),
+            step=0.05,
+            disabled=not b5_enabled or not phase_match_enabled,
+        )
+        phase_match_max_rotation_candidates = st.number_input(
+            "phase_match_max_rotation_candidates",
+            min_value=1,
+            value=int(_num(sim_defaults.get("phase_match_max_rotation_candidates"), 64)),
+            step=1,
+            disabled=not b5_enabled or not phase_match_enabled,
+        )
+        if b5_enabled and simulation_engine == "diffsims":
+            st.warning(
+                "Real diffsims can hang in this environment; the UI uses a subprocess timeout."
+            )
+
     st.sidebar.subheader("Manual Point Selection Params")
     overlay_label_mode = st.sidebar.selectbox(
         "Overlay numbering",
@@ -2455,7 +3131,7 @@ def main() -> None:
     )
     manual_min_distance = st.sidebar.slider("Manual dedup distance (px)", 0.5, 12.0, 2.0, 0.1)
     manual_max_points = st.sidebar.slider("Manual max points", 2, 256, 64, 1)
-    with st.sidebar.expander("手动模式：两点向量合成参数", expanded=False):
+    with st.sidebar.expander("Manual mode: two-point vector synthesis", expanded=False):
         vector_expand_order = st.slider(
             "Vector expansion order",
             min_value=1,
@@ -2652,6 +3328,25 @@ def main() -> None:
     candidate_phase_params, candidate_phase_warnings = _parse_candidate_phase_params(
         candidate_phase_params_text
     )
+    candidate_phase_names = list(
+        dict.fromkeys([*candidate_phases, *_comma_list(extra_candidate_phases)])
+    )
+    phase_lookup_materials = _comma_list(phase_lookup_materials_text)
+    phase_lookup_elements = _comma_list(phase_lookup_elements_text)
+    materials_project_ids = _comma_list(materials_project_ids_text)
+    zone_axis_candidates, zone_axis_warnings = _parse_zone_axis_candidates(zone_axis_text)
+    rotation_axis_values, rotation_axis_warnings = _parse_float_vector(
+        rotation_axis_text,
+        [0.0, 0.0, 1.0],
+    )
+    if len(rotation_axis_values) < 3:
+        rotation_axis_warnings.append("rotation_axis must contain at least three numbers.")
+        rotation_axis_values = [0.0, 0.0, 1.0]
+    rotation_axis_values = rotation_axis_values[:3]
+    rotation_angles, rotation_angle_warnings = _parse_float_vector(
+        rotation_angles_text,
+        [0.0],
+    )
     diffraction_params: dict[str, Any] = {
         "auto_peak_tuning": bool(auto_peak_tuning),
         "peak_detector": str(peak_detector),
@@ -2674,7 +3369,7 @@ def main() -> None:
         "direct_beam_center_uncertainty_px": float(direct_beam_center_uncertainty_px),
         "indexing_mode": str(indexing_mode),
         "phase_top_n": int(phase_top_n),
-        "candidate_phases": list(candidate_phases),
+        "candidate_phases": list(candidate_phase_names),
         "candidate_phase_params": list(candidate_phase_params),
         "max_hkl": int(max_hkl),
         "d_tolerance_rel": float(d_tolerance_rel),
@@ -2687,6 +3382,56 @@ def main() -> None:
         diffraction_params["direct_beam_search_radius"] = float(direct_beam_search_radius)
     if cif_candidates_dir.strip():
         diffraction_params["cif_candidates_dir"] = str(cif_candidates_dir.strip())
+    if phase_lookup_enabled:
+        diffraction_params.update(
+            {
+                "phase_lookup_enabled": True,
+                "phase_lookup_sources": list(phase_lookup_sources),
+                "phase_lookup_limit_per_source": int(phase_lookup_limit_per_source),
+                "phase_lookup_timeout_s": float(phase_lookup_timeout_s),
+                "materials_project_sort_by": str(mp_sort_by),
+                "materials_project_include_deprecated": bool(mp_include_deprecated),
+                "materials_project_filter_stable": bool(mp_filter_stable),
+                "materials_project_prefer_experimental": bool(mp_prefer_experimental),
+                "materials_project_candidate_pool_size": int(mp_candidate_pool_size),
+            }
+        )
+        if phase_lookup_materials:
+            diffraction_params["phase_lookup_materials"] = phase_lookup_materials
+        if phase_lookup_formula.strip():
+            diffraction_params["phase_lookup_formula"] = phase_lookup_formula.strip()
+        if phase_lookup_elements:
+            diffraction_params["phase_lookup_elements"] = phase_lookup_elements
+        if materials_project_ids:
+            diffraction_params["materials_project_ids"] = materials_project_ids
+        if materials_project_config_path.strip():
+            diffraction_params["materials_project_config_path"] = (
+                materials_project_config_path.strip()
+            )
+        if float(mp_max_energy) > 0:
+            diffraction_params["materials_project_max_energy_above_hull"] = float(mp_max_energy)
+
+    b5_params: dict[str, Any] = {
+        "simulation_engine": str(simulation_engine),
+        "voltage_kv": float(sim_voltage_kv),
+        "reciprocal_radius_inv_angstrom": float(reciprocal_radius),
+        "max_candidates": int(sim_max_candidates),
+        "max_simulated_spots": int(max_simulated_spots),
+        "minimum_simulated_g_inv_nm": float(min_simulated_g),
+        "with_direct_beam": bool(sim_with_direct_beam),
+        "max_excitation_error": float(sim_max_excitation_error),
+        "fallback_single_atom": bool(sim_fallback_single_atom),
+        "zone_axis_candidates": [list(axis) for axis in zone_axis_candidates],
+        "rotation_axis": [float(item) for item in rotation_axis_values],
+        "rotation_angles_deg": [float(item) for item in rotation_angles],
+        "phase_match_enabled": bool(phase_match_enabled),
+        "phase_match_d_tolerance_rel": float(phase_match_d_tolerance_rel),
+        "phase_match_angle_tolerance_deg": float(phase_match_angle_tolerance_deg),
+        "phase_match_min_spots": int(phase_match_min_spots),
+        "phase_match_top_n": int(phase_match_top_n),
+        "phase_match_previous_score_weight": float(phase_match_previous_score_weight),
+        "phase_match_max_rotation_candidates": int(phase_match_max_rotation_candidates),
+    }
 
     manual_table_from_upload = _decode_uploaded_text(manual_table_upload).strip()
     manual_table_from_text = str(manual_table_text or "").strip()
@@ -3756,7 +4501,7 @@ def main() -> None:
             ),
             "diffraction": diffraction_params,
             "candidate_phase_params": candidate_phase_params,
-            "candidate_phases": list(candidate_phases),
+            "candidate_phases": list(candidate_phase_names),
             "manual_refine": manual_refine_diagnostics,
             "vector_synthesis": vector_synth_diagnostics,
             "auto_remove_peak_ids": [int(i) for i in auto_remove_peak_ids],
@@ -3773,7 +4518,7 @@ def main() -> None:
             calibration=calibration,
             diff_params=diffraction_params,
             candidate_phase_params=candidate_phase_params,
-            candidate_phases=list(candidate_phases),
+            candidate_phases=list(candidate_phase_names),
         )
         manual_result = _with_manual_context(
             manual_result,
@@ -3878,15 +4623,84 @@ def main() -> None:
             "result": align_result,
         }
 
+    b5_source_diffraction = (
+        diffraction_auto
+        if b5_source_mode == "Auto pipeline"
+        else _diffraction_from_manual_result(manual_result)
+    )
+    b5_signature = _json_signature(
+        {
+            "enabled": bool(b5_enabled),
+            "source_mode": str(b5_source_mode),
+            "diffraction": b5_source_diffraction.model_dump(mode="json"),
+            "parameters": b5_params,
+        }
+    )
+    b5_cache = st.session_state.get("b1b5_simulation_cache")
+    b5_cached = isinstance(b5_cache, dict) and b5_cache.get("signature") == b5_signature
+    b5_col1, b5_col2 = st.columns([0.22, 0.78])
+    with b5_col1:
+        b5_run_clicked = st.button(
+            "Run / refresh B5",
+            type="secondary",
+            disabled=not b5_enabled,
+            help="Runs simulation and experimental-vs-simulated phase matching.",
+        )
+    with b5_col2:
+        if b5_enabled:
+            st.caption(
+                f"B5 source: `{b5_source_mode}` | engine: `{simulation_engine}` | "
+                f"cached: `{b5_cached}`"
+            )
+        else:
+            st.caption("B5 simulation is disabled in the sidebar.")
+    should_auto_run_b5 = bool(b5_enabled) and (
+        bool(b5_auto_rerun) or str(simulation_engine) == "baseline"
+    )
+    need_b5_run = bool(b5_enabled) and (
+        b5_run_clicked or (should_auto_run_b5 and not b5_cached)
+    )
+    if need_b5_run:
+        with st.spinner("Running B5 simulation / phase matching..."):
+            simulation_result, b5_updated_diffraction, b5_warnings = (
+                _run_b5_simulation_with_timeout(
+                    b5_source_diffraction.model_copy(deep=True),
+                    parameters=b5_params,
+                    timeout_s=float(b5_timeout_s),
+                )
+            )
+        st.session_state["b1b5_simulation_cache"] = {
+            "signature": b5_signature,
+            "simulation": simulation_result,
+            "diffraction": b5_updated_diffraction,
+            "warnings": b5_warnings,
+        }
+        b5_cache = st.session_state.get("b1b5_simulation_cache")
+        b5_cached = True
+
+    if (
+        bool(b5_enabled)
+        and isinstance(b5_cache, dict)
+        and b5_cache.get("signature") == b5_signature
+    ):
+        b5_simulation = b5_cache.get("simulation")
+        b5_diffraction_used = b5_cache.get("diffraction")
+        b5_run_warnings = list(b5_cache.get("warnings", []))
+    else:
+        b5_simulation = None
+        b5_diffraction_used = b5_source_diffraction
+        b5_run_warnings = []
+
     selected_tab_label = (
         "Auto review set"
         if selection_mode == MODE_AUTO_EDIT
         else "Vector synthesis set"
     )
-    tab_selected, tab_auto, tab_manual_align, tab_b1, tab_diag = st.tabs(
+    tab_selected, tab_auto, tab_b5, tab_manual_align, tab_b1, tab_diag = st.tabs(
         [
             selected_tab_label,
             "Auto (pipeline)",
+            "B5 simulation",
             "Manual table align",
             "B1 details",
             "Warnings / Provenance",
@@ -3920,6 +4734,80 @@ def main() -> None:
             _build_phase_rows(list(diffraction_auto.phase_candidates)),
             use_container_width=True,
         )
+
+    with tab_b5:
+        st.caption(
+            "B5 debug panel for simulated diffraction, zone-axis candidates, and "
+            "experimental-vs-simulated phase matching."
+        )
+        if not b5_enabled:
+            st.info("Enable `Run B5 simulation step` in the sidebar to debug B5.")
+        elif b5_simulation is None:
+            st.info("Click `Run / refresh B5` to run B5 simulation for the current peak set.")
+        else:
+            phase_matching = _as_mapping(b5_simulation.provenance.get("phase_matching", {}))
+            adapter = _as_mapping(b5_simulation.provenance.get("adapter", {}))
+            metric_cols = st.columns(6)
+            metric_cols[0].metric(
+                "Engine",
+                str(b5_simulation.provenance.get("method", b5_params.get("simulation_engine"))),
+            )
+            metric_cols[1].metric(
+                "Patterns",
+                str(len(b5_simulation.patterns)),
+            )
+            metric_cols[2].metric(
+                "Matched phases",
+                str(len(b5_simulation.matched_phase_candidates)),
+            )
+            metric_cols[3].metric(
+                "Selected phase",
+                str(phase_matching.get("selected_phase", "-")),
+            )
+            metric_cols[4].metric(
+                "Selected zone axis",
+                str(phase_matching.get("selected_zone_axis", "-")),
+            )
+            metric_cols[5].metric(
+                "Adapter active",
+                str(adapter.get("active", "")),
+            )
+
+            overlay_fig_b5 = _plot_b5_simulation_overlay(
+                b5_diffraction_used
+                if isinstance(b5_diffraction_used, DiffractionResult)
+                else b5_source_diffraction,
+                b5_simulation,
+            )
+            if overlay_fig_b5 is not None:
+                st.pyplot(overlay_fig_b5, clear_figure=True)
+            else:
+                st.info("No B5 reciprocal-space overlay is available for this result.")
+
+            st.subheader("B5 Phase Match Candidates")
+            phase_rows = _build_simulation_phase_rows(b5_simulation)
+            if phase_rows:
+                st.dataframe(phase_rows, use_container_width=True, height=260)
+            else:
+                st.info("No B5 matched phase candidates recorded.")
+
+            st.subheader("Simulated Spots")
+            spot_rows = _build_simulated_spot_rows(b5_simulation)
+            if spot_rows:
+                st.dataframe(spot_rows, use_container_width=True, height=260)
+            else:
+                st.info("No simulated spots recorded.")
+
+            st.subheader("B5 Parameters")
+            st.json(
+                {
+                    "source_mode": b5_source_mode,
+                    "parameters": b5_params,
+                    "phase_matching": phase_matching,
+                    "adapter": adapter,
+                    "warnings": b5_run_warnings,
+                }
+            )
 
     with tab_manual_align:
         st.caption(
@@ -4060,8 +4948,12 @@ def main() -> None:
     with tab_diag:
         warnings = []
         warnings.extend(list(candidate_phase_warnings))
+        warnings.extend(list(zone_axis_warnings))
+        warnings.extend(list(rotation_axis_warnings))
+        warnings.extend(list(rotation_angle_warnings))
         warnings.extend(list(manual_table_parse_warnings))
         warnings.extend(list(align_result.get("warnings", [])))
+        warnings.extend(list(b5_run_warnings))
         warnings.extend(list(dataset.warnings))
         warnings.extend(list(quality.warnings))
         warnings.extend(list(calibration.warnings))
@@ -4085,6 +4977,11 @@ def main() -> None:
         st.json(diffraction_auto.provenance)
         st.markdown("**Selected-point provenance**")
         st.json(manual_result["provenance"])
+        st.markdown("**B5 simulation provenance**")
+        if isinstance(b5_simulation, SimulationResult):
+            st.json(b5_simulation.provenance)
+        else:
+            st.info("B5 simulation has not been run for the current signature.")
         st.markdown("**Manual-table alignment summary**")
         st.json(
             {
@@ -4106,6 +5003,8 @@ def main() -> None:
                     "input_path": str(input_path),
                     "output_dir": str(run_dir),
                     "signature_len": len(signature),
+                    "diffraction": diffraction_params,
+                    "simulation": b5_params,
                 },
                 sort_keys=False,
                 allow_unicode=False,
