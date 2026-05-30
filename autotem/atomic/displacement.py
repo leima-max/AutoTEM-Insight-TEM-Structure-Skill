@@ -42,6 +42,7 @@ def compute_atomic_displacement_from_basis(
     reference_mask: np.ndarray | None = None,
     lattice_index_tolerance: float = 0.40,
     manual_lattice_indices: dict[int, tuple[int, int]] | None = None,
+    allow_reference_fallback: bool = True,
 ) -> AtomicDisplacementResult:
     """Fit an ideal 2D lattice from custom basis picks and compute atom displacements."""
     coords = np.asarray(coordinates, dtype=np.float64)
@@ -107,6 +108,7 @@ def compute_atomic_displacement_from_basis(
         fit_mask=fit_mask,
         valid_mask=valid_mask,
         warnings=warnings,
+        allow_reference_fallback=allow_reference_fallback,
     )
 
     fitted_origin_y, fitted_a_y, fitted_b_y = _fit_axis(
@@ -169,6 +171,7 @@ def compute_atomic_displacement_from_basis(
         "parameters": {
             "lattice_index_tolerance": float(lattice_index_tolerance),
             "manual_lattice_index_count": int(np.sum(manual_mask)),
+            "allow_reference_fallback": bool(allow_reference_fallback),
         },
         "basis_indices": {
             "base_index": int(base_index),
@@ -233,11 +236,18 @@ def _ensure_fit_mask(
     fit_mask: np.ndarray,
     valid_mask: np.ndarray,
     warnings: list[str],
+    allow_reference_fallback: bool,
 ) -> np.ndarray:
     fit_mask = np.asarray(fit_mask, dtype=bool).copy()
     design = _design_matrix(lattice_indices[fit_mask])
     if np.sum(fit_mask) >= 3 and np.linalg.matrix_rank(design) == 3:
         return fit_mask
+
+    if not allow_reference_fallback:
+        raise ValueError(
+            "Reference ROI atoms are insufficient for a stable ideal-lattice fit. "
+            "Select a larger, cleaner ROI with at least three non-collinear assigned atoms."
+        )
 
     warnings.append(
         "Reference atoms were insufficient for a stable ideal-lattice fit; "

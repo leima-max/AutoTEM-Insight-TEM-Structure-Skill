@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.elements.image as st_image
+from matplotlib.collections import LineCollection
 from PIL import Image, ImageDraw
 from scipy import ndimage as ndi
 from streamlit_drawable_canvas import st_canvas
@@ -22,7 +23,18 @@ from autotem.atomic.displacement import (
 )
 from autotem.atomic.distance_statistics import compute_distance_statistics
 from autotem.atomic.gaussian_refinement import refine_atom_coordinates
+from autotem.atomic.intensity_quantification import (
+    AtomicColumnIntensityResult,
+    AtomicIntensityGroupResult,
+    cluster_atomic_column_intensities,
+    group_atomic_column_intensities_by_lattice,
+    quantify_atomic_column_intensity,
+)
 from autotem.atomic.lattice_constraint import apply_lattice_constraint
+from autotem.atomic.plane_spacing import (
+    AtomicPlaneSpacingResult,
+    compute_atomic_plane_spacing_segments_from_basis,
+)
 from autotem.io import load_tem_dataset
 from autotem.io.metadata import normalize_metadata
 from autotem.strain.atom_strain import AtomStrainFieldResult, compute_atom_strain_fields
@@ -52,6 +64,13 @@ if not hasattr(st_image, "image_to_url"):
 st.set_page_config(page_title="AutoTEM Atom Detection (C0)", layout="wide")
 st.title("AutoTEM-Insight: Atom-Column Detection (C0)")
 st.caption("Support: dm/dm3/dm4/tif/tiff + LoG/DoG + optional Gaussian filter")
+
+DISPLACEMENT_METHOD_MANUAL_BASIS = "Method 1 - manual base/a/b"
+DISPLACEMENT_METHOD_REFERENCE_ROI = "Method 2 - reference ROI fit + custom a/b direction"
+DISPLACEMENT_METHOD_OPTIONS = [
+    DISPLACEMENT_METHOD_MANUAL_BASIS,
+    DISPLACEMENT_METHOD_REFERENCE_ROI,
+]
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
@@ -326,6 +345,51 @@ def _atomic_displacement_csv(
     return buffer.getvalue()
 
 
+def _atomic_intensity_csv(coords: np.ndarray, result: AtomicColumnIntensityResult) -> str:
+    buffer = io.StringIO()
+    buffer.write("intensity_unit,a.u.\n")
+    buffer.write(
+        "atom_index,y,x,peak_intensity,raw_sum,raw_mean,background_level,"
+        "background_mean,background_median,background_std,"
+        "background_subtracted_sum,normalized_intensity,snr,atom_area_px,"
+        "background_area_px,nearest_neighbor_distance_px,valid_intensity,"
+        "edge_flag,overlap_flag,saturation_flag\n"
+    )
+    for idx in range(len(coords)):
+        y, x = coords[idx]
+        row = [
+            str(idx),
+            f"{float(y):.6f}",
+            f"{float(x):.6f}",
+            _csv_float(result.peak_intensity[idx]),
+            _csv_float(result.raw_sum[idx]),
+            _csv_float(result.raw_mean[idx]),
+            _csv_float(result.background_level[idx]),
+            _csv_float(result.background_mean[idx]),
+            _csv_float(result.background_median[idx]),
+            _csv_float(result.background_std[idx]),
+            _csv_float(result.background_subtracted_sum[idx]),
+            _csv_float(result.normalized_intensity[idx]),
+            _csv_float(result.snr[idx]),
+            str(int(result.atom_area_px[idx])),
+            str(int(result.background_area_px[idx])),
+            _csv_float(result.nearest_neighbor_distance_px[idx]),
+            str(int(bool(result.valid_atom_mask[idx]))),
+            str(int(bool(result.edge_flag[idx]))),
+            str(int(bool(result.overlap_flag[idx]))),
+            str(int(bool(result.saturation_flag[idx]))),
+        ]
+        buffer.write(",".join(row) + "\n")
+    return buffer.getvalue()
+
+
+def _csv_float(value: float) -> str:
+    value = float(value)
+    if not np.isfinite(value):
+        return ""
+    return f"{value:.6f}"
+
+
 def _symmetric_limit(arr: np.ndarray, percentile: float = 98.0, fallback: float = 1.0) -> float:
     finite = np.asarray(arr, dtype=np.float64)
     finite = finite[np.isfinite(finite)]
@@ -335,6 +399,324 @@ def _symmetric_limit(arr: np.ndarray, percentile: float = 98.0, fallback: float 
     if not np.isfinite(lim) or lim <= 1e-12:
         lim = fallback
     return lim
+
+
+def _atomic_intensity_metric(
+    result: AtomicColumnIntensityResult,
+    metric: str,
+) -> tuple[np.ndarray, str]:
+    mapping = {
+        "background_subtracted_sum": (
+            result.background_subtracted_sum,
+            "background-subtracted intensity [a.u.]",
+        ),
+        "normalized_intensity": (
+            result.normalized_intensity,
+            "normalized intensity [relative]",
+        ),
+        "peak_intensity": (result.peak_intensity, "peak intensity [a.u.]"),
+        "snr": (result.snr, "local SNR"),
+    }
+    if metric not in mapping:
+        raise ValueError(f"Unsupported intensity metric: {metric}")
+    values, label = mapping[metric]
+    return np.asarray(values, dtype=np.float64), label
+
+
+def _auto_color_limits(values: np.ndarray, fallback: tuple[float, float]) -> tuple[float, float]:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return fallback
+    vmin = float(np.percentile(finite, 2))
+    vmax = float(np.percentile(finite, 98))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or abs(vmax - vmin) <= 1e-12:
+        return fallback
+    return vmin, vmax
+
+
+def _render_atomic_intensity_overlay(
+    image_norm: np.ndarray,
+    coords: np.ndarray,
+    result: AtomicColumnIntensityResult,
+    *,
+    metric: str,
+    auto_color_range: bool,
+    vmin: float,
+    vmax: float,
+    marker_size: float,
+) -> plt.Figure:
+    values, label = _atomic_intensity_metric(result, metric)
+    valid = np.asarray(result.valid_atom_mask, dtype=bool) & np.isfinite(values)
+    if auto_color_range:
+        vmin, vmax = _auto_color_limits(values[valid], (0.0, 1.0))
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
+
+    fig, ax = plt.subplots(figsize=(7.2, 6.8), dpi=160)
+    ax.imshow(image_norm, cmap="gray")
+    if np.any(valid):
+        scatter = ax.scatter(
+            coords[valid, 1],
+            coords[valid, 0],
+            c=values[valid],
+            cmap="turbo",
+            vmin=vmin,
+            vmax=vmax,
+            s=float(marker_size),
+            edgecolors="white",
+            linewidths=0.35,
+            alpha=0.92,
+            label="valid intensity",
+        )
+        cbar = fig.colorbar(scatter, ax=ax, shrink=0.84)
+        cbar.set_label(label, rotation=90)
+    invalid = ~valid
+    if np.any(invalid):
+        ax.scatter(
+            coords[invalid, 1],
+            coords[invalid, 0],
+            s=max(float(marker_size) * 0.85, 8.0),
+            c="none",
+            edgecolors="#ff3d3d",
+            marker="x",
+            linewidths=0.8,
+            label="invalid intensity",
+        )
+    ax.set_title(f"Atomic-column intensity map: {metric}")
+    ax.axis("off")
+    if np.any(invalid):
+        ax.legend(loc="upper right", fontsize=8, framealpha=0.82)
+    fig.tight_layout()
+    return fig
+
+
+def _render_atomic_intensity_histogram(
+    result: AtomicColumnIntensityResult,
+    *,
+    metric: str,
+) -> plt.Figure:
+    values, label = _atomic_intensity_metric(result, metric)
+    valid = np.asarray(result.valid_atom_mask, dtype=bool) & np.isfinite(values)
+    fig, ax = plt.subplots(figsize=(6.8, 3.8), dpi=160)
+    if np.any(valid):
+        ax.hist(values[valid], bins=36, color="#147c8c", alpha=0.82, edgecolor="white")
+        ax.axvline(float(np.median(values[valid])), color="#ff5a3d", lw=1.6, label="median")
+        ax.legend(frameon=False)
+    else:
+        ax.text(0.5, 0.5, "No valid intensity values", ha="center", va="center")
+    ax.set_xlabel(label)
+    ax.set_ylabel("atom count")
+    ax.set_title("Atomic-column intensity histogram")
+    fig.tight_layout()
+    return fig
+
+
+def _render_atomic_intensity_group_histogram(
+    result: AtomicColumnIntensityResult,
+    group_result: AtomicIntensityGroupResult,
+    *,
+    metric: str,
+) -> plt.Figure:
+    values, label = _atomic_intensity_metric(result, metric)
+    labels = np.asarray(group_result.labels, dtype=np.int32)
+    valid = np.asarray(result.valid_atom_mask, dtype=bool) & np.isfinite(values) & (labels >= 0)
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=160)
+    if not np.any(valid):
+        ax.text(0.5, 0.5, "No valid grouped intensity values", ha="center", va="center")
+    else:
+        summary_by_id = {int(row["group_id"]): row for row in group_result.summaries}
+        group_ids = sorted(int(v) for v in np.unique(labels[valid]))
+        for group_id in group_ids:
+            group_values = values[valid & (labels == group_id)]
+            group_name = str(summary_by_id.get(group_id, {}).get("group_name", group_id))
+            ax.hist(
+                group_values,
+                bins=28,
+                alpha=0.55,
+                label=f"{group_name} (n={len(group_values)})",
+            )
+        ax.legend(frameon=False, fontsize=8)
+    ax.set_xlabel(label)
+    ax.set_ylabel("atom count")
+    ax.set_title("Grouped atomic-column intensity histogram")
+    fig.tight_layout()
+    return fig
+
+
+def _atomic_intensity_group_csv(group_result: AtomicIntensityGroupResult) -> str:
+    buffer = io.StringIO()
+    buffer.write(f"metric,{group_result.metric}\n")
+    buffer.write(
+        "group_id,group_name,count,mean,std,median,min,max,method,confidence\n"
+    )
+    method = str(group_result.provenance.get("method", ""))
+    for row in group_result.summaries:
+        buffer.write(
+            ",".join(
+                [
+                    str(int(row["group_id"])),
+                    str(row["group_name"]),
+                    str(int(row["count"])),
+                    _csv_float(row["mean"]),
+                    _csv_float(row["std"]),
+                    _csv_float(row["median"]),
+                    _csv_float(row["min"]),
+                    _csv_float(row["max"]),
+                    method,
+                    _csv_float(group_result.confidence),
+                ]
+            )
+            + "\n"
+        )
+    return buffer.getvalue()
+
+
+def _plane_spacing_csv(
+    result: AtomicPlaneSpacingResult,
+    *,
+    spacing_scale: float,
+    spacing_unit: str,
+) -> str:
+    buffer = io.StringIO()
+    buffer.write(f"spacing_unit,{spacing_unit}\n")
+    buffer.write(
+        "segment_index,direction,source_atom,target_atom,source_i,source_j,"
+        "target_i,target_j,start_y,start_x,end_y,end_x,length\n"
+    )
+    for idx in range(len(result.length_px)):
+        start_y, start_x = result.start_yx[idx]
+        end_y, end_x = result.end_yx[idx]
+        source_i, source_j = result.source_lattice_ij[idx]
+        target_i, target_j = result.target_lattice_ij[idx]
+        row = [
+            str(idx),
+            str(result.direction[idx]),
+            str(int(result.source_atom_index[idx])),
+            str(int(result.target_atom_index[idx])),
+            str(int(source_i)),
+            str(int(source_j)),
+            str(int(target_i)),
+            str(int(target_j)),
+            f"{float(start_y):.6f}",
+            f"{float(start_x):.6f}",
+            f"{float(end_y):.6f}",
+            f"{float(end_x):.6f}",
+            f"{float(result.length_px[idx]) * spacing_scale:.6f}",
+        ]
+        buffer.write(",".join(row) + "\n")
+    return buffer.getvalue()
+
+
+def _plane_spacing_direction_mask(
+    result: AtomicPlaneSpacingResult,
+    direction_mode: str,
+) -> np.ndarray:
+    directions = np.asarray(result.direction, dtype=object)
+    if direction_mode == "a + b":
+        return np.ones(len(directions), dtype=bool)
+    if direction_mode == "a only":
+        return directions == "a"
+    if direction_mode == "b only":
+        return directions == "b"
+    raise ValueError(f"Unsupported spacing direction mode: {direction_mode}")
+
+
+def _render_plane_spacing_segments(
+    image_norm: np.ndarray,
+    coords: np.ndarray,
+    result: AtomicPlaneSpacingResult,
+    *,
+    direction_mode: str,
+    spacing_scale: float,
+    spacing_unit: str,
+    show_image: bool,
+    show_atoms: bool,
+    auto_color_range: bool,
+    vmin: float,
+    vmax: float,
+    line_width: float,
+) -> plt.Figure:
+    mask = _plane_spacing_direction_mask(result, direction_mode)
+    lengths = np.asarray(result.length_px, dtype=np.float64) * spacing_scale
+    finite_mask = mask & np.isfinite(lengths)
+    if auto_color_range:
+        vmin, vmax = _auto_color_limits(lengths[finite_mask], (0.0, 1.0))
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
+
+    fig, ax = plt.subplots(figsize=(7.3, 6.8), dpi=160)
+    if show_image:
+        ax.imshow(image_norm, cmap="gray")
+    else:
+        ax.set_facecolor("white")
+        ax.set_xlim(0, image_norm.shape[1])
+        ax.set_ylim(image_norm.shape[0], 0)
+    if show_atoms and len(coords) > 0:
+        ax.scatter(
+            coords[:, 1],
+            coords[:, 0],
+            s=8,
+            c="#e8e8e8" if show_image else "#333333",
+            edgecolors="none",
+            alpha=0.72,
+            label="atoms",
+        )
+    if np.any(finite_mask):
+        start = result.start_yx[finite_mask]
+        end = result.end_yx[finite_mask]
+        segments = [
+            [(float(sx), float(sy)), (float(ex), float(ey))]
+            for (sy, sx), (ey, ex) in zip(start, end, strict=False)
+        ]
+        line_collection = LineCollection(
+            segments,
+            cmap="turbo",
+            array=lengths[finite_mask],
+            linewidths=float(line_width),
+            alpha=0.96,
+        )
+        line_collection.set_clim(vmin, vmax)
+        ax.add_collection(line_collection)
+        cbar = fig.colorbar(line_collection, ax=ax, shrink=0.84)
+        cbar.set_label(f"spacing [{spacing_unit}]", rotation=90)
+    ax.set_title(f"Local atom-to-atom spacing segments ({direction_mode})")
+    ax.axis("off")
+    fig.tight_layout()
+    return fig
+
+
+def _render_plane_spacing_histogram(
+    result: AtomicPlaneSpacingResult,
+    *,
+    direction_mode: str,
+    spacing_scale: float,
+    spacing_unit: str,
+) -> plt.Figure:
+    mask = _plane_spacing_direction_mask(result, direction_mode)
+    lengths = np.asarray(result.length_px, dtype=np.float64) * spacing_scale
+    valid = mask & np.isfinite(lengths)
+    fig, ax = plt.subplots(figsize=(6.8, 3.8), dpi=160)
+    if np.any(valid):
+        for direction, color in [("a", "#1f77b4"), ("b", "#ff7f0e")]:
+            direction_mask = valid & (np.asarray(result.direction, dtype=object) == direction)
+            if np.any(direction_mask):
+                ax.hist(
+                    lengths[direction_mask],
+                    bins=32,
+                    alpha=0.58,
+                    color=color,
+                    edgecolor="white",
+                    label=f"{direction} direction",
+                )
+        ax.legend(frameon=False)
+    else:
+        ax.text(0.5, 0.5, "No valid spacing segments", ha="center", va="center")
+    ax.set_xlabel(f"spacing [{spacing_unit}]")
+    ax.set_ylabel("segment count")
+    ax.set_title("Local spacing histogram")
+    fig.tight_layout()
+    return fig
 
 
 def _render_atom_strain_maps(
@@ -843,10 +1225,21 @@ def _figure_png_bytes(fig: plt.Figure) -> bytes:
     return buffer.getvalue()
 
 
+def _invalidate_atomic_intensity_state() -> None:
+    st.session_state.atomic_intensity_result = None
+    st.session_state.atomic_intensity_meta = None
+
+
+def _invalidate_plane_spacing_state() -> None:
+    st.session_state.plane_spacing_result = None
+    st.session_state.plane_spacing_meta = None
+
+
 def _invalidate_atom_strain_state() -> None:
     st.session_state.atom_strain_fields = None
     st.session_state.atom_strain_meta = None
     _invalidate_custom_basis_state()
+    _invalidate_atomic_intensity_state()
 
 
 def _invalidate_custom_basis_state() -> None:
@@ -871,6 +1264,7 @@ def _disable_custom_basis_state() -> None:
 def _invalidate_atomic_displacement_state() -> None:
     st.session_state.atomic_displacement_result = None
     st.session_state.atomic_displacement_meta = None
+    _invalidate_plane_spacing_state()
 
 
 def _coords_inside_roi_mask(coords: np.ndarray, roi_mask: np.ndarray | None) -> np.ndarray | None:
@@ -1584,10 +1978,15 @@ for key, default in [
     ("custom_basis_last_picked_atom", None),
     ("atomic_displacement_result", None),
     ("atomic_displacement_meta", None),
+    ("atomic_displacement_method", DISPLACEMENT_METHOD_MANUAL_BASIS),
     ("atomic_displacement_tolerance", 0.40),
     ("atomic_displacement_manual_pairs", {}),
     ("atomic_displacement_manual_atom", None),
     ("atomic_displacement_manual_site", None),
+    ("plane_spacing_result", None),
+    ("plane_spacing_meta", None),
+    ("atomic_intensity_result", None),
+    ("atomic_intensity_meta", None),
     ("distance_pixel_size", 0.02),
     ("distance_unit", "nm"),
     ("pixel_size_auto_nm", None),
@@ -1840,8 +2239,21 @@ with st.sidebar:
     st.divider()
     st.subheader("Atomic Displacement")
     st.caption(
-        "Used by the separate ideal-lattice atomic-displacement module. "
-        "The custom a-b basis is still picked in the custom-basis strain section."
+        "Standalone ideal-lattice displacement module. "
+        "Methods 1 and 2 both use the custom a-b direction picker."
+    )
+    current_displacement_method = st.session_state.atomic_displacement_method
+    if current_displacement_method not in DISPLACEMENT_METHOD_OPTIONS:
+        current_displacement_method = DISPLACEMENT_METHOD_MANUAL_BASIS
+    atomic_displacement_method = st.selectbox(
+        "Displacement method",
+        DISPLACEMENT_METHOD_OPTIONS,
+        index=DISPLACEMENT_METHOD_OPTIONS.index(current_displacement_method),
+        key="atomic_displacement_method",
+        help=(
+            "Method 1 uses the custom base/a/b basis directly. "
+            "Method 2 uses your custom a/b direction, but fits origin/a/b from the current ROI."
+        ),
     )
     atomic_displacement_tolerance = st.slider(
         "Lattice index tolerance",
@@ -1884,6 +2296,188 @@ with st.sidebar:
         help="Large atom maps are downsampled only for arrow display speed.",
     )
 
+    st.divider()
+    st.subheader("Atomic Spacing Segments")
+    plane_spacing_direction = st.selectbox(
+        "Spacing segment direction",
+        ["a + b", "a only", "b only"],
+        index=0,
+        help="Connect adjacent atoms according to the current custom a/b lattice indices.",
+    )
+    plane_spacing_lattice_tolerance = st.slider(
+        "Spacing lattice index tolerance",
+        min_value=0.10,
+        max_value=0.80,
+        value=0.40,
+        step=0.01,
+        help=(
+            "Used only inside spacing quantification to decide whether an atom belongs "
+            "to the custom a/b lattice."
+        ),
+    )
+    plane_spacing_show_image = st.checkbox(
+        "Spacing map overlay original image",
+        value=True,
+    )
+    plane_spacing_show_atoms = st.checkbox(
+        "Show atom points on spacing map",
+        value=True,
+    )
+    plane_spacing_auto_color_range = st.checkbox(
+        "Spacing auto color range",
+        value=True,
+    )
+    plane_spacing_color_min = st.number_input(
+        "Spacing color min",
+        value=0.0,
+        step=0.1,
+        format="%.3f",
+        disabled=plane_spacing_auto_color_range,
+    )
+    plane_spacing_color_max = st.number_input(
+        "Spacing color max",
+        value=10.0,
+        step=0.1,
+        format="%.3f",
+        disabled=plane_spacing_auto_color_range,
+    )
+    plane_spacing_line_width = st.slider(
+        "Spacing line width",
+        min_value=0.5,
+        max_value=8.0,
+        value=2.2,
+        step=0.1,
+    )
+
+    st.divider()
+    st.subheader("Atomic Column Intensity")
+    intensity_method = st.selectbox(
+        "Intensity method",
+        ["Disk integration + annulus background"],
+        index=0,
+        help="Baseline quantitative intensity from C0/C1 atom coordinates.",
+    )
+    intensity_integration_radius = st.slider(
+        "Integration radius (px)",
+        min_value=0.5,
+        max_value=10.0,
+        value=2.5,
+        step=0.5,
+    )
+    intensity_background_inner_radius = st.slider(
+        "Background inner radius (px)",
+        min_value=1.0,
+        max_value=20.0,
+        value=4.0,
+        step=0.5,
+    )
+    intensity_background_outer_radius = st.slider(
+        "Background outer radius (px)",
+        min_value=2.0,
+        max_value=30.0,
+        value=7.0,
+        step=0.5,
+    )
+    intensity_background_statistic = st.selectbox(
+        "Background statistic",
+        ["median", "mean", "percentile_25", "percentile_10"],
+        index=0,
+        help="Median is usually robust against neighboring weak contrast and noise.",
+    )
+    intensity_normalization = st.selectbox(
+        "Normalize intensity",
+        ["median", "mean", "none"],
+        index=0,
+        help="Median normalization makes the map easier to compare across atom columns.",
+    )
+    intensity_overlay_metric = st.selectbox(
+        "Intensity map metric",
+        [
+            "normalized_intensity",
+            "background_subtracted_sum",
+            "peak_intensity",
+            "snr",
+        ],
+        index=0,
+    )
+    intensity_auto_color_range = st.checkbox(
+        "Intensity auto color range",
+        value=True,
+        help="If OFF, use manual min/max for the intensity overlay map.",
+    )
+    intensity_color_min = st.number_input(
+        "Intensity color min",
+        value=0.0,
+        step=0.1,
+        format="%.3f",
+        disabled=intensity_auto_color_range,
+    )
+    intensity_color_max = st.number_input(
+        "Intensity color max",
+        value=2.0,
+        step=0.1,
+        format="%.3f",
+        disabled=intensity_auto_color_range,
+    )
+    intensity_marker_size = st.slider(
+        "Intensity marker size",
+        min_value=8.0,
+        max_value=90.0,
+        value=30.0,
+        step=2.0,
+    )
+    intensity_grouping_enabled = st.checkbox(
+        "Enable intensity group analysis",
+        value=False,
+        help=(
+            "Optional. Group atom columns by intensity clusters or by current "
+            "user-defined a/b lattice sublattice."
+        ),
+    )
+    intensity_grouping_method = "Intensity clustering"
+    intensity_group_metric = "normalized_intensity"
+    intensity_cluster_count = 2
+    intensity_lattice_group_mode = "ij_parity"
+    if intensity_grouping_enabled:
+        intensity_grouping_method = st.selectbox(
+            "Intensity grouping method",
+            ["Intensity clustering", "Current a/b lattice sublattice"],
+            index=0,
+        )
+        intensity_group_metric = st.selectbox(
+            "Grouping metric",
+            [
+                "normalized_intensity",
+                "background_subtracted_sum",
+                "peak_intensity",
+                "snr",
+            ],
+            index=0,
+        )
+        if intensity_grouping_method == "Intensity clustering":
+            intensity_cluster_count = st.slider(
+                "Intensity cluster count",
+                min_value=2,
+                max_value=6,
+                value=2,
+                step=1,
+            )
+        else:
+            intensity_lattice_group_mode = st.selectbox(
+                "Sublattice grouping",
+                [
+                    "ij_parity",
+                    "sum_parity",
+                    "i_parity",
+                    "j_parity",
+                ],
+                index=0,
+                help=(
+                    "Uses lattice indices from the current atomic displacement result. "
+                    "The a/b direction is defined by your selected custom basis."
+                ),
+            )
+
 params = {
     "mode": mode,
     "gaussian_sigma": None if gaussian_sigma == 0 else float(gaussian_sigma),
@@ -1923,11 +2517,36 @@ params = {
     "atom_strain_overlay_min": float(atom_strain_overlay_min),
     "atom_strain_overlay_max": float(atom_strain_overlay_max),
     "atom_strain_overlay_marker_size": float(atom_strain_overlay_marker_size),
+    "atomic_displacement_method": str(atomic_displacement_method),
     "atomic_displacement_tolerance": float(atomic_displacement_tolerance),
     "atomic_displacement_vector_show_image": bool(atomic_displacement_vector_show_image),
     "atomic_displacement_arrow_scale": float(atomic_displacement_arrow_scale),
     "atomic_displacement_marker_size": float(atomic_displacement_marker_size),
     "atomic_displacement_max_arrows": int(atomic_displacement_max_arrows),
+    "plane_spacing_direction": str(plane_spacing_direction),
+    "plane_spacing_lattice_tolerance": float(plane_spacing_lattice_tolerance),
+    "plane_spacing_show_image": bool(plane_spacing_show_image),
+    "plane_spacing_show_atoms": bool(plane_spacing_show_atoms),
+    "plane_spacing_auto_color_range": bool(plane_spacing_auto_color_range),
+    "plane_spacing_color_min": float(plane_spacing_color_min),
+    "plane_spacing_color_max": float(plane_spacing_color_max),
+    "plane_spacing_line_width": float(plane_spacing_line_width),
+    "intensity_method": str(intensity_method),
+    "intensity_integration_radius": float(intensity_integration_radius),
+    "intensity_background_inner_radius": float(intensity_background_inner_radius),
+    "intensity_background_outer_radius": float(intensity_background_outer_radius),
+    "intensity_background_statistic": str(intensity_background_statistic),
+    "intensity_normalization": str(intensity_normalization),
+    "intensity_overlay_metric": str(intensity_overlay_metric),
+    "intensity_auto_color_range": bool(intensity_auto_color_range),
+    "intensity_color_min": float(intensity_color_min),
+    "intensity_color_max": float(intensity_color_max),
+    "intensity_marker_size": float(intensity_marker_size),
+    "intensity_grouping_enabled": bool(intensity_grouping_enabled),
+    "intensity_grouping_method": str(intensity_grouping_method),
+    "intensity_group_metric": str(intensity_group_metric),
+    "intensity_cluster_count": int(intensity_cluster_count),
+    "intensity_lattice_group_mode": str(intensity_lattice_group_mode),
 }
 
 sig = _signature(current_file_sig, params)
@@ -2254,6 +2873,10 @@ prospective_reference_atom_mask = None
 if params["atom_strain_use_roi_reference"]:
     prospective_reference_atom_mask = _coords_inside_roi_mask(coords, roi_mask)
 
+atomic_displacement_reference_atom_mask = None
+if params["atomic_displacement_method"] == DISPLACEMENT_METHOD_REFERENCE_ROI:
+    atomic_displacement_reference_atom_mask = _coords_inside_roi_mask(coords, roi_mask)
+
 left, right = st.columns([1.45, 1.0])
 with left:
     st.subheader("Overlay")
@@ -2423,6 +3046,12 @@ atom_strain_fields = st.session_state.atom_strain_fields
 atom_strain_meta = st.session_state.atom_strain_meta
 displacement_result: AtomicDisplacementResult | None = st.session_state.atomic_displacement_result
 displacement_meta = st.session_state.atomic_displacement_meta
+plane_spacing_result: AtomicPlaneSpacingResult | None = st.session_state.plane_spacing_result
+plane_spacing_meta = st.session_state.plane_spacing_meta
+atomic_intensity_result: AtomicColumnIntensityResult | None = (
+    st.session_state.atomic_intensity_result
+)
+atomic_intensity_meta = st.session_state.atomic_intensity_meta
 displacement_scale = params["pixel_size"] if params["use_physical_unit"] else 1.0
 displacement_unit = params["distance_unit"] if params["use_physical_unit"] else "px"
 strain_scale = 100.0 if params["atom_strain_display_unit"] == "%" else 1.0
@@ -2720,25 +3349,69 @@ if custom_basis is not None:
 
 st.subheader("Atomic Displacement")
 st.caption(
-    "Standalone module for atom displacement. Method 1 fits an ideal 2D lattice from the custom "
-    "a-b basis tool above and measures observed-vs-ideal atom displacement."
+    "Standalone module for atom displacement. Method 1 uses the custom base/a/b picks. "
+    "Method 2 still uses your custom a/b direction, but fits the ideal lattice from "
+    "a regular reference ROI."
 )
-st.write("Method:", "Ideal lattice from custom a-b basis")
+displacement_method = params["atomic_displacement_method"]
+displacement_uses_reference_roi = displacement_method == DISPLACEMENT_METHOD_REFERENCE_ROI
+displacement_method_slug = (
+    "ideal_lattice_from_reference_roi_with_custom_ab_direction"
+    if displacement_uses_reference_roi
+    else "ideal_lattice_from_manual_ab_basis"
+)
+if displacement_meta is not None and displacement_meta.get("method") != displacement_method_slug:
+    _invalidate_atomic_displacement_state()
+    displacement_result = None
+    displacement_meta = None
+reference_atom_mask_for_fit = (
+    atomic_displacement_reference_atom_mask if displacement_uses_reference_roi else None
+)
+reference_atom_count = (
+    int(np.sum(reference_atom_mask_for_fit))
+    if reference_atom_mask_for_fit is not None
+    else 0
+)
+displacement_ready = custom_basis_ready and (
+    not displacement_uses_reference_roi or reference_atom_count >= 3
+)
+st.write("Method:", displacement_method)
 disp_button_col, disp_info_col = st.columns([0.34, 0.66])
 run_atomic_displacement = disp_button_col.button(
     "Run Atomic Displacement",
     type="primary",
     use_container_width=False,
-    disabled=not custom_basis_ready,
+    disabled=not displacement_ready,
 )
 manual_displacement_pairs = {
     int(atom_idx): (int(pair[0]), int(pair[1]))
     for atom_idx, pair in dict(st.session_state.atomic_displacement_manual_pairs).items()
 }
-if custom_basis_ready:
+if custom_basis_ready and displacement_uses_reference_roi:
     disp_info_col.caption(
-        "Reference source: "
-        f"{params['atom_strain_reference_mode']} | "
+        "Reference source: current ROI fit | "
+        f"ROI atoms={reference_atom_count} | "
+        f"lattice index tolerance={params['atomic_displacement_tolerance']:.2f} | "
+        f"manual pairs={len(manual_displacement_pairs)}"
+    )
+    if roi_mask is None:
+        st.info(
+            "Method 2 needs a reference ROI. Enable canvas editing / ROI drawing above, "
+            "draw a regular lattice region, then run displacement."
+        )
+    elif reference_atom_count < 3:
+        st.warning(
+            "Method 2 needs at least 3 atoms inside the current ROI. "
+            "Select a larger regular lattice area before running displacement."
+        )
+    else:
+        st.success(
+            "Method 2 will fit origin, a_vec, and b_vec from the current ROI while "
+            "using your custom a/b direction for lattice indexing."
+        )
+elif custom_basis_ready:
+    disp_info_col.caption(
+        "Reference source: all valid atoms from the custom base/a/b lattice | "
         f"lattice index tolerance={params['atomic_displacement_tolerance']:.2f} | "
         f"manual pairs={len(manual_displacement_pairs)}"
     )
@@ -2751,14 +3424,7 @@ else:
         "Enable the custom a-b basis tool first. This method will then call that basis directly."
     )
 
-if run_atomic_displacement and custom_basis_ready and custom_basis is not None:
-    reference_atom_mask_for_fit = (
-        prospective_reference_atom_mask
-        if params["atom_strain_use_roi_reference"]
-        and prospective_reference_atom_mask is not None
-        and np.any(prospective_reference_atom_mask)
-        else None
-    )
+if run_atomic_displacement and displacement_ready and custom_basis is not None:
     try:
         displacement_result = compute_atomic_displacement_from_basis(
             coords,
@@ -2768,6 +3434,7 @@ if run_atomic_displacement and custom_basis_ready and custom_basis is not None:
             reference_mask=reference_atom_mask_for_fit,
             lattice_index_tolerance=float(params["atomic_displacement_tolerance"]),
             manual_lattice_indices=manual_displacement_pairs or None,
+            allow_reference_fallback=not displacement_uses_reference_roi,
         )
     except Exception as exc:
         _invalidate_atomic_displacement_state()
@@ -2783,10 +3450,16 @@ if run_atomic_displacement and custom_basis_ready and custom_basis is not None:
                 "a_idx": int(custom_basis["a_idx"]),
                 "b_idx": int(custom_basis["b_idx"]),
             },
-            "reference_source": params["atom_strain_reference_mode"],
-            "method": "ideal_lattice_from_custom_ab_basis",
+            "reference_source": (
+                "Current ROI mask"
+                if displacement_uses_reference_roi
+                else "All valid assigned atoms"
+            ),
+            "reference_roi_atom_count": reference_atom_count,
+            "method": displacement_method_slug,
             "manual_lattice_pair_count": len(manual_displacement_pairs),
         }
+        _invalidate_plane_spacing_state()
         displacement_meta = st.session_state.atomic_displacement_meta
         st.success("Atomic displacement finished.")
 
@@ -2930,7 +3603,9 @@ if displacement_result is not None:
                 rerun_manual = pair_col3.button(
                     "Re-run with manual pairs",
                     type="primary",
-                    disabled=len(manual_pairs) == 0 or custom_basis is None,
+                    disabled=len(manual_pairs) == 0
+                    or custom_basis is None
+                    or (displacement_uses_reference_roi and reference_atom_count < 3),
                 )
                 if add_pair and selected_atom is not None and selected_site is not None:
                     manual_pairs[int(selected_atom)] = (
@@ -2958,13 +3633,6 @@ if displacement_result is not None:
                     )
                     st.dataframe(pair_preview, use_container_width=True)
                 if rerun_manual and custom_basis is not None:
-                    reference_atom_mask_for_fit = (
-                        prospective_reference_atom_mask
-                        if params["atom_strain_use_roi_reference"]
-                        and prospective_reference_atom_mask is not None
-                        and np.any(prospective_reference_atom_mask)
-                        else None
-                    )
                     try:
                         corrected = compute_atomic_displacement_from_basis(
                             coords,
@@ -2976,6 +3644,7 @@ if displacement_result is not None:
                                 params["atomic_displacement_tolerance"]
                             ),
                             manual_lattice_indices=manual_pairs,
+                            allow_reference_fallback=not displacement_uses_reference_roi,
                         )
                     except Exception as exc:
                         st.error(f"Manual displacement correction failed: {exc}")
@@ -2990,10 +3659,16 @@ if displacement_result is not None:
                                 "a_idx": int(custom_basis["a_idx"]),
                                 "b_idx": int(custom_basis["b_idx"]),
                             },
-                            "reference_source": params["atom_strain_reference_mode"],
-                            "method": "ideal_lattice_from_custom_ab_basis",
+                            "reference_source": (
+                                "Current ROI mask"
+                                if displacement_uses_reference_roi
+                                else "All valid assigned atoms"
+                            ),
+                            "reference_roi_atom_count": reference_atom_count,
+                            "method": displacement_method_slug,
                             "manual_lattice_pair_count": len(manual_pairs),
                         }
+                        _invalidate_plane_spacing_state()
                         st.success("Manual displacement correction finished.")
                         st.rerun()
         with qa_right:
@@ -3137,16 +3812,502 @@ if displacement_result is not None:
         file_name=f"{Path(uploaded.name).stem}_atomic_displacement.csv",
         mime="text/csv",
     )
-elif custom_basis_ready:
+elif displacement_ready:
     st.info(
-        "Custom basis is ready. Click `Run Atomic Displacement` to fit the ideal lattice "
-        "and compute atom displacements."
+        "Atomic displacement inputs are ready. Click `Run Atomic Displacement` to fit "
+        "the ideal lattice and compute atom displacements."
+    )
+elif custom_basis_ready and displacement_uses_reference_roi:
+    st.info(
+        "Custom a/b direction is ready. For method 2, draw a reference ROI with at least "
+        "3 regular atoms before running displacement."
     )
 else:
     st.info(
         "Atomic displacement is fully standalone now. "
-        "First define the custom a-b basis tool above, "
+        "Choose a displacement method, define the custom a-b direction above, "
         "then run this module directly."
+    )
+
+st.subheader("Atomic Spacing Segments")
+st.caption(
+    "Connect adjacent atoms along the current custom a/b lattice. Line color represents "
+    "local atom-to-atom spacing, with manual color range controls in the sidebar."
+)
+spacing_ready = custom_basis_ready and custom_basis is not None
+current_spacing_settings = {
+    "source": "custom_ab_basis_direct_indexing",
+    "atom_count": int(len(coords)),
+    "basis_indices": {
+        "base_idx": int(custom_basis["base_idx"]) if custom_basis is not None else None,
+        "a_idx": int(custom_basis["a_idx"]) if custom_basis is not None else None,
+        "b_idx": int(custom_basis["b_idx"]) if custom_basis is not None else None,
+    },
+    "lattice_index_tolerance": params["plane_spacing_lattice_tolerance"],
+}
+if (
+    plane_spacing_meta is not None
+    and plane_spacing_meta.get("settings") != current_spacing_settings
+):
+    _invalidate_plane_spacing_state()
+    plane_spacing_result = None
+    plane_spacing_meta = None
+
+spacing_button_col, spacing_info_col = st.columns([0.34, 0.66])
+run_plane_spacing = spacing_button_col.button(
+    "Run Atomic Spacing Segments",
+    type="primary",
+    use_container_width=False,
+    disabled=not spacing_ready,
+)
+if spacing_ready:
+    spacing_info_col.caption(
+        "Source: current custom base/a/b direction | "
+        f"index tolerance={params['plane_spacing_lattice_tolerance']:.2f} | "
+        f"display={params['plane_spacing_direction']} | "
+        f"unit={displacement_unit}"
+    )
+else:
+    spacing_info_col.caption(
+        "Define the custom base/a/b basis first. This module directly measures atom-to-atom "
+        "distances and does not require running atomic displacement."
+    )
+
+if run_plane_spacing and spacing_ready and custom_basis is not None:
+    try:
+        measured_spacing = compute_atomic_plane_spacing_segments_from_basis(
+            coords,
+            base_index=int(custom_basis["base_idx"]),
+            a_index=int(custom_basis["a_idx"]),
+            b_index=int(custom_basis["b_idx"]),
+            lattice_index_tolerance=params["plane_spacing_lattice_tolerance"],
+            directions=("a", "b"),
+        )
+    except Exception as exc:
+        _invalidate_plane_spacing_state()
+        st.error(f"Atomic spacing segment quantification failed: {exc}")
+        plane_spacing_result = None
+        plane_spacing_meta = None
+    else:
+        st.session_state.plane_spacing_result = measured_spacing
+        st.session_state.plane_spacing_meta = {
+            "settings": current_spacing_settings,
+            "method": "direct_short_segments_from_custom_ab_basis",
+            "segment_count": int(len(measured_spacing.length_px)),
+        }
+        plane_spacing_result = measured_spacing
+        plane_spacing_meta = st.session_state.plane_spacing_meta
+        st.success("Atomic spacing segments finished.")
+
+if plane_spacing_meta is not None:
+    st.write("Atomic spacing settings:", plane_spacing_meta)
+
+if plane_spacing_result is not None:
+    spacing_map_tab, spacing_hist_tab, spacing_table_tab = st.tabs(
+        ["Spacing map", "Histogram", "Summary / Table"]
+    )
+    with spacing_map_tab:
+        spacing_fig = _render_plane_spacing_segments(
+            norm,
+            coords,
+            plane_spacing_result,
+            direction_mode=params["plane_spacing_direction"],
+            spacing_scale=displacement_scale,
+            spacing_unit=displacement_unit,
+            show_image=params["plane_spacing_show_image"],
+            show_atoms=params["plane_spacing_show_atoms"],
+            auto_color_range=params["plane_spacing_auto_color_range"],
+            vmin=params["plane_spacing_color_min"],
+            vmax=params["plane_spacing_color_max"],
+            line_width=params["plane_spacing_line_width"],
+        )
+        st.pyplot(spacing_fig)
+        spacing_png = _figure_png_bytes(spacing_fig)
+        st.download_button(
+            label="Download atomic spacing segment map PNG",
+            data=spacing_png,
+            file_name=f"{Path(uploaded.name).stem}_atomic_spacing_segments.png",
+            mime="image/png",
+        )
+        plt.close(spacing_fig)
+    with spacing_hist_tab:
+        spacing_hist_fig = _render_plane_spacing_histogram(
+            plane_spacing_result,
+            direction_mode=params["plane_spacing_direction"],
+            spacing_scale=displacement_scale,
+            spacing_unit=displacement_unit,
+        )
+        st.pyplot(spacing_hist_fig)
+        spacing_hist_png = _figure_png_bytes(spacing_hist_fig)
+        st.download_button(
+            label="Download atomic spacing histogram PNG",
+            data=spacing_hist_png,
+            file_name=f"{Path(uploaded.name).stem}_atomic_spacing_histogram.png",
+            mime="image/png",
+        )
+        plt.close(spacing_hist_fig)
+    with spacing_table_tab:
+        direction_mask = _plane_spacing_direction_mask(
+            plane_spacing_result,
+            params["plane_spacing_direction"],
+        )
+        spacing_lengths = (
+            np.asarray(plane_spacing_result.length_px, dtype=np.float64) * displacement_scale
+        )
+        summary_rows = []
+        for direction in ("a", "b"):
+            mask = (
+                direction_mask
+                & (np.asarray(plane_spacing_result.direction, dtype=object) == direction)
+                & np.isfinite(spacing_lengths)
+            )
+            values = spacing_lengths[mask]
+            if values.size:
+                summary_rows.append(
+                    {
+                        "direction": direction,
+                        "count": int(values.size),
+                        "mean": float(np.mean(values)),
+                        "std": float(np.std(values)),
+                        "median": float(np.median(values)),
+                        "min": float(np.min(values)),
+                        "max": float(np.max(values)),
+                    }
+                )
+        st.write(
+            "Atomic spacing summary:",
+            {
+                "confidence": round(float(plane_spacing_result.confidence), 3),
+                "display_direction": params["plane_spacing_direction"],
+                "unit": displacement_unit,
+                "segment_count": int(np.sum(direction_mask)),
+            },
+        )
+        if summary_rows:
+            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
+        st.info(
+            "These short-line values are local atom-to-atom distances along custom a/b. "
+            "They are different from perpendicular crystallographic plane spacing."
+        )
+        if plane_spacing_result.warnings:
+            summary = _warning_summary_lines(plane_spacing_result.warnings)
+            st.warning("\n".join(summary))
+            with st.expander("Show full atomic-spacing warnings"):
+                st.code("\n".join(plane_spacing_result.warnings), language="text")
+        spacing_preview_count = min(len(plane_spacing_result.length_px), 500)
+        if spacing_preview_count > 0:
+            spacing_preview = {
+                "direction": plane_spacing_result.direction[:spacing_preview_count],
+                "source_atom": plane_spacing_result.source_atom_index[:spacing_preview_count],
+                "target_atom": plane_spacing_result.target_atom_index[:spacing_preview_count],
+                "source_i": plane_spacing_result.source_lattice_ij[:spacing_preview_count, 0],
+                "source_j": plane_spacing_result.source_lattice_ij[:spacing_preview_count, 1],
+                "target_i": plane_spacing_result.target_lattice_ij[:spacing_preview_count, 0],
+                "target_j": plane_spacing_result.target_lattice_ij[:spacing_preview_count, 1],
+                f"length [{displacement_unit}]": (
+                    plane_spacing_result.length_px[:spacing_preview_count] * displacement_scale
+                ),
+            }
+            st.dataframe(spacing_preview, use_container_width=True)
+        spacing_csv_text = _plane_spacing_csv(
+            plane_spacing_result,
+            spacing_scale=displacement_scale,
+            spacing_unit=displacement_unit,
+        )
+        st.download_button(
+            label="Download atomic spacing segments CSV",
+            data=spacing_csv_text.encode("utf-8"),
+            file_name=f"{Path(uploaded.name).stem}_atomic_spacing_segments.csv",
+            mime="text/csv",
+        )
+else:
+    st.info(
+        "Click `Run Atomic Spacing Segments` after selecting custom base/a/b to draw "
+        "short a/b neighbor lines colored by local spacing."
+    )
+
+st.subheader("Atomic Column Intensity Quantification")
+st.caption(
+    "Standalone intensity module from current atom coordinates. First version uses "
+    "disk integration plus local annulus background subtraction; output is relative "
+    "atomic-column intensity, not absolute Z unless HAADF calibration is available."
+)
+current_intensity_settings = {
+    "method": params["intensity_method"],
+    "integration_radius": params["intensity_integration_radius"],
+    "background_inner_radius": params["intensity_background_inner_radius"],
+    "background_outer_radius": params["intensity_background_outer_radius"],
+    "background_statistic": params["intensity_background_statistic"],
+    "normalization": params["intensity_normalization"],
+}
+if (
+    atomic_intensity_meta is not None
+    and atomic_intensity_meta.get("settings") != current_intensity_settings
+):
+    _invalidate_atomic_intensity_state()
+    atomic_intensity_result = None
+    atomic_intensity_meta = None
+
+intensity_ready = (
+    len(coords) > 0
+    and params["intensity_integration_radius"] > 0
+    and params["intensity_background_inner_radius"]
+    > params["intensity_integration_radius"]
+    and params["intensity_background_outer_radius"]
+    > params["intensity_background_inner_radius"]
+)
+intensity_button_col, intensity_info_col = st.columns([0.34, 0.66])
+run_atomic_intensity = intensity_button_col.button(
+    "Run Atomic Column Intensity",
+    type="primary",
+    use_container_width=False,
+    disabled=not intensity_ready,
+)
+intensity_info_col.caption(
+    f"method={params['intensity_method']} | "
+    f"r={params['intensity_integration_radius']:.1f}px | "
+    f"bg={params['intensity_background_inner_radius']:.1f}-"
+    f"{params['intensity_background_outer_radius']:.1f}px | "
+    f"background={params['intensity_background_statistic']} | "
+    f"normalize={params['intensity_normalization']}"
+)
+if len(coords) == 0:
+    st.warning("Need atom coordinates before running intensity quantification.")
+elif not intensity_ready:
+    st.warning(
+        "Intensity radii are invalid. Use: integration radius < background inner "
+        "radius < background outer radius."
+    )
+
+if run_atomic_intensity and intensity_ready:
+    with st.spinner("Running atomic-column intensity quantification..."):
+        try:
+            measured_intensity = quantify_atomic_column_intensity(
+                raw,
+                coords,
+                integration_radius=params["intensity_integration_radius"],
+                background_inner_radius=params["intensity_background_inner_radius"],
+                background_outer_radius=params["intensity_background_outer_radius"],
+                background_statistic=params["intensity_background_statistic"],
+                normalization=params["intensity_normalization"],
+            )
+        except Exception as exc:
+            _invalidate_atomic_intensity_state()
+            st.error(f"Atomic-column intensity quantification failed: {exc}")
+            atomic_intensity_result = None
+            atomic_intensity_meta = None
+        else:
+            st.session_state.atomic_intensity_result = measured_intensity
+            st.session_state.atomic_intensity_meta = {
+                "settings": current_intensity_settings,
+                "method": "disk_integration_with_local_annulus_background",
+                "atom_count": int(len(coords)),
+            }
+            atomic_intensity_result = measured_intensity
+            atomic_intensity_meta = st.session_state.atomic_intensity_meta
+            st.success("Atomic-column intensity quantification finished.")
+
+if atomic_intensity_meta is not None:
+    st.write("Atomic intensity settings:", atomic_intensity_meta)
+
+if atomic_intensity_result is not None:
+    intensity_map_tab, intensity_hist_tab, intensity_table_tab = st.tabs(
+        ["Intensity map", "Histogram", "Summary / Table"]
+    )
+    with intensity_map_tab:
+        intensity_fig = _render_atomic_intensity_overlay(
+            norm,
+            coords,
+            atomic_intensity_result,
+            metric=params["intensity_overlay_metric"],
+            auto_color_range=params["intensity_auto_color_range"],
+            vmin=params["intensity_color_min"],
+            vmax=params["intensity_color_max"],
+            marker_size=params["intensity_marker_size"],
+        )
+        st.pyplot(intensity_fig)
+        intensity_png = _figure_png_bytes(intensity_fig)
+        st.download_button(
+            label="Download atomic-column intensity map PNG",
+            data=intensity_png,
+            file_name=f"{Path(uploaded.name).stem}_atomic_column_intensity_map.png",
+            mime="image/png",
+        )
+        plt.close(intensity_fig)
+    with intensity_hist_tab:
+        hist_fig = _render_atomic_intensity_histogram(
+            atomic_intensity_result,
+            metric=params["intensity_overlay_metric"],
+        )
+        st.pyplot(hist_fig)
+        hist_png = _figure_png_bytes(hist_fig)
+        st.download_button(
+            label="Download atomic-column intensity histogram PNG",
+            data=hist_png,
+            file_name=f"{Path(uploaded.name).stem}_atomic_column_intensity_histogram.png",
+            mime="image/png",
+        )
+        plt.close(hist_fig)
+    with intensity_table_tab:
+        intensity_values, intensity_label = _atomic_intensity_metric(
+            atomic_intensity_result,
+            params["intensity_overlay_metric"],
+        )
+        valid_intensity = (
+            np.asarray(atomic_intensity_result.valid_atom_mask, dtype=bool)
+            & np.isfinite(intensity_values)
+        )
+        finite_values = intensity_values[valid_intensity]
+        fit_stats = atomic_intensity_result.provenance.get("fit_statistics", {})
+        st.write(
+            "Atomic-column intensity summary:",
+            {
+                "confidence": round(float(atomic_intensity_result.confidence), 3),
+                "metric": intensity_label,
+                "valid_atom_count": int(np.sum(valid_intensity)),
+                "valid_ratio": fit_stats.get("valid_ratio"),
+                "median": float(np.median(finite_values)) if finite_values.size else None,
+                "mean": float(np.mean(finite_values)) if finite_values.size else None,
+                "min": float(np.min(finite_values)) if finite_values.size else None,
+                "max": float(np.max(finite_values)) if finite_values.size else None,
+                "edge_count": fit_stats.get("edge_count"),
+                "overlap_count": fit_stats.get("overlap_count"),
+                "median_snr": fit_stats.get("median_snr"),
+            },
+        )
+        st.info(
+            "Interpretation note: these are relative atomic-column intensities. "
+            "For HAADF-STEM they can support Z-contrast analysis, but thickness, "
+            "tilt, detector angle, drift, and calibration still matter."
+        )
+        if atomic_intensity_result.warnings:
+            summary = _warning_summary_lines(atomic_intensity_result.warnings)
+            st.warning("\n".join(summary))
+            with st.expander("Show full atomic-intensity warnings"):
+                st.code("\n".join(atomic_intensity_result.warnings), language="text")
+        else:
+            st.success("No atomic-intensity warnings.")
+
+        intensity_preview_count = min(len(coords), 500)
+        if intensity_preview_count > 0:
+            intensity_preview = {
+                "y": coords[:intensity_preview_count, 0],
+                "x": coords[:intensity_preview_count, 1],
+                "peak_intensity": atomic_intensity_result.peak_intensity[
+                    :intensity_preview_count
+                ],
+                "background_subtracted_sum": (
+                    atomic_intensity_result.background_subtracted_sum[
+                        :intensity_preview_count
+                    ]
+                ),
+                "normalized_intensity": atomic_intensity_result.normalized_intensity[
+                    :intensity_preview_count
+                ],
+                "snr": atomic_intensity_result.snr[:intensity_preview_count],
+                "valid_intensity": atomic_intensity_result.valid_atom_mask[
+                    :intensity_preview_count
+                ].astype(np.int32),
+                "edge_flag": atomic_intensity_result.edge_flag[
+                    :intensity_preview_count
+                ].astype(np.int32),
+                "overlap_flag": atomic_intensity_result.overlap_flag[
+                    :intensity_preview_count
+                ].astype(np.int32),
+            }
+            st.dataframe(intensity_preview, use_container_width=True)
+        atomic_intensity_csv_text = _atomic_intensity_csv(
+            coords,
+            atomic_intensity_result,
+        )
+        st.download_button(
+            label="Download atomic-column intensity CSV",
+            data=atomic_intensity_csv_text.encode("utf-8"),
+            file_name=f"{Path(uploaded.name).stem}_atomic_column_intensity.csv",
+            mime="text/csv",
+        )
+
+    if params["intensity_grouping_enabled"]:
+        st.subheader("Optional Intensity Group Analysis")
+        st.caption(
+            "This optional section is OFF by default. It summarizes intensity by "
+            "automatic intensity clusters or by the current user-defined a/b sublattice."
+        )
+        group_result: AtomicIntensityGroupResult | None = None
+        try:
+            if params["intensity_grouping_method"] == "Intensity clustering":
+                group_result = cluster_atomic_column_intensities(
+                    atomic_intensity_result,
+                    metric=params["intensity_group_metric"],
+                    n_groups=params["intensity_cluster_count"],
+                )
+            elif displacement_result is None:
+                st.warning(
+                    "Current a/b lattice sublattice grouping needs an atomic displacement "
+                    "result first, because it uses the fitted lattice indices."
+                )
+            elif len(displacement_result.lattice_indices_ij) != len(coords):
+                st.warning(
+                    "The current atomic displacement result does not match the current "
+                    "atom-coordinate table. Re-run atomic displacement first."
+                )
+            else:
+                group_result = group_atomic_column_intensities_by_lattice(
+                    atomic_intensity_result,
+                    displacement_result.lattice_indices_ij,
+                    metric=params["intensity_group_metric"],
+                    mode=params["intensity_lattice_group_mode"],
+                    valid_lattice_mask=displacement_result.valid_atom_mask,
+                )
+        except Exception as exc:
+            st.error(f"Intensity group analysis failed: {exc}")
+
+        if group_result is not None:
+            group_summary = pd.DataFrame(group_result.summaries)
+            if group_summary.empty:
+                st.warning("No non-empty intensity groups were found.")
+            else:
+                st.write(
+                    "Group settings:",
+                    {
+                        "method": group_result.provenance.get("method"),
+                        "metric": group_result.metric,
+                        "confidence": round(float(group_result.confidence), 3),
+                    },
+                )
+                st.dataframe(group_summary, use_container_width=True)
+                group_hist_fig = _render_atomic_intensity_group_histogram(
+                    atomic_intensity_result,
+                    group_result,
+                    metric=params["intensity_group_metric"],
+                )
+                st.pyplot(group_hist_fig)
+                group_hist_png = _figure_png_bytes(group_hist_fig)
+                st.download_button(
+                    label="Download grouped intensity histogram PNG",
+                    data=group_hist_png,
+                    file_name=(
+                        f"{Path(uploaded.name).stem}_atomic_column_intensity_groups.png"
+                    ),
+                    mime="image/png",
+                )
+                plt.close(group_hist_fig)
+                group_csv = _atomic_intensity_group_csv(group_result)
+                st.download_button(
+                    label="Download grouped intensity statistics CSV",
+                    data=group_csv.encode("utf-8"),
+                    file_name=(
+                        f"{Path(uploaded.name).stem}_atomic_column_intensity_groups.csv"
+                    ),
+                    mime="text/csv",
+                )
+            if group_result.warnings:
+                summary = _warning_summary_lines(group_result.warnings)
+                st.warning("\n".join(summary))
+else:
+    st.info(
+        "Click `Run Atomic Column Intensity` to quantify peak, integrated, "
+        "background-subtracted, normalized intensity, and local SNR for each atom column."
     )
 
 if atom_strain_fields is not None:

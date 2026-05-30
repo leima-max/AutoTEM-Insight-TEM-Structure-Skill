@@ -59,6 +59,28 @@ def test_atomic_displacement_recovers_shifted_atom_with_reference_mask() -> None
     assert np.mean(out.displacement_magnitude[reference_mask]) < 0.05
 
 
+def test_atomic_displacement_can_force_reference_roi_fit() -> None:
+    coords = _rect_lattice()
+    reference_mask = np.zeros(len(coords), dtype=bool)
+    reference_mask[:12] = True
+    distorted = coords.copy()
+    distorted[~reference_mask] += np.array([0.45, -0.30], dtype=np.float64)
+
+    out = compute_atomic_displacement_from_basis(
+        distorted,
+        base_index=0,
+        a_index=1,
+        b_index=6,
+        reference_mask=reference_mask,
+        allow_reference_fallback=False,
+    )
+
+    assert out.provenance["parameters"]["allow_reference_fallback"] is False
+    assert out.provenance["fit_statistics"]["fit_atom_count"] == int(np.sum(reference_mask))
+    assert np.max(out.displacement_magnitude[reference_mask]) < 1e-6
+    assert np.mean(out.displacement_magnitude[~reference_mask]) > 0.4
+
+
 def test_atomic_displacement_rejects_collinear_basis() -> None:
     coords = _rect_lattice()
     with pytest.raises(ValueError, match="collinear"):
@@ -67,6 +89,22 @@ def test_atomic_displacement_rejects_collinear_basis() -> None:
             base_index=0,
             a_index=1,
             b_index=2,
+        )
+
+
+def test_atomic_displacement_rejects_unstable_reference_without_fallback() -> None:
+    coords = _rect_lattice()
+    reference_mask = np.zeros(len(coords), dtype=bool)
+    reference_mask[[0, 1, 2]] = True
+
+    with pytest.raises(ValueError, match="Reference ROI atoms are insufficient"):
+        compute_atomic_displacement_from_basis(
+            coords,
+            base_index=0,
+            a_index=1,
+            b_index=6,
+            reference_mask=reference_mask,
+            allow_reference_fallback=False,
         )
 
 
