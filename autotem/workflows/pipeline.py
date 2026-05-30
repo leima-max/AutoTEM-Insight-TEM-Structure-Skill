@@ -137,6 +137,7 @@ _STEP_TO_PARAM_KEYS: dict[str, tuple[str, ...]] = {
     "diffraction_peaks": ("diffraction", "fft", "analyze"),
     "index_diffraction": ("diffraction", "analyze"),
     "phase_match": ("diffraction", "analyze"),
+    "simulate": ("simulation", "simulate"),
     "validate": ("validation", "validate"),
     "benchmark": ("benchmark",),
 }
@@ -558,16 +559,20 @@ class _RunLogger:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._entries: list[RunLogEntry] = []
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("", encoding="utf-8")
 
     def log(self, level: str, message: str, context: dict[str, Any] | None = None) -> None:
-        self._entries.append(
-            RunLogEntry(
-                timestamp_utc=datetime.now(timezone.utc).isoformat(),
-                level=level,  # type: ignore[arg-type]
-                message=message,
-                context=context or {},
-            )
+        entry = RunLogEntry(
+            timestamp_utc=datetime.now(timezone.utc).isoformat(),
+            level=level,  # type: ignore[arg-type]
+            message=message,
+            context=context or {},
         )
+        self._entries.append(entry)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{entry.model_dump_json()}\n")
+            handle.flush()
 
     def info(self, message: str, context: dict[str, Any] | None = None) -> None:
         self.log("INFO", message, context=context)
@@ -649,8 +654,13 @@ class TEMAnalysisSkill:
         # Indexing is currently bundled in `run_diffraction_analysis` for A2 baseline.
         return diffraction
 
-    def simulate_from_diffraction(self, diffraction: DiffractionResult) -> SimulationResult:
-        return simulate_from_diffraction(diffraction)
+    def simulate_from_diffraction(
+        self,
+        diffraction: DiffractionResult,
+        *,
+        parameters: dict[str, Any] | None = None,
+    ) -> SimulationResult:
+        return simulate_from_diffraction(diffraction, parameters=parameters)
 
     def run(
         self,
@@ -825,7 +835,15 @@ class TEMAnalysisSkill:
                             "Diffraction result is required before simulation."
                         )
                     else:
-                        simulation = self.simulate_from_diffraction(diffraction)
+                        stage_parameters = _extract_stage_parameters(
+                            workflow_parameters,
+                            _STEP_TO_PARAM_KEYS.get("simulate", ("simulation",)),
+                        )
+                        step_record.parameters = stage_parameters
+                        simulation = self.simulate_from_diffraction(
+                            diffraction,
+                            parameters=stage_parameters,
+                        )
                         step_record.status = "warning" if simulation.warnings else "done"
                         step_record.warnings.extend(simulation.warnings)
                 elif step_record.name == "validate":

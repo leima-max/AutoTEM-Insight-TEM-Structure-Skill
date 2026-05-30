@@ -7,6 +7,7 @@ import pytest
 
 from autotem import TEMAnalysisSkill, __version__
 from autotem.cli import main as cli_main
+from autotem.workflows.pipeline import _RunLogger
 
 
 @pytest.mark.smoke
@@ -88,3 +89,21 @@ def test_smoke_cli_analyze_with_minimal_workflow(
     assert exit_code == 0
     assert "A2 baseline workflow completed." in captured.out
     assert (output_dir / "analysis_report.json").exists()
+
+
+def test_run_logger_writes_entries_immediately(tmp_path: Path) -> None:
+    log_path = tmp_path / "run.log"
+    logger = _RunLogger(log_path)
+
+    logger.info("before long-running step")
+
+    text = log_path.read_text(encoding="utf-8")
+    assert "before long-running step" in text
+    assert len(text.strip().splitlines()) == 1
+
+    logger.warning("step warning", context={"stage": "simulate"})
+    logger.flush()
+
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    assert "step warning" in lines[1]

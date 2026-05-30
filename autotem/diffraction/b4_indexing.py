@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import shlex
+from dataclasses import dataclass, field
 from math import gcd
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 import numpy as np
 
 from autotem.core import DiffractionPeak, GVector, IndexedSpot, Measurement, PhaseCandidate
+from autotem.simulation.pymatgen_adapter import load_candidate_phase_from_cif
 
 
 @dataclass(slots=True)
@@ -25,6 +27,9 @@ class _LatticePhase:
     source: str = "candidate_phase_params"
     identifier: str | None = None
     formula: str | None = None
+    space_group_number: int | None = None
+    atom_sites: list[dict[str, Any]] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -104,6 +109,71 @@ def _canonical_zone_axis(raw_vec: tuple[int, int, int]) -> tuple[int, int, int] 
     return (u, v, w)
 
 
+def _normalize_label(value: str | None) -> str:
+    if value is None:
+        return ""
+    return "".join(ch.lower() for ch in str(value) if ch.isalnum())
+
+
+def _phase_allowed(phase: _LatticePhase, allowed_names: set[str] | None) -> bool:
+    if allowed_names is None:
+        return True
+    allowed = {_normalize_label(item) for item in allowed_names if _normalize_label(item)}
+    if not allowed:
+        return True
+    labels = {
+        _normalize_label(phase.name),
+        _normalize_label(phase.formula),
+        _normalize_label(phase.identifier),
+    }
+    labels = {label for label in labels if label}
+    if labels.intersection(allowed):
+        return True
+    for allowed_label in allowed:
+        for label in labels:
+            if allowed_label in label or label in allowed_label:
+                return True
+    return False
+
+
+def _as_optional_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_atom_sites(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    sites: list[dict[str, Any]] = []
+    for idx, row in enumerate(value):
+        if not isinstance(row, dict):
+            continue
+        element = row.get("element") or row.get("type_symbol") or row.get("species")
+        if not isinstance(element, str) or not element.strip():
+            continue
+        coords = row.get("abc") or row.get("frac_coords") or row.get("fractional")
+        if not isinstance(coords, (list, tuple)) or len(coords) < 3:
+            continue
+        try:
+            abc = [float(coords[0]), float(coords[1]), float(coords[2])]
+            occupancy = float(row.get("occupancy", 1.0))
+        except (TypeError, ValueError):
+            continue
+        sites.append(
+            {
+                "element": element.strip(),
+                "abc": abc,
+                "occupancy": occupancy,
+                "source_index": int(row.get("source_index", idx)),
+            }
+        )
+    return sites
+
+
 def _parse_candidate_phase_params(
     raw_candidates: Any,
     *,
@@ -125,8 +195,6 @@ def _parse_candidate_phase_params(
             warnings.append(f"candidate_phase_params[{idx}] is not a mapping; skipped.")
             continue
         name = str(item.get("name", f"phase_{idx}")).strip() or f"phase_{idx}"
-        if allowed_names is not None and name not in allowed_names:
-            continue
         try:
             phase = _LatticePhase(
                 name=name,
@@ -142,15 +210,136 @@ def _parse_candidate_phase_params(
                     None if item.get("identifier") is None else str(item.get("identifier"))
                 ),
                 formula=None if item.get("formula") is None else str(item.get("formula")),
+                space_group_number=_as_optional_int(item.get("space_group_number")),
+                atom_sites=_clean_atom_sites(
+                    item.get("atom_sites", item.get("atoms", item.get("sites")))
+                ),
+                metadata={
+                    "materials_project": item.get("materials_project"),
+                    "cif_url": item.get("cif_url"),
+                },
             )
         except ValueError as exc:
             warnings.append(f"candidate phase '{name}' is invalid: {exc}")
+            continue
+        if not _phase_allowed(phase, allowed_names):
             continue
         phases.append(phase)
     return phases, warnings
 
 
+def _cif_length_to_nm(values: dict[str, Any]) -> tuple[float, float, float]:
+    a = _as_float(values["a"], field_name="cif.a")
+    b = _as_float(values["b"], field_name="cif.b")
+    c = _as_float(values["c"], field_name="cif.c")
+    # Standard CIF cell lengths are Angstrom. Existing repo fixtures may already
+    # use nm; values below 1 Angstrom are physically implausible for cell lengths,
+    # so keep sub-1 inputs as nm for backward compatibility.
+    if max(a, b, c) >= 1.0:
+        return a * 0.1, b * 0.1, c * 0.1
+    return a, b, c
+
+
+def _clean_cif_numeric(value: Any) -> float | None:
+    try:
+        return _as_float(value, field_name="cif_atom_site")
+    except ValueError:
+        return None
+
+
+def _element_from_cif_label(value: str) -> str:
+    match = "".join(ch for ch in str(value).strip() if ch.isalpha())
+    if not match:
+        return "X"
+    return match[0].upper() + match[1:].lower()
+
+
+def _parse_atom_sites_from_cif_lines(lines: list[str]) -> list[dict[str, Any]]:
+    sites: list[dict[str, Any]] = []
+    idx = 0
+    while idx < len(lines):
+        if lines[idx].strip().lower() != "loop_":
+            idx += 1
+            continue
+        idx += 1
+        headers: list[str] = []
+        while idx < len(lines):
+            line = lines[idx].strip()
+            if not line or line.startswith("#"):
+                idx += 1
+                continue
+            if not line.startswith("_"):
+                break
+            headers.append(line.split()[0].lower())
+            idx += 1
+        if not headers or not any(header.startswith("_atom_site_") for header in headers):
+            while (
+                idx < len(lines)
+                and lines[idx].strip()
+                and not lines[idx].strip().startswith("_")
+            ):
+                if lines[idx].strip().lower() == "loop_":
+                    break
+                idx += 1
+            continue
+        header_index = {header: pos for pos, header in enumerate(headers)}
+        required = {
+            "_atom_site_fract_x",
+            "_atom_site_fract_y",
+            "_atom_site_fract_z",
+        }
+        if not required.issubset(header_index):
+            continue
+        while idx < len(lines):
+            raw_line = lines[idx].strip()
+            if (
+                not raw_line
+                or raw_line.startswith("#")
+                or raw_line.lower() == "loop_"
+                or raw_line.startswith("_")
+            ):
+                break
+            try:
+                tokens = shlex.split(raw_line)
+            except ValueError:
+                tokens = raw_line.split()
+            if len(tokens) >= len(headers):
+                symbol = None
+                for key in ("_atom_site_type_symbol", "_atom_site_label"):
+                    pos = header_index.get(key)
+                    if pos is not None and pos < len(tokens):
+                        symbol = str(tokens[pos])
+                        break
+                x = _clean_cif_numeric(tokens[header_index["_atom_site_fract_x"]])
+                y = _clean_cif_numeric(tokens[header_index["_atom_site_fract_y"]])
+                z = _clean_cif_numeric(tokens[header_index["_atom_site_fract_z"]])
+                if symbol and x is not None and y is not None and z is not None:
+                    occupancy = 1.0
+                    occ_pos = header_index.get("_atom_site_occupancy")
+                    if occ_pos is not None and occ_pos < len(tokens):
+                        occupancy = _clean_cif_numeric(tokens[occ_pos]) or 1.0
+                    sites.append(
+                        {
+                            "element": _element_from_cif_label(symbol),
+                            "abc": [x, y, z],
+                            "occupancy": occupancy,
+                            "source_index": len(sites),
+                        }
+                    )
+            idx += 1
+    return sites
+
+
 def _phase_from_cif(path: Path) -> _LatticePhase | None:
+    pymatgen_result = load_candidate_phase_from_cif(path)
+    if pymatgen_result.candidate is not None:
+        phase, parse_warnings = _parse_candidate_phase_params(
+            [pymatgen_result.candidate],
+            allowed_names=None,
+        )
+        if phase and not parse_warnings:
+            return phase[0]
+
     keymap = {
         "_cell_length_a": "a",
         "_cell_length_b": "b",
@@ -160,10 +349,13 @@ def _phase_from_cif(path: Path) -> _LatticePhase | None:
         "_cell_angle_gamma": "gamma",
         "_symmetry_space_group_name_h-m": "space_group",
         "_space_group_name_h-m_alt": "space_group",
+        "_space_group_it_number": "space_group_number",
+        "_symmetry_int_tables_number": "space_group_number",
         "_chemical_formula_sum": "formula",
     }
     parsed: dict[str, Any] = {}
-    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    for raw_line in lines:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -179,11 +371,12 @@ def _phase_from_cif(path: Path) -> _LatticePhase | None:
     if not required.issubset(parsed):
         return None
     try:
+        a_nm, b_nm, c_nm = _cif_length_to_nm(parsed)
         return _LatticePhase(
             name=path.stem,
-            a=_as_float(parsed["a"], field_name=f"{path.name}.a"),
-            b=_as_float(parsed["b"], field_name=f"{path.name}.b"),
-            c=_as_float(parsed["c"], field_name=f"{path.name}.c"),
+            a=a_nm,
+            b=b_nm,
+            c=c_nm,
             alpha_deg=_as_float(parsed["alpha"], field_name=f"{path.name}.alpha"),
             beta_deg=_as_float(parsed["beta"], field_name=f"{path.name}.beta"),
             gamma_deg=_as_float(parsed["gamma"], field_name=f"{path.name}.gamma"),
@@ -191,6 +384,8 @@ def _phase_from_cif(path: Path) -> _LatticePhase | None:
             source="cif_candidates",
             identifier=path.name,
             formula=None if parsed.get("formula") is None else str(parsed["formula"]),
+            space_group_number=_as_optional_int(parsed.get("space_group_number")),
+            atom_sites=_parse_atom_sites_from_cif_lines(lines),
         )
     except ValueError:
         return None
@@ -199,23 +394,47 @@ def _phase_from_cif(path: Path) -> _LatticePhase | None:
 def _load_cif_candidates(
     cif_candidates_dir: str | None,
     *,
+    cif_candidate_paths: Any = None,
     allowed_names: set[str] | None,
 ) -> tuple[list[_LatticePhase], list[str]]:
     warnings: list[str] = []
-    if not cif_candidates_dir:
-        return [], warnings
-    root = Path(cif_candidates_dir)
-    if not root.exists() or not root.is_dir():
-        warnings.append(f"cif_candidates_dir does not exist: {cif_candidates_dir}")
-        return [], warnings
+    paths: list[Path] = []
+    if cif_candidates_dir:
+        root = Path(cif_candidates_dir)
+        if not root.exists() or not root.is_dir():
+            warnings.append(f"cif_candidates_dir does not exist: {cif_candidates_dir}")
+        else:
+            paths.extend(sorted(root.glob("*.cif")))
+
+    raw_paths: list[Any] = []
+    if isinstance(cif_candidate_paths, (str, Path)):
+        raw_paths = [cif_candidate_paths]
+    elif isinstance(cif_candidate_paths, list):
+        raw_paths = list(cif_candidate_paths)
+    elif cif_candidate_paths is not None:
+        warnings.append("cif_candidate_paths must be a string path or list of paths; skipped.")
+
+    for raw_path in raw_paths:
+        path = Path(str(raw_path))
+        if path.is_dir():
+            paths.extend(sorted(path.glob("*.cif")))
+        elif path.is_file():
+            paths.append(path)
+        else:
+            warnings.append(f"CIF candidate path does not exist: {path}")
 
     phases: list[_LatticePhase] = []
-    for path in sorted(root.glob("*.cif")):
+    seen_paths: set[Path] = set()
+    for path in paths:
+        resolved = path.resolve()
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
         phase = _phase_from_cif(path)
         if phase is None:
             warnings.append(f"Failed to parse CIF candidate: {path.name}")
             continue
-        if allowed_names is not None and phase.name not in allowed_names:
+        if not _phase_allowed(phase, allowed_names):
             continue
         phases.append(phase)
     return phases, warnings
@@ -569,6 +788,23 @@ def _match_phase(
             else Measurement(value=mean_angle_error, unit="deg", method="b4_angle_match")
         ),
         zone_axis=zone_axis,
+        lattice_parameters={
+            "a": float(phase.a),
+            "b": float(phase.b),
+            "c": float(phase.c),
+            "alpha": float(phase.alpha_deg),
+            "beta": float(phase.beta_deg),
+            "gamma": float(phase.gamma_deg),
+            "unit": "nm",
+            "space_group": phase.space_group,
+            "space_group_number": phase.space_group_number,
+            "atom_sites": phase.atom_sites,
+            **{
+                key: value
+                for key, value in phase.metadata.items()
+                if value is not None
+            },
+        },
         warnings=[],
     )
     if strict_mode:
@@ -617,6 +853,7 @@ def run_b4_indexing(
     angle_tolerance_deg: float,
     strict_mode: bool,
     cif_candidates_dir: str | None = None,
+    cif_candidate_paths: Any = None,
     top_n: int = 3,
 ) -> B4IndexingResult:
     warnings: list[str] = []
@@ -625,16 +862,29 @@ def run_b4_indexing(
     )
     warnings.extend(parse_warnings)
 
-    if strict_mode:
-        cif_phases, cif_warnings = _load_cif_candidates(
-            cif_candidates_dir, allowed_names=allowed_phase_names
+    cif_phases, cif_warnings = _load_cif_candidates(
+        cif_candidates_dir,
+        cif_candidate_paths=cif_candidate_paths,
+        allowed_names=allowed_phase_names,
+    )
+    warnings.extend(cif_warnings)
+    existing = {
+        (
+            _normalize_label(phase.name),
+            _normalize_label(phase.identifier),
+            _normalize_label(phase.source),
         )
-        warnings.extend(cif_warnings)
-        existing = {phase.name for phase in phases}
-        for phase in cif_phases:
-            if phase.name not in existing:
-                phases.append(phase)
-                existing.add(phase.name)
+        for phase in phases
+    }
+    for phase in cif_phases:
+        key = (
+            _normalize_label(phase.name),
+            _normalize_label(phase.identifier),
+            _normalize_label(phase.source),
+        )
+        if key not in existing:
+            phases.append(phase)
+            existing.add(key)
 
     if not phases:
         return B4IndexingResult(

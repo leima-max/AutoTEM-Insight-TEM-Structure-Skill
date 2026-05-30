@@ -11,10 +11,11 @@ from pydantic import Field
 from autotem.calibration.open_source_adapters import SUPPORTED_DIFFRACTION_CALIBRATION_ENGINES
 from autotem.core.models import AutoTEMModel, WorkflowConfig, WorkflowStep
 from autotem.diffraction.open_source_adapters import SUPPORTED_PEAK_ADAPTER_ENGINES
+from autotem.diffraction.phase_lookup import supported_phase_lookup_sources
 
 DEFAULT_WORKFLOW_NAME = "a2_default"
 DEFAULT_WORKFLOW_DESCRIPTION = "A2 baseline load-calibrate-diffraction-simulation workflow."
-WORKFLOW_PARAMETER_SCHEMA_VERSION = "2026-05-21.b2b3.2"
+WORKFLOW_PARAMETER_SCHEMA_VERSION = "2026-05-29.b5.3"
 DEFAULT_STEP_SEQUENCE: tuple[str, ...] = (
     "load",
     "assess_quality",
@@ -36,6 +37,14 @@ _SUPPORTED_PEAK_THRESHOLD_STRATEGIES = {"auto", "quantile", "std", "relative_max
 _SUPPORTED_PEAK_DETECTORS = {"local_max", "log", "dog"}
 _SUPPORTED_INDEXING_MODES = {"auto", "baseline", "lattice_fit"}
 _SUPPORTED_FFT_CENTER_MODES = {"auto", "geometric"}
+_SUPPORTED_PHASE_LOOKUP_SOURCES = supported_phase_lookup_sources()
+_SUPPORTED_MATERIALS_PROJECT_SORT_MODES = {
+    "stability",
+    "energy_above_hull",
+    "material_id",
+    "none",
+}
+_SUPPORTED_SIMULATION_ENGINES = {"baseline", "diffsims"}
 _SUPPORTED_ACCEPTANCE_OPS = {">=", "<=", ">", "<", "=="}
 _QUALITY_THRESHOLD_RANGE_01_KEYS = {
     "blur_risk_max",
@@ -145,6 +154,102 @@ def _validate_output_formats(formats: list[str]) -> list[str]:
         if name not in normalized:
             normalized.append(name)
     return normalized
+
+
+def _validate_candidate_phase_params(value: Any) -> None:
+    if value is None:
+        return
+    if not isinstance(value, list):
+        raise ValueError(
+            "workflow.parameters.diffraction.candidate_phase_params must be a list."
+        )
+
+    def _phase_numeric(raw: Any, *, field_name: str) -> float:
+        if isinstance(raw, bool):
+            raise ValueError(f"{field_name} must be numeric.")
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        if isinstance(raw, str) and raw.strip():
+            token = raw.strip()
+            keep: list[str] = []
+            seen_dot = False
+            seen_exp = False
+            for idx, ch in enumerate(token):
+                if ch in "+-" and (idx == 0 or (seen_exp and keep[-1] in {"e", "E"})):
+                    keep.append(ch)
+                    continue
+                if ch.isdigit():
+                    keep.append(ch)
+                    continue
+                if ch == "." and not seen_dot and not seen_exp:
+                    seen_dot = True
+                    keep.append(ch)
+                    continue
+                if ch in "eE" and not seen_exp and keep:
+                    seen_exp = True
+                    keep.append(ch)
+                    continue
+                break
+            try:
+                return float("".join(keep))
+            except ValueError as exc:
+                raise ValueError(f"{field_name} must be numeric.") from exc
+        raise ValueError(f"{field_name} must be numeric.")
+
+    for idx, row in enumerate(value):
+        if not isinstance(row, dict):
+            raise ValueError(
+                f"workflow.parameters.diffraction.candidate_phase_params[{idx}] "
+                "must be a mapping."
+            )
+        name = row.get("name")
+        if name is not None and (not isinstance(name, str) or not name.strip()):
+            raise ValueError(
+                f"workflow.parameters.diffraction.candidate_phase_params[{idx}].name "
+                "must be a non-empty string when provided."
+            )
+        for axis in ("a", "b", "c"):
+            if axis not in row:
+                raise ValueError(
+                    "workflow.parameters.diffraction."
+                    f"candidate_phase_params[{idx}].{axis} is required."
+                )
+            length = _phase_numeric(
+                row[axis],
+                field_name=(
+                    "workflow.parameters.diffraction."
+                    f"candidate_phase_params[{idx}].{axis}"
+                ),
+            )
+            if length <= 0:
+                raise ValueError(
+                    "workflow.parameters.diffraction."
+                    f"candidate_phase_params[{idx}].{axis} must be > 0."
+                )
+        for angle_name in ("alpha", "beta", "gamma"):
+            if angle_name not in row:
+                continue
+            angle = _phase_numeric(
+                row[angle_name],
+                field_name=(
+                    "workflow.parameters.diffraction."
+                    f"candidate_phase_params[{idx}].{angle_name}"
+                ),
+            )
+            if not (0 < angle < 180):
+                raise ValueError(
+                    "workflow.parameters.diffraction."
+                    f"candidate_phase_params[{idx}].{angle_name} must be within (0, 180)."
+                )
+
+
+def _validate_non_empty_string_list(value: Any, *, field_name: str) -> None:
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item.strip() for item in value
+    ):
+        raise ValueError(
+            f"workflow.parameters.diffraction.{field_name} must be a non-empty string list."
+        )
 
 
 def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
@@ -685,12 +790,168 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
                     "workflow.parameters.diffraction.candidate_phases must be a non-empty "
                     "string list."
                 )
+        _validate_candidate_phase_params(diffraction.get("candidate_phase_params"))
+        if "cif_candidate_paths" in diffraction:
+            _validate_non_empty_string_list(
+                diffraction["cif_candidate_paths"],
+                field_name="cif_candidate_paths",
+            )
         if "indexing_mode" in diffraction:
             indexing_mode = str(diffraction["indexing_mode"]).strip().lower()
             if indexing_mode not in _SUPPORTED_INDEXING_MODES:
                 raise ValueError(
                     "workflow.parameters.diffraction.indexing_mode must be one of "
                     f"{sorted(_SUPPORTED_INDEXING_MODES)}."
+                )
+        if "max_hkl" in diffraction:
+            max_hkl = int(_as_float(diffraction["max_hkl"], field_name="diffraction.max_hkl"))
+            if max_hkl < 1:
+                raise ValueError("workflow.parameters.diffraction.max_hkl must be >= 1.")
+        if "d_tolerance_rel" in diffraction:
+            d_tolerance_rel = _as_float(
+                diffraction["d_tolerance_rel"],
+                field_name="diffraction.d_tolerance_rel",
+            )
+            if d_tolerance_rel <= 0:
+                raise ValueError("workflow.parameters.diffraction.d_tolerance_rel must be > 0.")
+        if "angle_tolerance_deg" in diffraction:
+            angle_tolerance = _as_float(
+                diffraction["angle_tolerance_deg"],
+                field_name="diffraction.angle_tolerance_deg",
+            )
+            if angle_tolerance <= 0:
+                raise ValueError(
+                    "workflow.parameters.diffraction.angle_tolerance_deg must be > 0."
+                )
+        if "b4_strict_mode" in diffraction:
+            _as_bool(diffraction["b4_strict_mode"], field_name="diffraction.b4_strict_mode")
+        if "cif_candidates_dir" in diffraction:
+            cif_candidates_dir = diffraction["cif_candidates_dir"]
+            if not isinstance(cif_candidates_dir, str) or not cif_candidates_dir.strip():
+                raise ValueError(
+                    "workflow.parameters.diffraction.cif_candidates_dir must be a "
+                    "non-empty string."
+                )
+        if "phase_lookup_enabled" in diffraction:
+            _as_bool(
+                diffraction["phase_lookup_enabled"],
+                field_name="diffraction.phase_lookup_enabled",
+            )
+        if "phase_lookup_formula" in diffraction:
+            phase_lookup_formula = diffraction["phase_lookup_formula"]
+            if not isinstance(phase_lookup_formula, str) or not phase_lookup_formula.strip():
+                raise ValueError(
+                    "workflow.parameters.diffraction.phase_lookup_formula must be a "
+                    "non-empty string."
+                )
+        if "phase_lookup_materials" in diffraction:
+            _validate_non_empty_string_list(
+                diffraction["phase_lookup_materials"],
+                field_name="phase_lookup_materials",
+            )
+        if "phase_lookup_elements" in diffraction:
+            _validate_non_empty_string_list(
+                diffraction["phase_lookup_elements"],
+                field_name="phase_lookup_elements",
+            )
+        if "phase_lookup_sources" in diffraction:
+            _validate_non_empty_string_list(
+                diffraction["phase_lookup_sources"],
+                field_name="phase_lookup_sources",
+            )
+            invalid_sources = [
+                item
+                for item in diffraction["phase_lookup_sources"]
+                if str(item).strip() not in _SUPPORTED_PHASE_LOOKUP_SOURCES
+            ]
+            if invalid_sources:
+                raise ValueError(
+                    "workflow.parameters.diffraction.phase_lookup_sources must contain "
+                    f"only {sorted(_SUPPORTED_PHASE_LOOKUP_SOURCES)}."
+                )
+        if "materials_project_ids" in diffraction:
+            _validate_non_empty_string_list(
+                diffraction["materials_project_ids"],
+                field_name="materials_project_ids",
+            )
+        if "materials_project_config_path" in diffraction:
+            mp_config_path = diffraction["materials_project_config_path"]
+            if not isinstance(mp_config_path, str) or not mp_config_path.strip():
+                raise ValueError(
+                    "workflow.parameters.diffraction.materials_project_config_path "
+                    "must be a non-empty string."
+                )
+        if "materials_project_api_key" in diffraction:
+            mp_api_key = diffraction["materials_project_api_key"]
+            if not isinstance(mp_api_key, str) or not mp_api_key.strip():
+                raise ValueError(
+                    "workflow.parameters.diffraction.materials_project_api_key "
+                    "must be a non-empty string."
+                )
+        if "materials_project_sort_by" in diffraction:
+            mp_sort_by = str(diffraction["materials_project_sort_by"]).strip().lower()
+            if mp_sort_by not in _SUPPORTED_MATERIALS_PROJECT_SORT_MODES:
+                raise ValueError(
+                    "workflow.parameters.diffraction.materials_project_sort_by "
+                    f"must be one of {sorted(_SUPPORTED_MATERIALS_PROJECT_SORT_MODES)}."
+                )
+        if "materials_project_include_deprecated" in diffraction:
+            _as_bool(
+                diffraction["materials_project_include_deprecated"],
+                field_name="diffraction.materials_project_include_deprecated",
+            )
+        if "materials_project_filter_stable" in diffraction:
+            _as_bool(
+                diffraction["materials_project_filter_stable"],
+                field_name="diffraction.materials_project_filter_stable",
+            )
+        if "materials_project_prefer_experimental" in diffraction:
+            _as_bool(
+                diffraction["materials_project_prefer_experimental"],
+                field_name="diffraction.materials_project_prefer_experimental",
+            )
+        if "materials_project_max_energy_above_hull" in diffraction:
+            mp_max_hull = _as_float(
+                diffraction["materials_project_max_energy_above_hull"],
+                field_name="diffraction.materials_project_max_energy_above_hull",
+            )
+            if mp_max_hull < 0:
+                raise ValueError(
+                    "workflow.parameters.diffraction."
+                    "materials_project_max_energy_above_hull must be >= 0."
+                )
+        if "materials_project_candidate_pool_size" in diffraction:
+            mp_pool_size = int(
+                _as_float(
+                    diffraction["materials_project_candidate_pool_size"],
+                    field_name="diffraction.materials_project_candidate_pool_size",
+                )
+            )
+            if mp_pool_size < 1:
+                raise ValueError(
+                    "workflow.parameters.diffraction."
+                    "materials_project_candidate_pool_size must be >= 1."
+                )
+        if "phase_lookup_limit_per_source" in diffraction:
+            lookup_limit = int(
+                _as_float(
+                    diffraction["phase_lookup_limit_per_source"],
+                    field_name="diffraction.phase_lookup_limit_per_source",
+                )
+            )
+            if lookup_limit < 1:
+                raise ValueError(
+                    "workflow.parameters.diffraction.phase_lookup_limit_per_source "
+                    "must be >= 1."
+                )
+        if "phase_lookup_timeout_s" in diffraction:
+            lookup_timeout = _as_float(
+                diffraction["phase_lookup_timeout_s"],
+                field_name="diffraction.phase_lookup_timeout_s",
+            )
+            if lookup_timeout < 1:
+                raise ValueError(
+                    "workflow.parameters.diffraction.phase_lookup_timeout_s must be >= 1."
                 )
         if "peak_threshold_strategy" in diffraction:
             strategy = str(diffraction["peak_threshold_strategy"]).strip().lower()
@@ -854,6 +1115,247 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
                         "workflow.parameters.reporting.diffraction_gates."
                         "min_indexed_nonzero_fraction must be within [0, 1]."
                     )
+
+    simulation = params.get("simulation")
+    if simulation is not None:
+        if not isinstance(simulation, dict):
+            raise ValueError("workflow.parameters.simulation must be a mapping.")
+        if "simulation_engine" in simulation:
+            engine = str(simulation["simulation_engine"]).strip().lower()
+            if engine not in _SUPPORTED_SIMULATION_ENGINES:
+                raise ValueError(
+                    "workflow.parameters.simulation.simulation_engine must be one of "
+                    f"{sorted(_SUPPORTED_SIMULATION_ENGINES)}."
+                )
+        if "voltage_kv" in simulation:
+            voltage = _as_float(simulation["voltage_kv"], field_name="simulation.voltage_kv")
+            if voltage <= 0:
+                raise ValueError("workflow.parameters.simulation.voltage_kv must be > 0.")
+        if "reciprocal_radius_inv_angstrom" in simulation:
+            radius = _as_float(
+                simulation["reciprocal_radius_inv_angstrom"],
+                field_name="simulation.reciprocal_radius_inv_angstrom",
+            )
+            if radius <= 0:
+                raise ValueError(
+                    "workflow.parameters.simulation.reciprocal_radius_inv_angstrom must be > 0."
+                )
+        if "max_candidates" in simulation:
+            max_candidates = int(
+                _as_float(simulation["max_candidates"], field_name="simulation.max_candidates")
+            )
+            if max_candidates < 1:
+                raise ValueError("workflow.parameters.simulation.max_candidates must be >= 1.")
+        if "calibration" in simulation:
+            calibration = _as_float(simulation["calibration"], field_name="simulation.calibration")
+            if calibration <= 0:
+                raise ValueError("workflow.parameters.simulation.calibration must be > 0.")
+        if "pattern_shape" in simulation:
+            shape = simulation["pattern_shape"]
+            if (
+                not isinstance(shape, list)
+                or len(shape) != 2
+                or any(not isinstance(item, (int, float)) or int(item) < 1 for item in shape)
+            ):
+                raise ValueError(
+                    "workflow.parameters.simulation.pattern_shape must be a two-item "
+                    "positive integer list."
+                )
+        if "with_direct_beam" in simulation:
+            _as_bool(
+                simulation["with_direct_beam"],
+                field_name="simulation.with_direct_beam",
+            )
+        if "fallback_single_atom" in simulation:
+            _as_bool(
+                simulation["fallback_single_atom"],
+                field_name="simulation.fallback_single_atom",
+            )
+        if "max_excitation_error" in simulation:
+            max_excitation_error = _as_float(
+                simulation["max_excitation_error"],
+                field_name="simulation.max_excitation_error",
+            )
+            if max_excitation_error <= 0:
+                raise ValueError(
+                    "workflow.parameters.simulation.max_excitation_error must be > 0."
+                )
+        if "shape_factor_width" in simulation:
+            shape_factor_width = _as_float(
+                simulation["shape_factor_width"],
+                field_name="simulation.shape_factor_width",
+            )
+            if shape_factor_width <= 0:
+                raise ValueError(
+                    "workflow.parameters.simulation.shape_factor_width must be > 0."
+                )
+        if "zone_axis_candidates" in simulation:
+            zone_axes = simulation["zone_axis_candidates"]
+
+            def _valid_zone_axis(raw_axis: Any) -> bool:
+                return (
+                    isinstance(raw_axis, list)
+                    and len(raw_axis) == 3
+                    and all(isinstance(item, (int, float)) for item in raw_axis)
+                    and sum(float(item) * float(item) for item in raw_axis) > 0
+                )
+
+            if _valid_zone_axis(zone_axes):
+                pass
+            elif (
+                not isinstance(zone_axes, list)
+                or not zone_axes
+                or any(not _valid_zone_axis(axis) for axis in zone_axes)
+            ):
+                raise ValueError(
+                    "workflow.parameters.simulation.zone_axis_candidates must be a "
+                    "three-item numeric list or a non-empty list of three-item numeric lists."
+                )
+        if "rotation_axis" in simulation:
+            axis = simulation["rotation_axis"]
+            if (
+                not isinstance(axis, list)
+                or len(axis) != 3
+                or any(not isinstance(item, (int, float)) for item in axis)
+            ):
+                raise ValueError(
+                    "workflow.parameters.simulation.rotation_axis must be a three-item "
+                    "numeric list."
+                )
+            if sum(float(item) * float(item) for item in axis) <= 0:
+                raise ValueError(
+                    "workflow.parameters.simulation.rotation_axis must be non-zero."
+                )
+        if "rotation_angles_deg" in simulation:
+            angles = simulation["rotation_angles_deg"]
+            if (
+                not isinstance(angles, list)
+                or not angles
+                or any(not isinstance(item, (int, float)) for item in angles)
+            ):
+                raise ValueError(
+                    "workflow.parameters.simulation.rotation_angles_deg must be a "
+                    "non-empty numeric list."
+                )
+        if "pattern_sigma" in simulation:
+            pattern_sigma = _as_float(
+                simulation["pattern_sigma"],
+                field_name="simulation.pattern_sigma",
+            )
+            if pattern_sigma <= 0:
+                raise ValueError("workflow.parameters.simulation.pattern_sigma must be > 0.")
+        if "pattern_in_plane_angle_deg" in simulation:
+            _as_float(
+                simulation["pattern_in_plane_angle_deg"],
+                field_name="simulation.pattern_in_plane_angle_deg",
+            )
+        if "pattern_mirrored" in simulation:
+            _as_bool(
+                simulation["pattern_mirrored"],
+                field_name="simulation.pattern_mirrored",
+            )
+        if "pattern_normalize" in simulation:
+            _as_bool(
+                simulation["pattern_normalize"],
+                field_name="simulation.pattern_normalize",
+            )
+        if "pattern_clip_threshold" in simulation:
+            clip_threshold = _as_float(
+                simulation["pattern_clip_threshold"],
+                field_name="simulation.pattern_clip_threshold",
+            )
+            if clip_threshold < 0:
+                raise ValueError(
+                    "workflow.parameters.simulation.pattern_clip_threshold must be >= 0."
+                )
+        if "max_simulated_spots" in simulation:
+            max_simulated_spots = int(
+                _as_float(
+                    simulation["max_simulated_spots"],
+                    field_name="simulation.max_simulated_spots",
+                )
+            )
+            if max_simulated_spots < 1:
+                raise ValueError(
+                    "workflow.parameters.simulation.max_simulated_spots must be >= 1."
+                )
+        if "minimum_simulated_g_inv_nm" in simulation:
+            minimum_simulated_g = _as_float(
+                simulation["minimum_simulated_g_inv_nm"],
+                field_name="simulation.minimum_simulated_g_inv_nm",
+            )
+            if minimum_simulated_g < 0:
+                raise ValueError(
+                    "workflow.parameters.simulation.minimum_simulated_g_inv_nm must be >= 0."
+                )
+        if "phase_match_enabled" in simulation:
+            _as_bool(
+                simulation["phase_match_enabled"],
+                field_name="simulation.phase_match_enabled",
+            )
+        if "phase_match_d_tolerance_rel" in simulation:
+            d_tolerance = _as_float(
+                simulation["phase_match_d_tolerance_rel"],
+                field_name="simulation.phase_match_d_tolerance_rel",
+            )
+            if d_tolerance <= 0:
+                raise ValueError(
+                    "workflow.parameters.simulation.phase_match_d_tolerance_rel must be > 0."
+                )
+        if "phase_match_angle_tolerance_deg" in simulation:
+            angle_tolerance = _as_float(
+                simulation["phase_match_angle_tolerance_deg"],
+                field_name="simulation.phase_match_angle_tolerance_deg",
+            )
+            if angle_tolerance <= 0:
+                raise ValueError(
+                    "workflow.parameters.simulation.phase_match_angle_tolerance_deg "
+                    "must be > 0."
+                )
+        if "phase_match_min_spots" in simulation:
+            min_spots = int(
+                _as_float(
+                    simulation["phase_match_min_spots"],
+                    field_name="simulation.phase_match_min_spots",
+                )
+            )
+            if min_spots < 1:
+                raise ValueError(
+                    "workflow.parameters.simulation.phase_match_min_spots must be >= 1."
+                )
+        if "phase_match_top_n" in simulation:
+            top_n = int(
+                _as_float(
+                    simulation["phase_match_top_n"],
+                    field_name="simulation.phase_match_top_n",
+                )
+            )
+            if top_n < 1:
+                raise ValueError(
+                    "workflow.parameters.simulation.phase_match_top_n must be >= 1."
+                )
+        if "phase_match_previous_score_weight" in simulation:
+            previous_score_weight = _as_float(
+                simulation["phase_match_previous_score_weight"],
+                field_name="simulation.phase_match_previous_score_weight",
+            )
+            if not (0 <= previous_score_weight <= 1):
+                raise ValueError(
+                    "workflow.parameters.simulation.phase_match_previous_score_weight "
+                    "must be within [0, 1]."
+                )
+        if "phase_match_max_rotation_candidates" in simulation:
+            max_rotations = int(
+                _as_float(
+                    simulation["phase_match_max_rotation_candidates"],
+                    field_name="simulation.phase_match_max_rotation_candidates",
+                )
+            )
+            if max_rotations < 1:
+                raise ValueError(
+                    "workflow.parameters.simulation.phase_match_max_rotation_candidates "
+                    "must be >= 1."
+                )
 
     def _validate_acceptance_criteria(
         value: Any,

@@ -290,6 +290,7 @@ class PhaseCandidate(AutoTEMModel):
     mean_d_error: Measurement | None = None
     mean_angle_error: Measurement | None = None
     zone_axis: tuple[int, int, int] | None = None
+    lattice_parameters: JsonDict = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -463,11 +464,28 @@ class FourDSTEMResult(VersionedAutoTEMModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class SimulatedSpot(AutoTEMModel):
+    """Single simulated reciprocal-space spot for template matching."""
+
+    gx: Measurement
+    gy: Measurement
+    magnitude: Measurement | None = None
+    d_spacing: Measurement | None = None
+    intensity: float | None = None
+    h: int | None = None
+    k: int | None = None
+    l: int | None = None  # noqa: E741 - conventional hkl index name.
+    source_index: int | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class SimulatedPattern(AutoTEMModel):
     """Single simulated diffraction pattern or image."""
 
     kind: SimulationKind
     data: ArrayReference | None = None
+    spots: list[SimulatedSpot] = Field(default_factory=list)
     structure_id: str = ""
     zone_axis: tuple[int, int, int] | None = None
     microscope_parameters: JsonDict = Field(default_factory=dict)

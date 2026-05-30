@@ -17,7 +17,10 @@ Each run writes into one output root (CLI `--output` or API `output_dir`):
 Auto-created for A3:
 
 - `figures/`: PNG plots and overlays (`input_image.png`, `fft_magnitude.png`, etc.)
-- `tables/`: CSV tables (`diffraction_peaks.csv`, `d_spacings.csv`, etc.)
+  including B5 `simulation_diffraction_overlay.png` when simulated and measured
+  reciprocal-space spots are available.
+- `tables/`: CSV tables (`diffraction_peaks.csv`, `d_spacings.csv`,
+  `indexed_spots.csv`, etc.)
 - `json/`: JSON module snapshots and manifests
 - `intermediates/`: reserved for future intermediate arrays and debug artifacts
 
@@ -50,6 +53,16 @@ Inside `json/`:
 Inside `tables/`, A3 also writes:
 
 - `interface_completeness_bc.csv`: flat contract table for project board and acceptance automation
+- `phase_candidates.csv`: B4 phase-candidate ranking, lattice parameters,
+  crystal source, atom-site count, Materials Project ranking metadata when
+  available, matched spot counts, and d/angle errors.
+- `simulation_phase_matches.csv`: B5 simulation-vs-measurement closed-loop summary,
+  including engine, adapter status, phase-matching status, selected crystal
+  source, matched spot count, mean d-error, mean angle-error, and rotation
+  evidence plus the selected zone-axis metadata when a B5 zone-axis sweep is run.
+- `simulated_spots.csv`: reciprocal-space spots extracted from simulated
+  diffraction patterns, including zone-axis/rotation metadata and hkl labels
+  when the simulator provides them.
 
 Both `output_manifest.json` and `report_bundle_summary.json` are validated against Pydantic
 contract models and have exportable JSON Schemas.
@@ -82,12 +95,17 @@ Minimum fields:
   - `workflow_steps`
   - `workflow_details`
   - `interface_checks`
+  - `simulation`
   - `figures`
   - `tables`
   - `warnings`
   - `provenance`
 - Workflow detail sections render as collapsible `details` blocks.
 - Interface completeness includes Member B/C contract checks and marks each item as `pass` or `missing`.
+- The `simulation` HTML section includes a closed-loop summary, a candidate
+  comparison table that combines B4/Materials Project ranking metadata with
+  diffsims match scores, inferred zone-axis metadata, and the final matched
+  phase candidates.
 
 ## Quality Gates
 

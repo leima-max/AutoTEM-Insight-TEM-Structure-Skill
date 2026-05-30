@@ -14,6 +14,39 @@ suite:
         warning_count_increase: 0
 
 cases:
+  - case_id: b_diffraction_public
+    description: Public B-side fixture for diffraction, d-spacing, hkl, and phase metrics.
+    modality: HRTEM
+    report_path: cases/b_diffraction_public/analysis_report.json
+    tags: [public, minimal, b, diffraction, b4]
+    reference:
+      d_spacings_nm: [0.4, 0.4, 0.2828427125]
+      hkl_truth:
+        - [1, 0, 0]
+        - [0, 1, 0]
+        - [1, 1, 0]
+      hkl_top_k: 3
+      phase_truth: [cubic_probe]
+      phase_top_k: 1
+    acceptance_criteria:
+      - metric: workflow_no_failed_steps
+        op: ">="
+        threshold: 1
+      - metric: diffraction_peak_count
+        op: ">="
+        threshold: 3
+      - metric: d_spacing_mean_relative_error
+        op: "<="
+        threshold: 0.001
+      - metric: hkl_topk_accuracy
+        op: ">="
+        threshold: 1
+      - metric: phase_topk_accuracy
+        op: ">="
+        threshold: 1
+      - metric: b3_b4_indexed_nonzero_fraction
+        op: ">="
+        threshold: 1
   - case_id: c_atomic_strain_public
     description: Public C-side fixture for atom-coordinate and strain benchmark metrics.
     modality: HAADF-STEM

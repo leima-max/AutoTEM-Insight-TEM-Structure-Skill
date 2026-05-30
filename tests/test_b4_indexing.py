@@ -129,3 +129,58 @@ def test_b4_strict_reads_cif_candidates_and_reports_checks(tmp_path: Path) -> No
     assert any("zone_axis_consistency=" in text for text in top.warnings)
     assert bool(result.provenance.get("active"))
     assert result.provenance.get("mode") == "b4_strict"
+
+
+def test_b4_reads_direct_cif_candidate_paths_with_standard_angstrom_cell(
+    tmp_path: Path,
+) -> None:
+    peaks, g_vectors, d_by_peak = _build_b4_inputs()
+    initial = [IndexedSpot(peak_index=i, h=0, k=0, l=0, confidence=0.1) for i in range(len(peaks))]
+
+    cif_path = tmp_path / "phase_cubic_angstrom.cif"
+    cif_path.write_text(
+        "\n".join(
+            [
+                "_cell_length_a 4.0",
+                "_cell_length_b 4.0",
+                "_cell_length_c 4.0",
+                "_cell_angle_alpha 90",
+                "_cell_angle_beta 90",
+                "_cell_angle_gamma 90",
+                "_space_group_name_H-M_alt 'Pm-3m'",
+                "_space_group_IT_number 221",
+                "_chemical_formula_sum 'X'",
+                "loop_",
+                "_atom_site_label",
+                "_atom_site_type_symbol",
+                "_atom_site_fract_x",
+                "_atom_site_fract_y",
+                "_atom_site_fract_z",
+                "X1 X 0 0 0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_b4_indexing(
+        peaks=peaks,
+        g_vectors=g_vectors,
+        d_by_peak=d_by_peak,
+        initial_indexed_spots=initial,
+        candidate_phase_params=[],
+        allowed_phase_names={"phase_cubic_angstrom"},
+        max_hkl=3,
+        d_tolerance_rel=0.08,
+        angle_tolerance_deg=10.0,
+        strict_mode=False,
+        cif_candidate_paths=[str(cif_path)],
+        top_n=1,
+    )
+
+    assert result.phase_candidates
+    assert result.phase_candidates[0].source == "cif_candidates"
+    assert result.phase_candidates[0].name == "phase_cubic_angstrom"
+    assert result.phase_candidates[0].lattice_parameters["space_group_number"] == 221
+    assert result.phase_candidates[0].lattice_parameters["atom_sites"][0]["element"] == "X"
+    assert any((spot.h, spot.k, spot.l) != (0, 0, 0) for spot in result.indexed_spots)
+    assert result.provenance.get("active") is True

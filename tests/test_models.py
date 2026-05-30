@@ -28,6 +28,7 @@ from autotem.core import (
     RunSummary,
     RunSummaryStep,
     SimulatedPattern,
+    SimulatedSpot,
     SimulationResult,
     SpectroscopyResult,
     SpectroscopySignal,
@@ -195,6 +196,12 @@ def test_core_report_round_trip() -> None:
                 kind="diffraction",
                 structure_id="cif-001",
                 zone_axis=(0, 0, 1),
+                spots=[
+                    SimulatedSpot(
+                        gx=Measurement(value=2.5, unit="1/nm"),
+                        gy=Measurement(value=0.0, unit="1/nm"),
+                    )
+                ],
             )
         ],
         comparison_metrics=[Measurement(value=0.03, unit="nm", method="mean_d_error")],

@@ -29,6 +29,7 @@ from autotem.diffraction.peak_detection import (
     detect_bragg_peaks,
     suggest_peak_parameter_defaults,
 )
+from autotem.diffraction.phase_lookup import PhaseLookupResult, lookup_phase_candidates
 
 _SUPPORTED_IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 
@@ -64,6 +65,18 @@ def _to_bool(value: Any, *, default: bool) -> bool:
         if token in {"0", "false", "no", "off"}:
             return False
     return bool(default)
+
+
+def _optional_float(value: Any) -> float | None:
+    parsed = _to_float(value)
+    return parsed
+
+
+def _optional_int(value: Any) -> int | None:
+    parsed = _to_float(value)
+    if parsed is None:
+        return None
+    return int(parsed)
 
 
 def _array_from_reference(reference: ArrayReference) -> np.ndarray | None:
@@ -140,10 +153,104 @@ def _phase_placeholders(names: list[str], *, top_n: int) -> list[PhaseCandidate]
             mean_d_error=None,
             mean_angle_error=None,
             zone_axis=(0, 0, 1),
+            lattice_parameters={},
             warnings=["Placeholder phase candidate; lattice parameters not supplied."],
         )
         for idx, name in enumerate(chosen)
     ]
+
+
+def _as_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _resolve_phase_lookup_candidates(
+    params: dict[str, Any],
+    *,
+    candidate_phases: list[str],
+) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
+    lookup_requested = _to_bool(params.get("phase_lookup_enabled"), default=False)
+    lookup_materials = _as_string_list(params.get("phase_lookup_materials"))
+    lookup_formula = params.get("phase_lookup_formula")
+    lookup_elements = _as_string_list(params.get("phase_lookup_elements"))
+    lookup_sources = _as_string_list(params.get("phase_lookup_sources"))
+    lookup_mp_ids = _as_string_list(params.get("materials_project_ids"))
+    lookup_mp_config_path = params.get("materials_project_config_path")
+    lookup_mp_api_key = params.get("materials_project_api_key")
+    mp_sort_by = str(params.get("materials_project_sort_by", "stability")).strip().lower()
+    mp_include_deprecated = _to_bool(
+        params.get("materials_project_include_deprecated"),
+        default=False,
+    )
+    mp_filter_stable = _to_bool(
+        params.get("materials_project_filter_stable"),
+        default=False,
+    )
+    mp_max_energy = _optional_float(params.get("materials_project_max_energy_above_hull"))
+    mp_prefer_experimental = _to_bool(
+        params.get("materials_project_prefer_experimental"),
+        default=True,
+    )
+    mp_candidate_pool_size = _optional_int(
+        params.get("materials_project_candidate_pool_size")
+    )
+
+    if not lookup_requested:
+        return [], [], {"enabled": False}
+    if not lookup_materials and candidate_phases:
+        lookup_materials = list(candidate_phases)
+    formula = str(lookup_formula).strip() if isinstance(lookup_formula, str) else None
+    limit_per_source = int(_to_float(params.get("phase_lookup_limit_per_source")) or 5)
+    timeout_s = int(_to_float(params.get("phase_lookup_timeout_s")) or 8)
+
+    try:
+        result = lookup_phase_candidates(
+            formula=formula,
+            elements=lookup_elements,
+            material_names=lookup_materials,
+            sources=lookup_sources or None,
+            limit_per_source=max(1, limit_per_source),
+            timeout_s=max(1, timeout_s),
+            materials_project_api_key=(
+                lookup_mp_api_key.strip()
+                if isinstance(lookup_mp_api_key, str) and lookup_mp_api_key.strip()
+                else None
+            ),
+            materials_project_config_path=(
+                str(lookup_mp_config_path)
+                if isinstance(lookup_mp_config_path, str) and lookup_mp_config_path.strip()
+                else None
+            ),
+            materials_project_ids=lookup_mp_ids,
+            materials_project_sort_by=mp_sort_by,
+            materials_project_include_deprecated=mp_include_deprecated,
+            materials_project_filter_stable=mp_filter_stable,
+            materials_project_max_energy_above_hull=mp_max_energy,
+            materials_project_prefer_experimental=mp_prefer_experimental,
+            materials_project_candidate_pool_size=mp_candidate_pool_size,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return [], [f"B4 phase lookup failed: {exc}"], {"enabled": True, "failed": True}
+    if not isinstance(result, PhaseLookupResult):
+        return [], ["B4 phase lookup returned an unexpected result type."], {
+            "enabled": True,
+            "failed": True,
+        }
+    provenance = {
+        "enabled": True,
+        "candidate_count": len(result.candidates),
+        **result.provenance,
+    }
+    warnings = [f"B4 phase lookup: {warning}" for warning in result.warnings]
+    if not result.candidates:
+        warnings.append("B4 phase lookup returned no candidates.")
+    return result.candidates, warnings, provenance
 
 
 def _grade_fft_warnings(
@@ -482,13 +589,29 @@ def run_diffraction_analysis(
     indexed_spots = _baseline_indexed_spots(d_by_peak)
     phase_candidates: list[PhaseCandidate] = []
 
-    candidate_phase_params = params.get("candidate_phase_params")
+    raw_candidate_phase_params = params.get("candidate_phase_params")
     allowed_names_raw = params.get("candidate_phases")
+    candidate_phase_names = _as_string_list(allowed_names_raw)
     allowed_names = (
-        {str(item).strip() for item in allowed_names_raw if str(item).strip()}
-        if isinstance(allowed_names_raw, list)
+        {str(item).strip() for item in candidate_phase_names if str(item).strip()}
+        if candidate_phase_names
         else None
     )
+    candidate_phase_params = (
+        list(raw_candidate_phase_params) if isinstance(raw_candidate_phase_params, list) else []
+    )
+    phase_lookup_candidates, phase_lookup_warnings, phase_lookup_provenance = (
+        _resolve_phase_lookup_candidates(params, candidate_phases=candidate_phase_names)
+    )
+    if phase_lookup_candidates:
+        candidate_phase_params.extend(phase_lookup_candidates)
+        lookup_names = {
+            str(row.get("name", "")).strip()
+            for row in phase_lookup_candidates
+            if isinstance(row, dict) and str(row.get("name", "")).strip()
+        }
+        allowed_names = (set(allowed_names or set()) | lookup_names) or None
+    warnings.extend(phase_lookup_warnings)
     phase_top_n = int(_to_float(params.get("phase_top_n")) or 3)
     indexing_mode = str(params.get("indexing_mode", "auto")).strip().lower()
     enable_b4 = indexing_mode in {"auto", "lattice_fit"}
@@ -507,6 +630,7 @@ def run_diffraction_analysis(
             cif_candidates_dir=(
                 str(params["cif_candidates_dir"]) if "cif_candidates_dir" in params else None
             ),
+            cif_candidate_paths=params.get("cif_candidate_paths"),
             top_n=max(1, phase_top_n),
         )
         indexed_spots = b4_result.indexed_spots
@@ -516,11 +640,8 @@ def run_diffraction_analysis(
     else:
         b4_provenance = {"active": False, "reason": "disabled_or_no_peaks"}
 
-    if not phase_candidates and isinstance(allowed_names_raw, list):
-        phase_candidates = _phase_placeholders(
-            [str(item).strip() for item in allowed_names_raw if str(item).strip()],
-            top_n=phase_top_n,
-        )
+    if not phase_candidates and candidate_phase_names:
+        phase_candidates = _phase_placeholders(candidate_phase_names, top_n=phase_top_n)
 
     consistency_warnings, consistency_diag = _evaluate_b3_b4_consistency(
         peaks=peaks,
@@ -551,6 +672,7 @@ def run_diffraction_analysis(
         "direct_beam_center_uncertainty_px": center_uncertainty_px,
         "indexing_mode": indexing_mode,
         "b4_indexing": b4_provenance,
+        "b4_phase_lookup": phase_lookup_provenance,
         "b3_b4_consistency": consistency_diag,
         "parameters": params,
     }
