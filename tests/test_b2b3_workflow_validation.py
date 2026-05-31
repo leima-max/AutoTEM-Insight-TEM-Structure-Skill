@@ -268,9 +268,8 @@ def test_diffsims_closed_loop_example_workflow_is_valid() -> None:
 def test_materials_project_diffsims_lookup_example_workflow_is_valid() -> None:
     recipe = load_workflow_recipe(Path("examples/materials_project_diffsims_lookup.yaml"))
     diffraction = recipe.workflow.parameters.get("diffraction", {})
-    assert diffraction.get("phase_lookup_enabled") is True
     assert diffraction.get("phase_lookup_sources") == ["materials_project_api"]
-    assert diffraction.get("phase_lookup_materials") == ["mp-149"]
+    assert diffraction.get("phase_candidate_materials") == ["mp-149"]
     simulation = recipe.workflow.parameters.get("simulation", {})
     assert simulation.get("simulation_engine") == "diffsims"
     assert simulation.get("zone_axis_candidates") == [[0, 0, 1], [1, 1, 0], [1, 1, 1]]

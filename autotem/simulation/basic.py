@@ -117,7 +117,10 @@ def simulate_from_diffraction(
 
     voltage_kv = float(params.get("voltage_kv", 200.0))
     reciprocal_radius = float(params.get("reciprocal_radius_inv_angstrom", 1.0))
-    max_candidates = int(params.get("max_candidates", 3))
+    if params.get("max_candidates") is None:
+        max_candidates = max(1, len(diffraction.phase_candidates) or 3)
+    else:
+        max_candidates = int(params.get("max_candidates", 3))
     calibration = float(params.get("calibration", 0.01))
     max_simulated_spots = int(params.get("max_simulated_spots", 256))
     minimum_simulated_g = float(params.get("minimum_simulated_g_inv_nm", 1e-6))

@@ -7,6 +7,7 @@ offline use, plus optional online sources for broader candidate discovery.
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 import os
 import re
 import typing
@@ -867,7 +868,7 @@ def _mp_candidate_metadata(doc: Any, structure: Any, *, rank: int) -> dict[str, 
     return {key: value for key, value in metadata.items() if value is not None}
 
 
-def _fetch_mp_api_candidates(
+def _fetch_mp_api_candidates_direct(
     *,
     formula: str | None,
     elements: list[str],
@@ -1044,6 +1045,106 @@ def _fetch_mp_api_candidates(
     }
 
 
+def _mp_api_lookup_worker(kwargs: dict[str, Any], queue: Any) -> None:
+    try:
+        candidates, warnings, provenance = _fetch_mp_api_candidates_direct(**kwargs)
+        queue.put(
+            {
+                "ok": True,
+                "candidates": candidates,
+                "warnings": warnings,
+                "provenance": provenance,
+            }
+        )
+    except BaseException as exc:  # noqa: BLE001
+        queue.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+
+def _fetch_mp_api_candidates(
+    *,
+    formula: str | None,
+    elements: list[str],
+    material_ids: list[str],
+    limit: int,
+    timeout_s: int,
+    api_key: str | None,
+    config_path: str | Path | None,
+    sort_by: str = "stability",
+    include_deprecated: bool = False,
+    filter_stable: bool = False,
+    max_energy_above_hull: float | None = None,
+    prefer_experimental: bool = True,
+    candidate_pool_size: int | None = None,
+    isolate: bool = False,
+) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
+    kwargs = {
+        "formula": formula,
+        "elements": list(elements),
+        "material_ids": list(material_ids),
+        "limit": int(limit),
+        "timeout_s": int(timeout_s),
+        "api_key": api_key,
+        "config_path": config_path,
+        "sort_by": sort_by,
+        "include_deprecated": bool(include_deprecated),
+        "filter_stable": bool(filter_stable),
+        "max_energy_above_hull": max_energy_above_hull,
+        "prefer_experimental": bool(prefer_experimental),
+        "candidate_pool_size": candidate_pool_size,
+    }
+    if not isolate:
+        return _fetch_mp_api_candidates_direct(**kwargs)
+
+    timeout = max(1, int(timeout_s))
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    process = ctx.Process(target=_mp_api_lookup_worker, args=(kwargs, queue))
+    process.start()
+    process.join(timeout + 3)
+    provenance = {
+        "source": "materials_project_api",
+        "isolated": True,
+        "timeout_s": timeout,
+    }
+    if process.is_alive():
+        process.terminate()
+        process.join(2.0)
+        return [], [
+            "Materials Project API isolated lookup timed out; "
+            "other crystal sources may still return candidates."
+        ], {**provenance, "reason": "isolated_timeout"}
+    if queue.empty():
+        return [], [
+            "Materials Project API isolated lookup crashed or exited without a result; "
+            "other crystal sources may still return candidates."
+        ], {
+            **provenance,
+            "reason": "isolated_crash",
+            "exitcode": process.exitcode,
+        }
+    payload = queue.get()
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        error = str(payload.get("error", "unknown isolated lookup error"))
+        return [], [f"Materials Project API isolated lookup failed: {error}"], {
+            **provenance,
+            "reason": "isolated_failed",
+            "exitcode": process.exitcode,
+        }
+    mp_provenance = dict(payload.get("provenance", {}))
+    mp_provenance.update(
+        {
+            "isolated": True,
+            "isolated_exitcode": process.exitcode,
+            "timeout_s": timeout,
+        }
+    )
+    return (
+        list(payload.get("candidates", [])),
+        list(payload.get("warnings", [])),
+        mp_provenance,
+    )
+
+
 def _fetch_cod_candidates(
     *,
     formula: str | None,
@@ -1125,6 +1226,7 @@ def lookup_phase_candidates(
     materials_project_max_energy_above_hull: float | None = None,
     materials_project_prefer_experimental: bool = True,
     materials_project_candidate_pool_size: int | None = None,
+    materials_project_api_isolate: bool = False,
 ) -> PhaseLookupResult:
     """Return B4 candidate_phase_params entries from local and optional online sources."""
     active_sources = sources or ["local_builtin", "materials_project_optimade", "cod"]
@@ -1215,6 +1317,7 @@ def lookup_phase_candidates(
                 max_energy_above_hull=materials_project_max_energy_above_hull,
                 prefer_experimental=materials_project_prefer_experimental,
                 candidate_pool_size=materials_project_candidate_pool_size,
+                isolate=materials_project_api_isolate,
             )
             merged.extend(mp_api_rows)
             warnings.extend(mp_api_warnings)
@@ -1234,6 +1337,7 @@ def lookup_phase_candidates(
                 max_energy_above_hull=materials_project_max_energy_above_hull,
                 prefer_experimental=materials_project_prefer_experimental,
                 candidate_pool_size=materials_project_candidate_pool_size,
+                isolate=materials_project_api_isolate,
             )
             merged.extend(mp_api_rows)
             warnings.extend(mp_api_warnings)
@@ -1253,6 +1357,7 @@ def lookup_phase_candidates(
                 max_energy_above_hull=materials_project_max_energy_above_hull,
                 prefer_experimental=materials_project_prefer_experimental,
                 candidate_pool_size=materials_project_candidate_pool_size,
+                isolate=materials_project_api_isolate,
             )
             merged.extend(mp_api_rows)
             warnings.extend(mp_api_warnings)

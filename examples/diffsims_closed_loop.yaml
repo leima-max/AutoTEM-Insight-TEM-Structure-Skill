@@ -24,7 +24,7 @@ workflow:
       center_exclusion_radius: 4
       peak_threshold_strategy: relative_max
       peak_threshold_value: 0.12
-      candidate_phases: [cubic_probe]
+      phase_candidate_materials: [cubic_probe]
       candidate_phase_params:
         - name: cubic_probe
           formula: X
@@ -49,7 +49,6 @@ workflow:
       simulation_engine: diffsims
       voltage_kv: 200
       reciprocal_radius_inv_angstrom: 1.5
-      max_candidates: 1
       zone_axis_candidates:
         - [0, 0, 1]
         - [1, 1, 0]

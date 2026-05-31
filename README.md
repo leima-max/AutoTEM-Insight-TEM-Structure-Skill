@@ -100,14 +100,21 @@ This will calibrate `diffraction_scale` first, then propagate it into B3 g-vecto
   ranked `phase_candidates.csv`.
 - `diffraction.cif_candidate_paths` / `cif_candidates_dir`: import existing CIF
   files as B4 candidates.
-- `diffraction.phase_lookup_enabled`: when true, resolve material names or
-  formulas through the local built-in crystal library and optional online
-  sources (`materials_project_api`, `materials_project_optimade`, `cod`) before
-  B4 matching.
-- `diffraction.phase_lookup_materials`: accepts local names/formulas, common
-  aliases such as `quartz`, and Materials Project IDs such as `mp-149`. MP IDs
-  are routed directly to `materials_project_api`; common aliases are resolved to
-  formulas before online lookup.
+- `diffraction.phase_candidate_materials`: unified B3/B4 material or phase
+  list. The same names are used as the B4 candidate filter and, when lookup is
+  enabled, as crystal-source lookup queries. Legacy `candidate_phases` and
+  `phase_lookup_materials` remain accepted and are merged for compatibility.
+- `diffraction.phase_lookup_sources`: selecting one or more sources resolves
+  material names or formulas through the local built-in crystal library and
+  optional online sources (`materials_project_api`, `materials_project_optimade`,
+  `cod`) before B4 matching. Legacy `phase_lookup_enabled` is still accepted for
+  older recipes. The interactive B4 UI selects all four sources by default; if
+  `materials_project_api` has no API key configured, the UI shows the setup
+  guidance while the other sources can still return candidates.
+- material entries accept local names/formulas, common aliases such as
+  `quartz`, and Materials Project IDs such as `mp-149`. MP IDs are routed
+  directly to `materials_project_api`; common aliases are resolved to formulas
+  before online lookup.
 - `diffraction.materials_project_sort_by`: ranks MP API candidates before B4
   matching. The default `stability` priority prefers exact MP IDs, non-deprecated
   entries, stable phases, lower energy above hull, non-theoretical entries, and

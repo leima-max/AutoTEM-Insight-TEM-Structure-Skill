@@ -170,16 +170,74 @@ def _as_string_list(value: Any) -> list[str]:
     return []
 
 
+def _dedupe_string_lists(*values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for group in values:
+        for item in group:
+            text = str(item).strip()
+            key = text.casefold()
+            if text and key not in seen:
+                out.append(text)
+                seen.add(key)
+    return out
+
+
+def _resolve_phase_material_inputs(
+    params: dict[str, Any],
+) -> tuple[list[str], list[str], dict[str, Any]]:
+    """Resolve one material/phase selection for both B4 filtering and lookup.
+
+    ``phase_candidate_materials`` is the unified input. The older
+    ``candidate_phases`` and ``phase_lookup_materials`` fields remain supported
+    and are merged so legacy workflows do not have to maintain two matching
+    material lists.
+    """
+    unified_materials = _dedupe_string_lists(
+        _as_string_list(params.get("phase_candidate_materials")),
+        _as_string_list(params.get("material_phase_candidates")),
+    )
+    legacy_candidates = _as_string_list(params.get("candidate_phases"))
+    legacy_lookup = _as_string_list(params.get("phase_lookup_materials"))
+
+    if unified_materials:
+        candidate_materials = list(unified_materials)
+        lookup_materials = list(unified_materials)
+        source = "phase_candidate_materials"
+    else:
+        candidate_materials = _dedupe_string_lists(legacy_candidates, legacy_lookup)
+        lookup_materials = list(legacy_lookup or candidate_materials)
+        source = (
+            "candidate_phases+phase_lookup_materials"
+            if legacy_candidates and legacy_lookup
+            else "candidate_phases"
+            if legacy_candidates
+            else "phase_lookup_materials"
+            if legacy_lookup
+            else "empty"
+        )
+
+    return candidate_materials, lookup_materials, {
+        "source": source,
+        "candidate_materials": list(candidate_materials),
+        "lookup_materials": list(lookup_materials),
+    }
+
+
 def _resolve_phase_lookup_candidates(
     params: dict[str, Any],
     *,
-    candidate_phases: list[str],
+    lookup_materials: list[str],
 ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
-    lookup_requested = _to_bool(params.get("phase_lookup_enabled"), default=False)
-    lookup_materials = _as_string_list(params.get("phase_lookup_materials"))
     lookup_formula = params.get("phase_lookup_formula")
     lookup_elements = _as_string_list(params.get("phase_lookup_elements"))
     lookup_sources = _as_string_list(params.get("phase_lookup_sources"))
+    lookup_flag = params.get("phase_lookup_enabled")
+    lookup_requested = (
+        _to_bool(lookup_flag, default=False)
+        if lookup_flag is not None
+        else bool(lookup_sources)
+    )
     lookup_mp_ids = _as_string_list(params.get("materials_project_ids"))
     lookup_mp_config_path = params.get("materials_project_config_path")
     lookup_mp_api_key = params.get("materials_project_api_key")
@@ -200,11 +258,13 @@ def _resolve_phase_lookup_candidates(
     mp_candidate_pool_size = _optional_int(
         params.get("materials_project_candidate_pool_size")
     )
+    mp_api_isolate = _to_bool(
+        params.get("materials_project_api_isolate"),
+        default=False,
+    )
 
     if not lookup_requested:
         return [], [], {"enabled": False}
-    if not lookup_materials and candidate_phases:
-        lookup_materials = list(candidate_phases)
     formula = str(lookup_formula).strip() if isinstance(lookup_formula, str) else None
     limit_per_source = int(_to_float(params.get("phase_lookup_limit_per_source")) or 5)
     timeout_s = int(_to_float(params.get("phase_lookup_timeout_s")) or 8)
@@ -234,6 +294,7 @@ def _resolve_phase_lookup_candidates(
             materials_project_max_energy_above_hull=mp_max_energy,
             materials_project_prefer_experimental=mp_prefer_experimental,
             materials_project_candidate_pool_size=mp_candidate_pool_size,
+            materials_project_api_isolate=mp_api_isolate,
         )
     except Exception as exc:  # noqa: BLE001
         return [], [f"B4 phase lookup failed: {exc}"], {"enabled": True, "failed": True}
@@ -590,8 +651,9 @@ def run_diffraction_analysis(
     phase_candidates: list[PhaseCandidate] = []
 
     raw_candidate_phase_params = params.get("candidate_phase_params")
-    allowed_names_raw = params.get("candidate_phases")
-    candidate_phase_names = _as_string_list(allowed_names_raw)
+    candidate_phase_names, lookup_materials, phase_material_provenance = (
+        _resolve_phase_material_inputs(params)
+    )
     allowed_names = (
         {str(item).strip() for item in candidate_phase_names if str(item).strip()}
         if candidate_phase_names
@@ -601,7 +663,7 @@ def run_diffraction_analysis(
         list(raw_candidate_phase_params) if isinstance(raw_candidate_phase_params, list) else []
     )
     phase_lookup_candidates, phase_lookup_warnings, phase_lookup_provenance = (
-        _resolve_phase_lookup_candidates(params, candidate_phases=candidate_phase_names)
+        _resolve_phase_lookup_candidates(params, lookup_materials=lookup_materials)
     )
     if phase_lookup_candidates:
         candidate_phase_params.extend(phase_lookup_candidates)
@@ -673,6 +735,7 @@ def run_diffraction_analysis(
         "indexing_mode": indexing_mode,
         "b4_indexing": b4_provenance,
         "b4_phase_lookup": phase_lookup_provenance,
+        "b4_phase_materials": phase_material_provenance,
         "b3_b4_consistency": consistency_diag,
         "parameters": params,
     }
