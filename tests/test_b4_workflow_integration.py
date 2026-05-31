@@ -102,6 +102,46 @@ def _write_b4_lookup_workflow(path: Path) -> Path:
     return path
 
 
+def _write_b4_unified_lookup_workflow(path: Path) -> Path:
+    path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: b4_unified_lookup_integration",
+                "  steps: [load, assess_quality, calibrate, preprocess, analyze, report]",
+                "  parameters:",
+                "    calibration:",
+                "      method: reference",
+                "      known_d_spacing: 0.4",
+                "      known_d_spacing_unit: nm",
+                "      measured_radius_px: 10",
+                "    preprocessing:",
+                "      recipe: min_max",
+                "      background_method: none",
+                "    diffraction:",
+                "      top_k_peaks: 12",
+                "      min_peak_distance: 3",
+                "      center_exclusion_radius: 4",
+                "      peak_threshold_strategy: relative_max",
+                "      peak_threshold_value: 0.12",
+                "      phase_candidate_materials: [lookup_cubic]",
+                "      phase_lookup_sources: [local_builtin]",
+                "      phase_lookup_limit_per_source: 1",
+                "      phase_lookup_timeout_s: 1",
+                "      indexing_mode: lattice_fit",
+                "      phase_top_n: 1",
+                "      max_hkl: 3",
+                "      d_tolerance_rel: 0.08",
+                "      angle_tolerance_deg: 10.0",
+                "outputs:",
+                "  formats: [json, csv]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def _write_real_diffsims_workflow(path: Path) -> Path:
     path.write_text(
         "\n".join(
@@ -198,6 +238,7 @@ def _write_mp_lookup_diffsims_workflow(path: Path) -> Path:
                 "      phase_lookup_sources: [materials_project_api]",
                 "      phase_lookup_limit_per_source: 1",
                 "      phase_lookup_timeout_s: 1",
+                "      materials_project_api_isolate: true",
                 "      indexing_mode: lattice_fit",
                 "      phase_top_n: 1",
                 "      max_hkl: 3",
@@ -385,6 +426,67 @@ def test_b4_workflow_uses_material_lookup_candidates(
     )
 
 
+def test_b4_workflow_uses_unified_phase_candidate_materials_for_lookup(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_lookup_phase_candidates(**kwargs) -> PhaseLookupResult:
+        calls.append(dict(kwargs))
+        return PhaseLookupResult(
+            candidates=[
+                {
+                    "name": "lookup_cubic",
+                    "formula": "X",
+                    "a": 0.4,
+                    "b": 0.4,
+                    "c": 0.4,
+                    "alpha": 90,
+                    "beta": 90,
+                    "gamma": 90,
+                    "space_group": "Pm-3m",
+                    "source": "test_lookup",
+                    "identifier": "lookup_cubic",
+                }
+            ],
+            warnings=[],
+            provenance={"sources": ["test_lookup"], "material_names": ["lookup_cubic"]},
+        )
+
+    monkeypatch.setattr(
+        "autotem.diffraction.basic.lookup_phase_candidates",
+        fake_lookup_phase_candidates,
+    )
+
+    input_path = tmp_path / "b4_unified_lookup_input.npy"
+    np.save(input_path, _synthetic_cubic_fft_image())
+    workflow_path = _write_b4_unified_lookup_workflow(
+        tmp_path / "b4_unified_lookup_workflow.yaml"
+    )
+    output_dir = tmp_path / "outputs_unified_lookup"
+
+    run_result = TEMAnalysisSkill().run(
+        input_path=input_path,
+        workflow_path=workflow_path,
+        output_dir=output_dir,
+    )
+    report = read_json(Path(run_result["report_path"]), AnalysisReport)
+
+    assert calls
+    assert calls[0]["material_names"] == ["lookup_cubic"]
+    assert report.diffraction is not None
+    assert report.diffraction.phase_candidates[0].name == "lookup_cubic"
+    assert (
+        report.diffraction.provenance["b4_phase_materials"]["source"]
+        == "phase_candidate_materials"
+    )
+    assert (
+        report.diffraction.provenance["b4_phase_materials"]["lookup_materials"]
+        == ["lookup_cubic"]
+    )
+
+
 def test_mp_lookup_candidate_flows_into_diffsims_phase_matching(
     tmp_path: Path,
     monkeypatch,
@@ -496,6 +598,7 @@ def test_mp_lookup_candidate_flows_into_diffsims_phase_matching(
 
     assert lookup_calls
     assert lookup_calls[0]["sources"] == ["materials_project_api"]
+    assert lookup_calls[0]["materials_project_api_isolate"] is True
     assert report.diffraction is not None
     assert report.simulation is not None
     assert report.diffraction.phase_candidates[0].source == "materials_project_api"

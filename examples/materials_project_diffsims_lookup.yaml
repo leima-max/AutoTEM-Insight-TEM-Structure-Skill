@@ -23,10 +23,7 @@ workflow:
       min_peak_distance: 3
       center_exclusion_radius: 4
       peak_threshold_strategy: auto
-      candidate_phases:
-        - mp-149
-      phase_lookup_enabled: true
-      phase_lookup_materials:
+      phase_candidate_materials:
         - mp-149
       # You can also use common names such as "quartz"; AutoTEM resolves common
       # aliases to formulas before querying Materials Project.
@@ -49,7 +46,6 @@ workflow:
       simulation_engine: diffsims
       voltage_kv: 200
       reciprocal_radius_inv_angstrom: 1.5
-      max_candidates: 3
       zone_axis_candidates:
         - [0, 0, 1]
         - [1, 1, 0]
@@ -63,7 +59,6 @@ workflow:
       phase_match_d_tolerance_rel: 0.08
       phase_match_angle_tolerance_deg: 10.0
       phase_match_min_spots: 2
-      phase_match_top_n: 3
       phase_match_previous_score_weight: 0.25
 outputs:
   formats: [json, csv, html]

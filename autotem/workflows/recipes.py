@@ -790,6 +790,16 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
                     "workflow.parameters.diffraction.candidate_phases must be a non-empty "
                     "string list."
                 )
+        if "phase_candidate_materials" in diffraction:
+            _validate_non_empty_string_list(
+                diffraction["phase_candidate_materials"],
+                field_name="phase_candidate_materials",
+            )
+        if "material_phase_candidates" in diffraction:
+            _validate_non_empty_string_list(
+                diffraction["material_phase_candidates"],
+                field_name="material_phase_candidates",
+            )
         _validate_candidate_phase_params(diffraction.get("candidate_phase_params"))
         if "cif_candidate_paths" in diffraction:
             _validate_non_empty_string_list(

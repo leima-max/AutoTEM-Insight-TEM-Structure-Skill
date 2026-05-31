@@ -346,6 +346,93 @@ def test_material_name_alias_resolves_to_formula_for_materials_project_api(
     assert result.candidates[0]["atom_sites"][1]["element"] == "O"
 
 
+def test_formula_case_is_preserved_for_material_name_lookup(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeLattice:
+        a = 5.936
+        b = 5.936
+        c = 5.936
+        alpha = 90.0
+        beta = 90.0
+        gamma = 90.0
+
+    class FakeStructure:
+        lattice = FakeLattice()
+        sites = [
+            types.SimpleNamespace(
+                specie=types.SimpleNamespace(symbol="Pb"),
+                frac_coords=[0.0, 0.0, 0.0],
+                species=None,
+            ),
+            types.SimpleNamespace(
+                specie=types.SimpleNamespace(symbol="S"),
+                frac_coords=[0.5, 0.5, 0.5],
+                species=None,
+            ),
+        ]
+
+        def __iter__(self):
+            return iter(self.sites)
+
+    class FakeDoc:
+        material_id = "mp-pbs"
+        formula_pretty = "PbS"
+        structure = FakeStructure()
+        symmetry = {"symbol": "Fm-3m", "number": 225}
+
+    class FakeSummary:
+        def search(self, **kwargs):
+            calls.append(dict(kwargs))
+            assert kwargs["formula"] == "PbS"
+            return [FakeDoc()]
+
+    class FakeMaterials:
+        summary = FakeSummary()
+
+    class FakeMPRester:
+        def __init__(self, **kwargs):
+            assert kwargs["api_key"] == "secret"
+
+        def __enter__(self):
+            self.materials = FakeMaterials()
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    mp_api_pkg = types.ModuleType("mp_api")
+    mp_api_client = types.ModuleType("mp_api.client")
+    mp_api_client.MPRester = FakeMPRester
+    monkeypatch.setitem(sys.modules, "mp_api", mp_api_pkg)
+    monkeypatch.setitem(sys.modules, "mp_api.client", mp_api_client)
+    monkeypatch.delenv("MP_API_KEY", raising=False)
+
+    config_path = write_materials_project_api_config(
+        "secret",
+        config_path=tmp_path / "mp.json",
+    )
+    result = lookup_phase_candidates(
+        formula=None,
+        elements=None,
+        material_names=["PbS"],
+        sources=["materials_project_api"],
+        limit_per_source=1,
+        timeout_s=1,
+        materials_project_config_path=str(config_path),
+    )
+
+    assert calls
+    assert result.provenance["resolved_formulas"] == ["PbS"]
+    assert result.provenance["resolved_material_queries"] == [
+        {"material": "PbS", "query_type": "formula", "value": "PbS"}
+    ]
+    assert result.candidates[0]["formula"] == "PbS"
+
+
 def test_materials_project_id_can_be_entered_as_material_name(
     monkeypatch,
     tmp_path,
