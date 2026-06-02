@@ -349,12 +349,20 @@ def _zone_axis_payload(axis: tuple[int, int, int] | None) -> list[int] | None:
     return list(axis) if axis is not None else None
 
 
+def _zone_axis_equal(
+    left: tuple[int, int, int] | None,
+    right: tuple[int, int, int] | None,
+) -> bool:
+    return left is not None and right is not None and tuple(left) == tuple(right)
+
+
 def _updated_candidate(
     candidate: PhaseCandidate,
     pattern: SimulatedPattern,
     summary: _MatchSummary,
     *,
     previous_score_weight: float,
+    preserve_candidate_zone_axis: bool = False,
 ) -> PhaseCandidate:
     previous_score = float(candidate.score or 0.0)
     raw_score = float(summary.score)
@@ -399,6 +407,22 @@ def _updated_candidate(
     warnings = list(candidate.warnings)
     if summary.matched_count == 0:
         warnings.append("diffsims phase matching found no spot matches.")
+    if (
+        preserve_candidate_zone_axis
+        and candidate.zone_axis is not None
+        and pattern.zone_axis is not None
+        and not _zone_axis_equal(candidate.zone_axis, pattern.zone_axis)
+    ):
+        warnings.append(
+            "B5 suggested a different zone axis during template matching, "
+            "but the B4 candidate zone axis was preserved."
+        )
+
+    zone_axis = (
+        candidate.zone_axis
+        if preserve_candidate_zone_axis and candidate.zone_axis is not None
+        else pattern.zone_axis or candidate.zone_axis
+    )
 
     return candidate.model_copy(
         update={
@@ -406,7 +430,7 @@ def _updated_candidate(
             "matched_spot_count": summary.matched_count,
             "mean_d_error": mean_d_error,
             "mean_angle_error": mean_angle_error,
-            "zone_axis": pattern.zone_axis or candidate.zone_axis,
+            "zone_axis": zone_axis,
             "warnings": list(dict.fromkeys(warnings)),
         }
     )
@@ -487,6 +511,8 @@ def match_diffsims_patterns_to_diffraction(
     top_n: int = 3,
     previous_score_weight: float = 0.35,
     max_rotation_candidates: int = 64,
+    preserve_candidate_zone_axis: bool = False,
+    preserve_candidate_ranking: bool = False,
 ) -> PhaseMatchingResult:
     """Match diffsims patterns against measured g-vectors and rank phases."""
     warnings: list[str] = []
@@ -578,11 +604,24 @@ def match_diffsims_patterns_to_diffraction(
                 f"diffsims phase matching low support for '{candidate.name}': "
                 f"{summary.matched_count} matched spots."
             )
+        if (
+            preserve_candidate_zone_axis
+            and candidate.zone_axis is not None
+            and pattern.zone_axis is not None
+            and not _zone_axis_equal(candidate.zone_axis, pattern.zone_axis)
+        ):
+            warnings.append(
+                f"B5 suggested a different zone axis "
+                f"{_zone_axis_payload(pattern.zone_axis)} for "
+                f"'{candidate.name}', but preserved B4 zone axis "
+                f"{_zone_axis_payload(candidate.zone_axis)}."
+            )
         updated_candidate = _updated_candidate(
             candidate,
             pattern,
             summary,
             previous_score_weight=previous_score_weight,
+            preserve_candidate_zone_axis=preserve_candidate_zone_axis,
         )
         updated_pattern = _updated_pattern(pattern, summary)
         updated_candidates.append(updated_candidate)
@@ -605,13 +644,32 @@ def match_diffsims_patterns_to_diffraction(
                     "rotation_angle_deg"
                 ),
                 "simulation_rotation_axis": pattern.simulation_parameters.get("rotation_axis"),
+                "inherited_zone_axis": _zone_axis_payload(candidate.zone_axis),
                 "zone_axis": _zone_axis_payload(pattern.zone_axis),
+                "zone_axis_locked": bool(preserve_candidate_zone_axis),
+                "b5_suggested_zone_axis": (
+                    _zone_axis_payload(pattern.zone_axis)
+                    if (
+                        preserve_candidate_zone_axis
+                        and candidate.zone_axis is not None
+                        and pattern.zone_axis is not None
+                        and not _zone_axis_equal(candidate.zone_axis, pattern.zone_axis)
+                    )
+                    else None
+                ),
                 "zone_axis_index": pattern.simulation_parameters.get("zone_axis_index"),
                 "score": summary.score,
             }
         )
 
-    ranked = sorted(updated_candidates, key=lambda item: float(item.score or 0.0), reverse=True)
+    if preserve_candidate_ranking:
+        ranked = list(updated_candidates)
+    else:
+        ranked = sorted(
+            updated_candidates,
+            key=lambda item: float(item.score or 0.0),
+            reverse=True,
+        )
     ranked = ranked[: max(1, int(top_n))]
     best_candidate = ranked[0] if ranked else None
 
@@ -631,6 +689,8 @@ def match_diffsims_patterns_to_diffraction(
             "min_matched_spots": int(min_matched_spots),
             "previous_score_weight": max(0.0, min(1.0, float(previous_score_weight))),
             "max_rotation_candidates": int(max_rotation_candidates),
+            "zone_axis_locked": bool(preserve_candidate_zone_axis),
+            "candidate_ranking_locked": bool(preserve_candidate_ranking),
             "selected_phase": best_candidate.name if best_candidate is not None else None,
             "selected_zone_axis": _zone_axis_payload(best_candidate.zone_axis)
             if best_candidate is not None

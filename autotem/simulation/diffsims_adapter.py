@@ -26,6 +26,32 @@ class DiffsimsSimulationResult:
 
 
 _ELEMENT_RE = re.compile(r"[A-Z][a-z]?")
+_SPACE_GROUP_SYMBOL_ALIASES = {
+    "P1": 1,
+    "P-1": 2,
+    "P2": 3,
+    "P21": 4,
+    "C2": 5,
+    "PM": 6,
+    "PC": 7,
+    "CM": 8,
+    "CC": 9,
+    "P2/M": 10,
+    "P21/M": 11,
+    "C2/M": 12,
+    "P2/C": 13,
+    "P21/C": 14,
+    "PNMA": 62,
+    "PBNM": 62,
+    "P42/MNM": 136,
+    "R-3M": 166,
+    "P63MC": 186,
+    "P63/MMC": 194,
+    "PM-3M": 221,
+    "FM-3M": 225,
+    "FD-3M": 227,
+    "IM-3M": 229,
+}
 
 
 def _first_element(formula: str | None) -> str | None:
@@ -58,13 +84,88 @@ def _phase_space_group_number(candidate: PhaseCandidate) -> int | None:
     lattice = candidate.lattice_parameters
     if not isinstance(lattice, dict):
         return None
-    value = lattice.get("space_group_number")
+    for key in ("space_group_number", "spacegroup_number", "sg_number", "sgno"):
+        value = lattice.get(key)
+        number = _coerce_space_group_number(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _coerce_space_group_number(value: Any) -> int | None:
     if value is None:
         return None
     try:
-        return int(float(value))
+        number = int(float(value))
     except (TypeError, ValueError):
         return None
+    if 1 <= number <= 230:
+        return number
+    return None
+
+
+def _phase_space_group_symbol(candidate: PhaseCandidate) -> str | None:
+    lattice = candidate.lattice_parameters
+    if not isinstance(lattice, dict):
+        return None
+    for key in (
+        "space_group_symbol",
+        "space_group",
+        "spacegroup",
+        "sg",
+        "hm_symbol",
+        "hall_symbol",
+    ):
+        value = lattice.get(key)
+        if value is None:
+            continue
+        symbol = str(value).strip()
+        if symbol and symbol.lower() not in {"none", "null", "nan", "unknown", "?"}:
+            return symbol
+    return None
+
+
+def _normalize_space_group_symbol(symbol: str | None) -> str | None:
+    if symbol is None:
+        return None
+    normalized = (
+        str(symbol)
+        .strip()
+        .replace("_", "")
+        .replace(" ", "")
+        .replace("\t", "")
+        .replace("\u2212", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .upper()
+    )
+    return normalized or None
+
+
+def _phase_space_group_metadata(
+    candidate: PhaseCandidate,
+) -> tuple[int, str | None, str, list[str]]:
+    number = _phase_space_group_number(candidate)
+    symbol = _phase_space_group_symbol(candidate)
+    if number is not None:
+        return number, symbol, "candidate_space_group_number", []
+
+    normalized_symbol = _normalize_space_group_symbol(symbol)
+    if normalized_symbol is not None:
+        number = _SPACE_GROUP_SYMBOL_ALIASES.get(normalized_symbol)
+        if number is not None:
+            return number, symbol, "candidate_space_group_symbol", []
+
+    warnings = [
+        f"diffsims used P1 symmetry fallback for '{candidate.name}' because "
+        "space_group_number was unavailable."
+    ]
+    if symbol:
+        warnings[0] = (
+            f"diffsims used P1 symmetry fallback for '{candidate.name}' because "
+            f"space group symbol '{symbol}' could not be mapped to a number."
+        )
+    return 1, symbol, "p1_fallback", warnings
 
 
 def _phase_atom_sites(candidate: PhaseCandidate) -> list[dict[str, Any]]:
@@ -142,6 +243,48 @@ def _first_available_array(source: Any, names: tuple[str, ...]) -> np.ndarray | 
     return None
 
 
+def _array_from_xyz_tuple(value: Any) -> np.ndarray | None:
+    if not isinstance(value, tuple) or len(value) < 2:
+        return None
+    columns = []
+    for column in value[:3]:
+        array = _array_or_none(column)
+        if array is None:
+            return None
+        columns.append(np.ravel(array))
+    try:
+        stacked = np.column_stack(columns)
+    except ValueError:
+        return None
+    return stacked if stacked.ndim == 2 and stacked.shape[1] >= 2 else None
+
+
+def _extract_reciprocal_coordinates(simulation: Any) -> np.ndarray | None:
+    coordinates = getattr(simulation, "coordinates", None)
+    if coordinates is None:
+        return None
+
+    # diffsims exposes a DiffractingVector object where np.asarray(...) returns
+    # hkl indices, while .data/.xyz contain reciprocal coordinates in 1/Angstrom.
+    for name in ("data", "xyz"):
+        raw = getattr(coordinates, name, None)
+        array = _array_from_xyz_tuple(raw)
+        if array is None:
+            array = _array_or_none(raw)
+        if array is not None and array.ndim == 2 and array.shape[1] >= 2:
+            return array
+
+    for name in ("data", "xyz", "reciprocal_coordinates", "cartesian_coordinates"):
+        raw = getattr(simulation, name, None)
+        array = _array_from_xyz_tuple(raw)
+        if array is None:
+            array = _array_or_none(raw)
+        if array is not None and array.ndim == 2 and array.shape[1] >= 2:
+            return array
+
+    return _array_or_none(coordinates)
+
+
 def _extract_indices(simulation: Any) -> np.ndarray | None:
     coordinates = getattr(simulation, "coordinates", None)
     nested = _first_available_array(coordinates, ("hkl", "indices", "coordinates"))
@@ -180,7 +323,7 @@ def _extract_simulated_spots(
     minimum_g_inv_nm: float,
     max_spots: int,
 ) -> list[SimulatedSpot]:
-    coords = _array_or_none(getattr(simulation, "coordinates", None))
+    coords = _extract_reciprocal_coordinates(simulation)
     if coords is None:
         return []
     if coords.ndim == 1:
@@ -352,7 +495,10 @@ def _build_structure_and_phase(
         for site in raw_sites
     ]
     structure = _make_structure(Structure, atoms=atoms, lattice=lattice)
-    space_group_number = _phase_space_group_number(candidate)
+    space_group_number, space_group_symbol, space_group_source, symmetry_warnings = (
+        _phase_space_group_metadata(candidate)
+    )
+    warnings.extend(symmetry_warnings)
     phase = _make_phase(
         Phase,
         candidate=candidate,
@@ -363,6 +509,8 @@ def _build_structure_and_phase(
         "structure_source": structure_source,
         "atom_site_count": len(raw_sites),
         "space_group_number": space_group_number,
+        "space_group_symbol": space_group_symbol,
+        "space_group_source": space_group_source,
     }
     return structure, phase, provenance, warnings
 

@@ -76,6 +76,7 @@ workflow:
       angle_tolerance_deg: 12.0
     simulation:
       simulation_engine: diffsims
+      diffsims_timeout_s: 30
       reciprocal_radius_inv_angstrom: 1.0
       with_direct_beam: true
       max_excitation_error: 0.01

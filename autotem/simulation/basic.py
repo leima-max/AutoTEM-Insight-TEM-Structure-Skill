@@ -1,8 +1,15 @@
-"""A2 baseline simulation adapters from phase-candidate evidence."""
+"""B5 simulation adapters from phase-candidate evidence."""
 
 from __future__ import annotations
 
-from autotem.core import DiffractionResult, Measurement, SimulatedPattern, SimulationResult
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from autotem.core import DiffractionResult, Measurement, SimulationResult
 from autotem.diffraction.phase_matching import match_diffsims_patterns_to_diffraction
 from autotem.simulation.diffsims_adapter import simulate_diffraction_with_diffsims
 
@@ -54,54 +61,161 @@ def _zone_axis_candidates(raw_axes: object) -> list[tuple[int, int, int]] | None
     return axes or None
 
 
-def _baseline_simulation(diffraction: DiffractionResult) -> SimulationResult:
-    """Create simple simulation placeholders linked to matched phase candidates."""
-    warnings = list(diffraction.warnings)
-    if not diffraction.phase_candidates:
-        warnings.append("No phase candidates available; simulation outputs are empty.")
-        return SimulationResult(
-            confidence=0.2,
-            warnings=warnings,
-            provenance={"method": "a2_baseline_no_phase"},
-        )
+def _diffsims_timeout_s(params: dict[str, object]) -> float | None:
+    raw = params.get("diffsims_timeout_s", params.get("timeout_s"))
+    if raw is None:
+        return None
+    try:
+        timeout = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return timeout if timeout > 0 else None
 
-    patterns: list[SimulatedPattern] = []
-    metrics: list[Measurement] = []
 
-    for candidate in diffraction.phase_candidates:
-        patterns.append(
-            SimulatedPattern(
-                kind="diffraction",
-                structure_id=candidate.identifier or candidate.name,
-                zone_axis=candidate.zone_axis or (0, 0, 1),
-                microscope_parameters={"voltage_kv": 200},
-                simulation_parameters={"engine": "a2_baseline"},
-                score=Measurement(
-                    value=float(candidate.score or 0.0),
-                    unit="confidence",
-                    method="phase_match_score",
-                ),
-            )
-        )
-
-    best = diffraction.phase_candidates[0]
-    if best.mean_d_error is not None:
-        metrics.append(
-            Measurement(
-                value=float(best.mean_d_error.value),
-                unit=best.mean_d_error.unit,
-                method="best_phase_mean_d_error",
-            )
-        )
-
+def _diffsims_fallback_result(
+    diffraction: DiffractionResult,
+    *,
+    warning: str,
+    reason: str,
+    timeout_s: float | None = None,
+) -> SimulationResult:
+    provenance: dict[str, object] = {
+        "method": "diffsims",
+        "adapter": {
+            "adapter": "diffsims",
+            "active": False,
+            "reason": reason,
+        },
+        "phase_matching": {
+            "active": False,
+            "reason": reason,
+        },
+    }
+    if timeout_s is not None:
+        provenance["adapter"]["timeout_s"] = float(timeout_s)  # type: ignore[index]
     return SimulationResult(
-        patterns=patterns,
-        matched_phase_candidates=diffraction.phase_candidates,
-        comparison_metrics=metrics,
-        confidence=max(0.3, min(0.9, float(best.score or 0.0))),
-        warnings=warnings,
-        provenance={"method": "a2_baseline"},
+        matched_phase_candidates=list(diffraction.phase_candidates),
+        confidence=0.2,
+        warnings=[*diffraction.warnings, warning],
+        provenance=provenance,
     )
+
+
+def _tail_text(text: str, *, limit: int = 2000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def _temporary_directory_root() -> str | None:
+    root = os.environ.get("AUTOTEM_TMP_DIR")
+    if root:
+        Path(root).mkdir(parents=True, exist_ok=True)
+        return root
+    if os.name == "nt":
+        windows_root = Path("C:/tmp")
+        try:
+            windows_root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        return str(windows_root)
+    return None
+
+
+def _simulate_diffsims_with_timeout(
+    diffraction: DiffractionResult,
+    *,
+    parameters: dict[str, object] | None = None,
+    timeout_s: float,
+) -> SimulationResult:
+    timeout = max(1.0, float(timeout_s))
+    with tempfile.TemporaryDirectory(
+        prefix="autotem_diffsims_",
+        dir=_temporary_directory_root(),
+        ignore_cleanup_errors=True,
+    ) as tmp_dir:
+        input_path = Path(tmp_dir) / "request.json"
+        output_path = Path(tmp_dir) / "response.json"
+        stdout_path = Path(tmp_dir) / "stdout.txt"
+        stderr_path = Path(tmp_dir) / "stderr.txt"
+        input_path.write_text(
+            json.dumps(
+                {
+                    "diffraction": diffraction.model_dump(mode="json"),
+                    "parameters": dict(parameters or {}),
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        try:
+            with stdout_path.open("w", encoding="utf-8") as stdout_handle:
+                with stderr_path.open("w", encoding="utf-8") as stderr_handle:
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            "-m",
+                            "autotem.simulation.diffsims_worker",
+                            "--input",
+                            str(input_path),
+                            "--output",
+                            str(output_path),
+                        ],
+                        cwd=Path.cwd(),
+                        stdout=stdout_handle,
+                        stderr=stderr_handle,
+                        text=True,
+                        timeout=timeout,
+                        check=False,
+                    )
+        except subprocess.TimeoutExpired:
+            warning = (
+                "B5 diffsims simulation timed out in subprocess "
+                f"after {timeout:.1f}s."
+            )
+            return _diffsims_fallback_result(
+                diffraction,
+                warning=warning,
+                reason="timeout",
+                timeout_s=timeout,
+            )
+        if completed.returncode != 0:
+            stderr = stderr_path.read_text(encoding="utf-8") if stderr_path.exists() else ""
+            stdout = stdout_path.read_text(encoding="utf-8") if stdout_path.exists() else ""
+            detail = _tail_text((stderr or stdout).strip())
+            warning = (
+                "B5 diffsims subprocess failed"
+                + (f": {detail}" if detail else f" with exit code {completed.returncode}")
+            )
+            return _diffsims_fallback_result(
+                diffraction,
+                warning=warning,
+                reason="worker_failed",
+            )
+        if not output_path.exists():
+            warning = "B5 diffsims subprocess exited without writing a result."
+            return _diffsims_fallback_result(
+                diffraction,
+                warning=warning,
+                reason="worker_empty",
+            )
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            error = (
+                str(payload.get("error", "unknown diffsims subprocess error"))
+                if isinstance(payload, dict)
+                else "invalid diffsims subprocess payload"
+            )
+            warning = f"B5 diffsims subprocess failed: {error}"
+            return _diffsims_fallback_result(
+                diffraction,
+                warning=warning,
+                reason="worker_failed",
+            )
+        simulation = SimulationResult.model_validate(payload["simulation"])
+        updated_diffraction = DiffractionResult.model_validate(payload["diffraction"])
+        diffraction.phase_candidates = list(updated_diffraction.phase_candidates)
+        return simulation
 
 
 def simulate_from_diffraction(
@@ -111,10 +225,38 @@ def simulate_from_diffraction(
 ) -> SimulationResult:
     """Simulate diffraction evidence with optional external engines."""
     params = dict(parameters or {})
-    engine = str(params.get("simulation_engine", "baseline")).strip().lower()
+    engine = str(params.get("simulation_engine", "diffsims")).strip().lower()
     if engine != "diffsims":
-        return _baseline_simulation(diffraction)
+        warning = (
+            f"B5 simulation engine '{engine}' is no longer supported; "
+            "use 'diffsims' to generate simulated diffraction spots."
+        )
+        return SimulationResult(
+            matched_phase_candidates=list(diffraction.phase_candidates),
+            confidence=0.0,
+            warnings=[*diffraction.warnings, warning],
+            provenance={
+                "method": "unsupported_simulation_engine",
+                "engine": engine,
+                "adapter": {"active": False, "reason": "unsupported_engine"},
+                "phase_matching": {"active": False, "reason": "unsupported_engine"},
+            },
+        )
+    timeout = _diffsims_timeout_s(params)
+    if timeout is not None:
+        return _simulate_diffsims_with_timeout(
+            diffraction,
+            parameters=params,
+            timeout_s=timeout,
+        )
+    return _simulate_diffsims_in_process(diffraction, params)
 
+
+def _simulate_diffsims_in_process(
+    diffraction: DiffractionResult,
+    params: dict[str, object],
+) -> SimulationResult:
+    """Run the real diffsims adapter in the current process."""
     voltage_kv = float(params.get("voltage_kv", 200.0))
     reciprocal_radius = float(params.get("reciprocal_radius_inv_angstrom", 1.0))
     if params.get("max_candidates") is None:
@@ -184,6 +326,14 @@ def simulate_from_diffraction(
             top_n=int(params.get("phase_match_top_n", max_candidates)),
             previous_score_weight=float(params.get("phase_match_previous_score_weight", 0.35)),
             max_rotation_candidates=int(params.get("phase_match_max_rotation_candidates", 64)),
+            preserve_candidate_zone_axis=_to_bool(
+                params.get("preserve_candidate_zone_axis"),
+                default=False,
+            ),
+            preserve_candidate_ranking=_to_bool(
+                params.get("preserve_candidate_ranking"),
+                default=False,
+            ),
         )
         matched_candidates = match_result.candidates
         matched_patterns = match_result.patterns

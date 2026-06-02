@@ -43,6 +43,7 @@ from autotem.diffraction.phase_lookup import (
 from autotem.io import load_tem_dataset, read_image
 from autotem.preprocessing import SUPPORTED_DENOISE_METHODS, assess_quality, preprocess_dataset
 from autotem.simulation.basic import simulate_from_diffraction
+from autotem.simulation.process_utils import collect_process_queue_payload
 
 # Compatibility patch for streamlit-drawable-canvas on newer Streamlit.
 if not hasattr(st_image, "image_to_url"):
@@ -82,7 +83,7 @@ INDEXING_MODE_LABELS: dict[str, str] = {
 SUPPORTED_BACKGROUND_METHODS = ["none", "gaussian", "rolling_ball"]
 SUPPORTED_FFT_CENTER_MODES = ["auto", "geometric"]
 SUPPORTED_INDEXING_MODES = ["auto", "baseline", "lattice_fit"]
-SUPPORTED_SIMULATION_ENGINES = ["baseline", "diffsims"]
+SUPPORTED_SIMULATION_ENGINES = ["diffsims"]
 SUPPORTED_MP_SORT_MODES = ["stability", "energy_above_hull", "material_id", "none"]
 DEFAULT_PHASE_LOOKUP_SOURCES = [
     "local_builtin",
@@ -206,14 +207,18 @@ _FALLBACK_DEFAULTS: dict[str, Any] = {
     },
     "simulation": {
         "enabled": True,
-        "simulation_engine": "baseline",
+        "simulation_engine": "diffsims",
         "reciprocal_radius_inv_angstrom": 1.0,
         "max_simulated_spots": 128,
         "minimum_simulated_g_inv_nm": 0.001,
         "with_direct_beam": True,
         "max_excitation_error": 0.01,
         "fallback_single_atom": True,
+        "zone_axis_mode": "inherit_b4_locked",
         "zone_axis_candidates": [[0, 0, 1]],
+        "manual_zone_axis": [0, 0, 1],
+        "show_unmatched_simulated_spots": False,
+        "show_match_residual_lines": False,
         "rotation_axis": [0, 0, 1],
         "rotation_angles_deg": [0.0],
         "phase_match_enabled": True,
@@ -1821,11 +1826,14 @@ def _build_peak_rows(
 def _build_phase_rows(phase_candidates: list[PhaseCandidate]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for item in phase_candidates:
+        lattice = item.lattice_parameters if isinstance(item.lattice_parameters, dict) else {}
+        atom_sites = lattice.get("atom_sites") if isinstance(lattice, dict) else None
         rows.append(
             {
                 "name": item.name,
                 "formula": item.formula,
                 "source": item.source,
+                "identifier": item.identifier,
                 "score": item.score,
                 "matched_spot_count": item.matched_spot_count,
                 "zone_axis": item.zone_axis,
@@ -1839,6 +1847,10 @@ def _build_phase_rows(phase_candidates: list[PhaseCandidate]) -> list[dict[str, 
                     if item.mean_angle_error is None or item.mean_angle_error.value is None
                     else item.mean_angle_error.value
                 ),
+                "space_group": lattice.get("space_group"),
+                "space_group_number": lattice.get("space_group_number"),
+                "atom_site_count": len(atom_sites) if isinstance(atom_sites, list) else None,
+                "structure_source": lattice.get("structure_source"),
             }
         )
     return rows
@@ -1882,7 +1894,7 @@ def _run_b5_simulation_with_timeout(
     parameters: dict[str, Any],
     timeout_s: float,
 ) -> tuple[SimulationResult, DiffractionResult, list[str]]:
-    engine = str(parameters.get("simulation_engine", "baseline")).strip().lower()
+    engine = str(parameters.get("simulation_engine", "diffsims")).strip().lower()
     if engine != "diffsims":
         simulation = simulate_from_diffraction(diffraction, parameters=parameters)
         return simulation, diffraction, list(simulation.warnings)
@@ -1895,13 +1907,16 @@ def _run_b5_simulation_with_timeout(
         args=(diffraction.model_dump(mode="json"), dict(parameters), queue),
     )
     process.start()
-    process.join(timeout)
-    if process.is_alive():
-        process.terminate()
-        process.join(2.0)
+    status, payload = collect_process_queue_payload(
+        process,
+        queue,
+        timeout_s=timeout,
+        settle_s=2.0,
+    )
+    if status == "timeout":
         warning = (
             "B5 diffsims simulation timed out in the UI subprocess "
-            f"after {timeout:.1f}s; reduce candidates/zone axes or use baseline mode."
+            f"after {timeout:.1f}s; reduce candidates/zone axes or increase timeout."
         )
         return (
             SimulationResult(
@@ -1917,27 +1932,38 @@ def _run_b5_simulation_with_timeout(
             [warning],
         )
 
-    if queue.empty():
+    if payload is None:
         warning = "B5 diffsims subprocess exited without returning a result."
         return (
             SimulationResult(
                 matched_phase_candidates=list(diffraction.phase_candidates),
                 warnings=[warning],
-                provenance={"method": "diffsims", "ui_worker_empty": True},
+                provenance={
+                    "method": "diffsims",
+                    "ui_worker_empty": True,
+                    "ui_worker_status": status,
+                },
             ),
             diffraction,
             [warning],
         )
 
-    payload = queue.get()
     if not isinstance(payload, dict) or not payload.get("ok"):
-        error = str(payload.get("error", "unknown diffsims subprocess error"))
+        error = (
+            str(payload.get("error", "unknown diffsims subprocess error"))
+            if isinstance(payload, dict)
+            else f"unexpected worker payload status={status}"
+        )
         warning = f"B5 diffsims subprocess failed: {error}"
         return (
             SimulationResult(
                 matched_phase_candidates=list(diffraction.phase_candidates),
                 warnings=[warning],
-                provenance={"method": "diffsims", "ui_worker_failed": True},
+                provenance={
+                    "method": "diffsims",
+                    "ui_worker_failed": True,
+                    "ui_worker_status": status,
+                },
             ),
             diffraction,
             [warning],
@@ -1993,10 +2019,15 @@ def _build_simulated_spot_rows(simulation: SimulationResult | None) -> list[dict
         return []
     rows: list[dict[str, Any]] = []
     for pattern_idx, pattern in enumerate(simulation.patterns):
+        original_pattern_index = pattern.simulation_parameters.get(
+            "display_source_pattern_index",
+            pattern_idx,
+        )
         for spot_idx, spot in enumerate(pattern.spots):
             rows.append(
                 {
                     "pattern_index": pattern_idx,
+                    "source_pattern_index": original_pattern_index,
                     "structure_id": pattern.structure_id,
                     "zone_axis": pattern.zone_axis,
                     "rotation_angle_deg": pattern.simulation_parameters.get(
@@ -2013,6 +2044,118 @@ def _build_simulated_spot_rows(simulation: SimulationResult | None) -> list[dict
                 }
             )
     return rows
+
+
+def _zone_axis_payload(axis: Any) -> list[int] | None:
+    parsed = _zone_axis_tuple(axis)
+    return list(parsed) if parsed is not None else None
+
+
+def _zone_axis_equal(left: Any, right: Any) -> bool:
+    parsed_left = _zone_axis_tuple(left)
+    parsed_right = _zone_axis_tuple(right)
+    return parsed_left is not None and parsed_left == parsed_right
+
+
+def _pattern_matches_phase_key(pattern: SimulatedPattern, key: str) -> bool:
+    if not key:
+        return True
+    values = [pattern.structure_id]
+    for name in ("phase_name", "candidate_name", "candidate_identifier"):
+        value = pattern.simulation_parameters.get(name)
+        if value is not None:
+            values.append(str(value))
+    return any(str(value).strip().casefold() == key for value in values)
+
+
+def _filter_b5_simulation_for_zone_axis(
+    simulation: SimulationResult,
+    *,
+    zone_axis_mode: str,
+) -> SimulationResult:
+    mode = str(zone_axis_mode or "auto_matched").strip().lower()
+    if mode == "scan_all":
+        return simulation
+    if not simulation.patterns:
+        return simulation
+
+    phase_matching = _as_mapping(simulation.provenance.get("phase_matching", {}))
+    selected_axis = _zone_axis_payload(phase_matching.get("selected_zone_axis"))
+    selected_phase = str(phase_matching.get("selected_phase") or "").strip().casefold()
+    per_phase = phase_matching.get("per_phase", [])
+    selected_indices: list[int] = []
+
+    if isinstance(per_phase, list):
+        for row in per_phase:
+            if not isinstance(row, dict):
+                continue
+            row_phase = str(row.get("phase_name") or "").strip().casefold()
+            if selected_phase and row_phase and row_phase != selected_phase:
+                continue
+            idx = row.get("best_pattern_index")
+            if isinstance(idx, int) and 0 <= idx < len(simulation.patterns):
+                selected_indices.append(idx)
+                if selected_axis is None:
+                    selected_axis = _zone_axis_payload(row.get("zone_axis"))
+
+    if selected_axis is not None:
+        for idx, pattern in enumerate(simulation.patterns):
+            if not _zone_axis_equal(pattern.zone_axis, selected_axis):
+                continue
+            if not _pattern_matches_phase_key(pattern, selected_phase):
+                continue
+            selected_indices.append(idx)
+
+    if not selected_indices:
+        for idx, pattern in enumerate(simulation.patterns):
+            if _as_mapping(pattern.simulation_parameters.get("phase_match", {})):
+                selected_indices.append(idx)
+                selected_axis = _zone_axis_payload(pattern.zone_axis)
+                break
+
+    if not selected_indices:
+        return simulation
+
+    unique_indices: list[int] = []
+    seen: set[int] = set()
+    for idx in selected_indices:
+        if idx in seen:
+            continue
+        seen.add(idx)
+        unique_indices.append(idx)
+
+    filtered_patterns = []
+    for idx in unique_indices:
+        pattern = simulation.patterns[idx]
+        filtered_patterns.append(
+            pattern.model_copy(
+                update={
+                    "simulation_parameters": {
+                        **pattern.simulation_parameters,
+                        "display_source_pattern_index": idx,
+                    }
+                }
+            )
+        )
+
+    return simulation.model_copy(
+        update={
+            "patterns": filtered_patterns,
+            "provenance": {
+                **simulation.provenance,
+                "display_filter": {
+                    "mode": mode,
+                    "source_pattern_count": len(simulation.patterns),
+                    "display_pattern_count": len(filtered_patterns),
+                    "selected_zone_axis": selected_axis,
+                    "selected_phase": (
+                        phase_matching.get("selected_phase") if phase_matching else None
+                    ),
+                    "kept_source_pattern_indices": unique_indices,
+                },
+            },
+        }
+    )
 
 
 def _best_simulation_pattern(simulation: SimulationResult | None) -> SimulatedPattern | None:
@@ -2036,9 +2179,263 @@ def _best_simulation_pattern(simulation: SimulationResult | None) -> SimulatedPa
     return simulation.patterns[0]
 
 
+def _b5_pattern_title(pattern: SimulatedPattern, phase_matching: dict[str, Any]) -> str:
+    phase_name = str(phase_matching.get("selected_phase") or pattern.structure_id or "").strip()
+    axis = _zone_axis_payload(pattern.zone_axis)
+    axis_text = "" if axis is None else f" [{axis[0]} {axis[1]} {axis[2]}]"
+    return f"Simulated Diffraction: {phase_name or 'B5 candidate'}{axis_text}"
+
+
+def _b5_hkl_label(spot: Any) -> str:
+    values = (getattr(spot, "h", None), getattr(spot, "k", None), getattr(spot, "l", None))
+    if any(value is None for value in values):
+        return ""
+    return "(" + "".join(str(int(value)) for value in values) + ")"
+
+
+def _b5_spot_d_spacing(spot: Any, gx: float, gy: float) -> float | None:
+    d_value = _measurement_value(getattr(spot, "d_spacing", None))
+    if d_value is not None and d_value > 0:
+        return float(d_value)
+    magnitude = _measurement_value(getattr(spot, "magnitude", None))
+    if magnitude is None:
+        magnitude = float(np.hypot(gx, gy))
+    if magnitude <= 1e-12:
+        return None
+    return float(1.0 / magnitude)
+
+
+def _b5_simulated_spots_xy(
+    pattern: SimulatedPattern,
+    *,
+    rotation_deg: float = 0.0,
+) -> list[dict[str, Any]]:
+    theta = np.deg2rad(float(rotation_deg))
+    cr = float(np.cos(theta))
+    sr = float(np.sin(theta))
+    rows: list[dict[str, Any]] = []
+    for idx, spot in enumerate(pattern.spots):
+        gx = _measurement_value(spot.gx)
+        gy = _measurement_value(spot.gy)
+        if gx is None or gy is None:
+            continue
+        gx_rot = float(gx) * cr - float(gy) * sr
+        gy_rot = float(gx) * sr + float(gy) * cr
+        d_spacing = _b5_spot_d_spacing(spot, gx_rot, gy_rot)
+        rows.append(
+            {
+                "index": idx,
+                "gx": gx_rot,
+                "gy": gy_rot,
+                "magnitude": float(np.hypot(gx_rot, gy_rot)),
+                "intensity": (
+                    None
+                    if getattr(spot, "intensity", None) is None
+                    else float(spot.intensity)
+                ),
+                "h": getattr(spot, "h", None),
+                "k": getattr(spot, "k", None),
+                "l": getattr(spot, "l", None),
+                "label": _b5_hkl_label(spot),
+                "d_spacing": d_spacing,
+            }
+        )
+    return rows
+
+
+def _b5_spot_sizes(rows: list[dict[str, Any]], *, base: float = 28.0) -> np.ndarray:
+    intensities = np.asarray(
+        [
+            1.0 if row.get("intensity") is None else max(0.0, float(row["intensity"]))
+            for row in rows
+        ],
+        dtype=float,
+    )
+    if intensities.size == 0:
+        return np.asarray([], dtype=float)
+    max_intensity = float(np.nanmax(intensities))
+    if not np.isfinite(max_intensity) or max_intensity <= 0:
+        return np.full(intensities.shape, base, dtype=float)
+    scaled = np.sqrt(intensities / max_intensity)
+    return base + 26.0 * scaled
+
+
+def _b5_matched_simulated_indices(phase_match: dict[str, Any]) -> set[int]:
+    pairs = phase_match.get("matched_pairs", [])
+    matched: set[int] = set()
+    if not isinstance(pairs, list):
+        return matched
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            continue
+        s_idx = pair.get("simulated_spot_index")
+        if isinstance(s_idx, int):
+            matched.add(s_idx)
+    return matched
+
+
+def _b5_row_intensity(row: dict[str, Any]) -> float:
+    value = row.get("intensity")
+    if value is None:
+        return 1.0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if np.isfinite(number) else 0.0
+
+
+def _b5_row_hkl_order(row: dict[str, Any]) -> int | None:
+    values = []
+    for key in ("h", "k", "l"):
+        value = row.get(key)
+        if value is None:
+            return None
+        try:
+            values.append(abs(int(value)))
+        except (TypeError, ValueError):
+            return None
+    return max(values) if values else None
+
+
+def _b5_display_rows(
+    rows: list[dict[str, Any]],
+    phase_match: dict[str, Any],
+    *,
+    max_points: int = 96,
+    max_hkl_order: int = 12,
+) -> list[dict[str, Any]]:
+    if len(rows) <= max_points:
+        return rows
+    matched = _b5_matched_simulated_indices(phase_match)
+    filtered = [
+        row
+        for row in rows
+        if int(row.get("index", -1)) in matched
+        or (_b5_row_hkl_order(row) is not None and _b5_row_hkl_order(row) <= max_hkl_order)
+    ]
+    if len(filtered) < min(max_points, max(24, len(matched))):
+        filtered = rows
+    ranked = sorted(
+        filtered,
+        key=lambda row: (
+            int(row.get("index", -1)) not in matched,
+            -_b5_row_intensity(row),
+            float(row.get("magnitude") or np.hypot(row["gx"], row["gy"])),
+        ),
+    )
+    selected = ranked[:max_points]
+    return sorted(selected, key=lambda row: int(row.get("index", 0)))
+
+
+def _b5_label_indices(
+    rows: list[dict[str, Any]],
+    phase_match: dict[str, Any],
+    *,
+    max_labels: int = 18,
+) -> set[int]:
+    matched = _b5_matched_simulated_indices(phase_match)
+    ranked = sorted(
+        rows,
+        key=lambda row: (
+            int(row.get("index", -1)) not in matched,
+            -_b5_row_intensity(row),
+            float(row.get("magnitude") or np.hypot(row["gx"], row["gy"])),
+        ),
+    )
+    return {int(row["index"]) for row in ranked[:max(0, int(max_labels))]}
+
+
+def _style_b5_reciprocal_axes(ax: Any, points: np.ndarray, title: str) -> None:
+    limit = 1.0
+    if points.size:
+        max_abs = float(np.nanmax(np.abs(points)))
+        if np.isfinite(max_abs):
+            limit = max(1.0, max_abs * 1.12)
+    ax.set_xlim(-limit, limit)
+    ax.set_ylim(-limit, limit)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("gx (1/nm)")
+    ax.set_ylabel("gy (1/nm)")
+    ax.set_title(title, fontsize=13, pad=10)
+    ax.grid(True, color="#d6dbe3", linewidth=0.7, alpha=0.55)
+    ax.axhline(0.0, color="#9aa4b2", linewidth=0.75, alpha=0.55)
+    ax.axvline(0.0, color="#9aa4b2", linewidth=0.75, alpha=0.55)
+    ax.tick_params(colors="#1f2937")
+    for spine in ax.spines.values():
+        spine.set_color("#1f2937")
+        spine.set_linewidth(0.8)
+
+
+def _plot_b5_simulated_pattern(simulation: SimulationResult | None) -> Any | None:
+    pattern = _best_simulation_pattern(simulation)
+    if pattern is None or not pattern.spots:
+        return None
+    phase_matching = (
+        {}
+        if simulation is None
+        else _as_mapping(simulation.provenance.get("phase_matching", {}))
+    )
+    phase_match = _as_mapping(pattern.simulation_parameters.get("phase_match", {}))
+    rotation_deg = _num(phase_match.get("rotation_deg"), 0.0)
+    rows = _b5_simulated_spots_xy(pattern, rotation_deg=float(rotation_deg))
+    if not rows:
+        return None
+
+    display_rows = _b5_display_rows(rows, phase_match)
+    xy = np.asarray([(row["gx"], row["gy"]) for row in display_rows], dtype=float)
+    fig, ax = plt.subplots(figsize=(6.7, 6.7), dpi=150)
+    ax.scatter(
+        xy[:, 0],
+        xy[:, 1],
+        s=_b5_spot_sizes(display_rows),
+        c="#ff8a3d",
+        edgecolors="white",
+        linewidths=0.6,
+        alpha=0.92,
+    )
+
+    label_indices = _b5_label_indices(display_rows, phase_match)
+    for row in display_rows:
+        if int(row["index"]) not in label_indices:
+            continue
+        label = str(row.get("label", ""))
+        d_spacing = row.get("d_spacing")
+        if not label and d_spacing is None:
+            continue
+        label_text = label
+        if d_spacing is not None:
+            label_text = f"{label}\n{float(d_spacing):.3f}" if label else f"{float(d_spacing):.3f}"
+        ax.text(
+            float(row["gx"]),
+            float(row["gy"]),
+            label_text,
+            fontsize=5.5,
+            ha="center",
+            va="bottom",
+            color="#111827",
+        )
+
+    _style_b5_reciprocal_axes(
+        ax,
+        xy,
+        (
+            _b5_pattern_title(pattern, phase_matching)
+            if len(display_rows) == len(rows)
+            else f"{_b5_pattern_title(pattern, phase_matching)} "
+            f"(showing {len(display_rows)}/{len(rows)} spots)"
+        ),
+    )
+    fig.tight_layout()
+    return fig
+
+
 def _plot_b5_simulation_overlay(
     diffraction: DiffractionResult,
     simulation: SimulationResult | None,
+    *,
+    show_unmatched_simulated_spots: bool = False,
+    show_match_residual_lines: bool = False,
 ) -> Any | None:
     pattern = _best_simulation_pattern(simulation)
     if pattern is None or not pattern.spots or not diffraction.g_vectors:
@@ -2046,9 +2443,6 @@ def _plot_b5_simulation_overlay(
 
     phase_match = _as_mapping(pattern.simulation_parameters.get("phase_match", {}))
     rotation_deg = _num(phase_match.get("rotation_deg"), 0.0)
-    theta = np.deg2rad(float(rotation_deg))
-    cr = float(np.cos(theta))
-    sr = float(np.sin(theta))
 
     measured: dict[int, tuple[float, float]] = {}
     for idx, g_vector in enumerate(diffraction.g_vectors):
@@ -2057,41 +2451,66 @@ def _plot_b5_simulation_overlay(
         if gx is not None and gy is not None:
             measured[idx] = (float(gx), float(gy))
 
-    simulated: dict[int, tuple[float, float]] = {}
-    for idx, spot in enumerate(pattern.spots):
-        gx = _measurement_value(spot.gx)
-        gy = _measurement_value(spot.gy)
-        if gx is None or gy is None:
-            continue
-        simulated[idx] = (float(gx) * cr - float(gy) * sr, float(gx) * sr + float(gy) * cr)
+    rows = _b5_simulated_spots_xy(pattern, rotation_deg=float(rotation_deg))
+    simulated = {int(row["index"]): (float(row["gx"]), float(row["gy"])) for row in rows}
 
-    if not measured or not simulated:
+    pairs = phase_match.get("matched_pairs", [])
+    matched_simulated_indices: set[int] = set()
+    if isinstance(pairs, list):
+        for pair in pairs:
+            if not isinstance(pair, dict):
+                continue
+            s_idx = pair.get("simulated_spot_index")
+            if isinstance(s_idx, int):
+                matched_simulated_indices.add(s_idx)
+
+    visible_simulated = simulated
+    if matched_simulated_indices and not show_unmatched_simulated_spots:
+        visible_simulated = {
+            idx: xy for idx, xy in simulated.items() if idx in matched_simulated_indices
+        }
+
+    if not measured or not visible_simulated:
         return None
 
-    fig, ax = plt.subplots(figsize=(6, 6), dpi=160)
-    ax.axhline(0.0, color="0.7", linewidth=0.6)
-    ax.axvline(0.0, color="0.7", linewidth=0.6)
+    fig, ax = plt.subplots(figsize=(6.7, 6.7), dpi=150)
     measured_xy = np.asarray(list(measured.values()), dtype=float)
-    simulated_xy = np.asarray(list(simulated.values()), dtype=float)
+    visible_simulated_xy = np.asarray(list(visible_simulated.values()), dtype=float)
     ax.scatter(
         measured_xy[:, 0],
         measured_xy[:, 1],
-        s=40,
-        facecolors="none",
-        edgecolors="#1f77b4",
-        linewidths=1.3,
-        label="measured",
-    )
-    ax.scatter(
-        simulated_xy[:, 0],
-        simulated_xy[:, 1],
         s=36,
-        marker="x",
-        c="#d64b3a",
-        linewidths=1.3,
-        label="simulated",
+        c="#2f80c2",
+        edgecolors="white",
+        linewidths=0.5,
+        alpha=0.82,
+        label="Experimental",
     )
-    pairs = phase_match.get("matched_pairs", [])
+    if show_unmatched_simulated_spots and matched_simulated_indices:
+        unmatched = {
+            idx: xy for idx, xy in simulated.items() if idx not in matched_simulated_indices
+        }
+        if unmatched:
+            unmatched_xy = np.asarray(list(unmatched.values()), dtype=float)
+            ax.scatter(
+                unmatched_xy[:, 0],
+                unmatched_xy[:, 1],
+                s=24,
+                c="#ff8a3d",
+                edgecolors="none",
+                alpha=0.22,
+                label="Simulated unmatched",
+            )
+    ax.scatter(
+        visible_simulated_xy[:, 0],
+        visible_simulated_xy[:, 1],
+        s=30,
+        c="#ff8a3d",
+        edgecolors="white",
+        linewidths=0.45,
+        alpha=0.84,
+        label="Simulated",
+    )
     if isinstance(pairs, list):
         for pair in pairs:
             if not isinstance(pair, dict):
@@ -2103,16 +2522,29 @@ def _plot_b5_simulation_overlay(
             if m_idx in measured and s_idx in simulated:
                 mx, my = measured[m_idx]
                 sx, sy = simulated[s_idx]
-                ax.plot([mx, sx], [my, sy], color="0.35", linewidth=0.8, alpha=0.55)
-    stacked = np.vstack([measured_xy, simulated_xy])
-    limit = max(1.0, float(np.nanmax(np.abs(stacked))) * 1.15)
-    ax.set_xlim(-limit, limit)
-    ax.set_ylim(-limit, limit)
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel("gx (1/nm)")
-    ax.set_ylabel("gy (1/nm)")
-    ax.set_title("B5 measured vs simulated diffraction")
-    ax.legend(loc="upper right")
+                if show_match_residual_lines:
+                    ax.plot(
+                        [mx, sx],
+                        [my, sy],
+                        color="#64748b",
+                        linewidth=0.75,
+                        alpha=0.45,
+                    )
+                spot = pattern.spots[s_idx] if 0 <= s_idx < len(pattern.spots) else None
+                label = _b5_hkl_label(spot) if spot is not None else ""
+                if label:
+                    ax.text(
+                        sx,
+                        sy,
+                        label,
+                        fontsize=5.3,
+                        ha="center",
+                        va="bottom",
+                        color="#111827",
+                    )
+    stacked = np.vstack([measured_xy, visible_simulated_xy])
+    _style_b5_reciprocal_axes(ax, stacked, "Experimental vs Simulated Overlay")
+    ax.legend(loc="upper right", fontsize=8, frameon=True)
     fig.tight_layout()
     return fig
 
@@ -3056,19 +3488,18 @@ def main() -> None:
             index=SUPPORTED_SIMULATION_ENGINES.index(
                 _choice(
                     SUPPORTED_SIMULATION_ENGINES,
-                    sim_defaults.get("simulation_engine", "baseline"),
-                    "baseline",
+                    sim_defaults.get("simulation_engine", "diffsims"),
+                    "diffsims",
                 )
             ),
             disabled=not b5_enabled,
             help=(
-                "Use baseline for quick UI debugging; diffsims runs in a "
-                "timeout-limited subprocess."
+                "B5 simulated diffraction uses diffsims in a timeout-limited subprocess."
             ),
         )
         st.caption(
             "B5 uses the current active peak set, B1 voltage, B3/B4 phase candidates, "
-            "and B4 d/angle tolerances."
+            "B4 d/angle tolerances, and by default locks to each candidate's B4 zone axis."
         )
         b5_auto_rerun = st.checkbox(
             "Auto rerun B5 on parameter change",
@@ -3122,6 +3553,42 @@ def main() -> None:
             value=bool(sim_defaults.get("fallback_single_atom", True)),
             disabled=not b5_enabled,
         )
+        zone_axis_mode_options = [
+            "inherit_b4_locked",
+            "manual_fixed",
+            "auto_matched",
+            "scan_all",
+        ]
+        zone_axis_mode_labels = {
+            "inherit_b4_locked": "Inherit B4 zone axis (locked)",
+            "manual_fixed": "Manual fixed zone axis",
+            "auto_matched": "Debug: rescan and show best axis",
+            "scan_all": "Debug: scan/show all axes",
+        }
+        zone_axis_mode = st.selectbox(
+            "zone_axis_mode",
+            options=zone_axis_mode_options,
+            index=zone_axis_mode_options.index(
+                _choice(
+                    zone_axis_mode_options,
+                    sim_defaults.get("zone_axis_mode", "inherit_b4_locked"),
+                    "inherit_b4_locked",
+                )
+            ),
+            format_func=lambda value: zone_axis_mode_labels.get(str(value), str(value)),
+            disabled=not b5_enabled,
+            help=(
+                "Locked mode simulates each phase candidate using the B4 zone axis. "
+                "Debug modes can rescan candidate axes and should not be used as the "
+                "default production interpretation."
+            ),
+        )
+        manual_zone_axis_text = st.text_input(
+            "manual_zone_axis JSON",
+            value=json.dumps(sim_defaults.get("manual_zone_axis", [0, 0, 1])),
+            disabled=not b5_enabled or zone_axis_mode != "manual_fixed",
+            help="Single [h,k,l] zone axis used when zone_axis_mode is manual_fixed.",
+        )
         zone_axis_text = st.text_area(
             "zone_axis_candidates JSON",
             value=json.dumps(
@@ -3129,7 +3596,24 @@ def main() -> None:
                 ensure_ascii=False,
             ),
             height=80,
+            disabled=not b5_enabled
+            or zone_axis_mode in {"inherit_b4_locked", "manual_fixed"},
+            help="Candidate axes scanned only in debug rescan modes.",
+        )
+        show_unmatched_simulated_spots = st.checkbox(
+            "show_unmatched_simulated_spots",
+            value=bool(sim_defaults.get("show_unmatched_simulated_spots", False)),
             disabled=not b5_enabled,
+            help="Show all simulated spots in the overlay; matched spots are always shown.",
+        )
+        show_match_residual_lines = st.checkbox(
+            "show_match_residual_lines",
+            value=bool(sim_defaults.get("show_match_residual_lines", False)),
+            disabled=not b5_enabled,
+            help=(
+                "Draw experimental-to-simulated match residual lines in the overlay. "
+                "Off by default because Friedel-pair matches can cross the center."
+            ),
         )
         rotation_axis_text = st.text_input(
             "rotation_axis JSON",
@@ -3380,6 +3864,17 @@ def main() -> None:
     )
     phase_lookup_elements = _comma_list(phase_lookup_elements_text)
     zone_axis_candidates, zone_axis_warnings = _parse_zone_axis_candidates(zone_axis_text)
+    manual_zone_axis_candidates, manual_zone_axis_warnings = _parse_zone_axis_candidates(
+        manual_zone_axis_text
+    )
+    manual_zone_axis = manual_zone_axis_candidates[0]
+    zone_axis_mode_value = str(zone_axis_mode)
+    if zone_axis_mode_value == "inherit_b4_locked":
+        effective_zone_axis_candidates = None
+    elif zone_axis_mode_value == "manual_fixed":
+        effective_zone_axis_candidates = [manual_zone_axis]
+    else:
+        effective_zone_axis_candidates = list(zone_axis_candidates)
     rotation_axis_values, rotation_axis_warnings = _parse_float_vector(
         rotation_axis_text,
         [0.0, 0.0, 1.0],
@@ -3461,7 +3956,16 @@ def main() -> None:
         "with_direct_beam": bool(sim_with_direct_beam),
         "max_excitation_error": float(sim_max_excitation_error),
         "fallback_single_atom": bool(sim_fallback_single_atom),
-        "zone_axis_candidates": [list(axis) for axis in zone_axis_candidates],
+        "zone_axis_mode": zone_axis_mode_value,
+        "zone_axis_candidates": (
+            None
+            if effective_zone_axis_candidates is None
+            else [list(axis) for axis in effective_zone_axis_candidates]
+        ),
+        "zone_axis_scan_candidates": [list(axis) for axis in zone_axis_candidates],
+        "manual_zone_axis": list(manual_zone_axis),
+        "preserve_candidate_zone_axis": zone_axis_mode_value == "inherit_b4_locked",
+        "preserve_candidate_ranking": zone_axis_mode_value == "inherit_b4_locked",
         "rotation_axis": [float(item) for item in rotation_axis_values],
         "rotation_angles_deg": [float(item) for item in rotation_angles],
         "phase_match_enabled": bool(phase_match_enabled),
@@ -4695,13 +5199,11 @@ def main() -> None:
         if b5_enabled:
             st.caption(
                 f"B5 source: `{b5_source_mode}` | engine: `{simulation_engine}` | "
-                f"cached: `{b5_cached}`"
+                f"zone axis mode: `{zone_axis_mode}` | cached: `{b5_cached}`"
             )
         else:
             st.caption("B5 simulation is disabled in the sidebar.")
-    should_auto_run_b5 = bool(b5_enabled) and (
-        bool(b5_auto_rerun) or str(simulation_engine) == "baseline"
-    )
+    should_auto_run_b5 = bool(b5_enabled) and bool(b5_auto_rerun)
     need_b5_run = bool(b5_enabled) and (
         b5_run_clicked or (should_auto_run_b5 and not b5_cached)
     )
@@ -4713,6 +5215,10 @@ def main() -> None:
                     parameters=b5_params,
                     timeout_s=float(b5_timeout_s),
                 )
+            )
+            simulation_result = _filter_b5_simulation_for_zone_axis(
+                simulation_result,
+                zone_axis_mode=str(zone_axis_mode),
             )
         st.session_state["b1b5_simulation_cache"] = {
             "signature": b5_signature,
@@ -4806,14 +5312,50 @@ def main() -> None:
                 "Adapter active",
                 str(adapter.get("active", "")),
             )
+            if bool(phase_matching.get("zone_axis_locked")):
+                st.success(
+                    "B5 zone axis is locked to the B4 phase-candidate zone axis."
+                )
+            if bool(phase_matching.get("candidate_ranking_locked")):
+                st.success(
+                    "B5 keeps the B4 phase-candidate ranking and only adds simulation "
+                    "validation metrics."
+                )
+            elif str(b5_params.get("zone_axis_mode")) in {"auto_matched", "scan_all"}:
+                st.warning(
+                    "Debug zone-axis rescan is active; B5 may differ from the B4 "
+                    "phase-candidate zone axis."
+                )
+            suggested_axes = []
+            per_phase = phase_matching.get("per_phase", [])
+            if isinstance(per_phase, list):
+                for row in per_phase:
+                    if not isinstance(row, dict):
+                        continue
+                    suggested_axis = row.get("b5_suggested_zone_axis")
+                    if suggested_axis:
+                        suggested_axes.append(suggested_axis)
+            if suggested_axes:
+                st.warning(
+                    "B5 suggested different zone axes during matching, but the "
+                    f"B4 axes were preserved: {suggested_axes}"
+                )
+
+            simulated_fig_b5 = _plot_b5_simulated_pattern(b5_simulation)
+            if simulated_fig_b5 is not None:
+                st.subheader("Simulated Diffraction Pattern")
+                st.pyplot(simulated_fig_b5, clear_figure=True)
 
             overlay_fig_b5 = _plot_b5_simulation_overlay(
                 b5_diffraction_used
                 if isinstance(b5_diffraction_used, DiffractionResult)
                 else b5_source_diffraction,
                 b5_simulation,
+                show_unmatched_simulated_spots=bool(show_unmatched_simulated_spots),
+                show_match_residual_lines=bool(show_match_residual_lines),
             )
             if overlay_fig_b5 is not None:
+                st.subheader("Experimental vs Simulated Overlay")
                 st.pyplot(overlay_fig_b5, clear_figure=True)
             else:
                 st.info("No B5 reciprocal-space overlay is available for this result.")
@@ -4826,6 +5368,15 @@ def main() -> None:
                 st.info("No B5 matched phase candidates recorded.")
 
             st.subheader("Simulated Spots")
+            display_filter = _as_mapping(b5_simulation.provenance.get("display_filter", {}))
+            if display_filter:
+                st.caption(
+                    "Displayed patterns: "
+                    f"{display_filter.get('display_pattern_count')} of "
+                    f"{display_filter.get('source_pattern_count')} | "
+                    f"mode: `{display_filter.get('mode')}` | "
+                    f"zone axis: `{display_filter.get('selected_zone_axis')}`"
+                )
             spot_rows = _build_simulated_spot_rows(b5_simulation)
             if spot_rows:
                 st.dataframe(spot_rows, use_container_width=True, height=260)
@@ -4837,6 +5388,12 @@ def main() -> None:
                 {
                     "source_mode": b5_source_mode,
                     "parameters": b5_params,
+                    "display": {
+                        "show_unmatched_simulated_spots": bool(
+                            show_unmatched_simulated_spots
+                        ),
+                        "show_match_residual_lines": bool(show_match_residual_lines),
+                    },
                     "phase_matching": phase_matching,
                     "adapter": adapter,
                     "warnings": b5_run_warnings,
@@ -4983,6 +5540,7 @@ def main() -> None:
         warnings = []
         warnings.extend(list(candidate_phase_warnings))
         warnings.extend(list(zone_axis_warnings))
+        warnings.extend(list(manual_zone_axis_warnings))
         warnings.extend(list(rotation_axis_warnings))
         warnings.extend(list(rotation_angle_warnings))
         warnings.extend(list(manual_table_parse_warnings))

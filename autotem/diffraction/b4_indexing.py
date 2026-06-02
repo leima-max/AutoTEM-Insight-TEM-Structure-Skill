@@ -217,6 +217,13 @@ def _parse_candidate_phase_params(
                 metadata={
                     "materials_project": item.get("materials_project"),
                     "cif_url": item.get("cif_url"),
+                    "structure_source": item.get("structure_source"),
+                    "mp_rank": item.get("mp_rank"),
+                    "mp_energy_above_hull": item.get("mp_energy_above_hull"),
+                    "mp_is_stable": item.get("mp_is_stable"),
+                    "mp_theoretical": item.get("mp_theoretical"),
+                    "mp_deprecated": item.get("mp_deprecated"),
+                    "mp_site_count": item.get("mp_site_count"),
                 },
             )
         except ValueError as exc:

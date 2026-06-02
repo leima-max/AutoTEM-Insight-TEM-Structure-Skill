@@ -16,7 +16,10 @@ from autotem.core import (
     SimulatedSpot,
 )
 from autotem.simulation.basic import simulate_from_diffraction
-from autotem.simulation.diffsims_adapter import simulate_diffraction_with_diffsims
+from autotem.simulation.diffsims_adapter import (
+    _extract_simulated_spots,
+    simulate_diffraction_with_diffsims,
+)
 from autotem.simulation.pymatgen_adapter import load_candidate_phase_from_cif
 
 
@@ -161,6 +164,7 @@ def test_diffsims_adapter_runs_with_fake_diffsims_modules(monkeypatch) -> None:
             "alpha": 90,
             "beta": 90,
             "gamma": 90,
+            "space_group": "P1",
             "atom_sites": [
                 {"element": "Si", "abc": [0.0, 0.0, 0.0], "occupancy": 1.0}
             ],
@@ -183,6 +187,137 @@ def test_diffsims_adapter_runs_with_fake_diffsims_modules(monkeypatch) -> None:
     assert result.patterns[0].spots[0].magnitude is not None
     assert result.patterns[0].spots[0].magnitude.value == 10.0
     assert result.provenance["active"] is True
+
+
+def test_diffsims_adapter_maps_space_group_symbol_when_number_is_missing(
+    monkeypatch,
+) -> None:
+    received_space_groups: list[int | None] = []
+
+    class FakeAtom:
+        def __init__(self, element: str, xyz: list[float]) -> None:
+            self.element = element
+            self.xyz = xyz
+
+    class FakeLattice:
+        def __init__(self, *args: float) -> None:
+            self.args = args
+
+    class FakeStructure:
+        def __init__(self, *, atoms: list[FakeAtom], lattice: FakeLattice) -> None:
+            self.atoms = atoms
+            self.lattice = lattice
+
+    class FakePhase:
+        def __init__(
+            self,
+            *,
+            name: str,
+            structure: FakeStructure,
+            space_group: int | None = None,
+        ) -> None:
+            self.name = name
+            self.structure = structure
+            self.space_group = space_group
+            received_space_groups.append(space_group)
+
+    class FakeSimulation:
+        coordinates = [(0.0, 0.0), (1.0, 0.0)]
+        intensities = [100.0, 80.0]
+        indices = [(0, 0, 0), (1, 0, 0)]
+
+    class FakeSimulationGenerator:
+        def __init__(self, *, accelerating_voltage: float) -> None:
+            self.accelerating_voltage = accelerating_voltage
+
+        def calculate_diffraction2d(self, **kwargs) -> FakeSimulation:
+            assert kwargs["phase"].space_group == 225
+            return FakeSimulation()
+
+    diffpy_pkg = types.ModuleType("diffpy")
+    diffpy_structure = types.ModuleType("diffpy.structure")
+    diffpy_structure.Atom = FakeAtom
+    diffpy_structure.Lattice = FakeLattice
+    diffpy_structure.Structure = FakeStructure
+
+    diffsims_pkg = types.ModuleType("diffsims")
+    diffsims_generators = types.ModuleType("diffsims.generators")
+    diffsims_sim_generator = types.ModuleType("diffsims.generators.simulation_generator")
+    diffsims_sim_generator.SimulationGenerator = FakeSimulationGenerator
+
+    orix_pkg = types.ModuleType("orix")
+    orix_crystal_map = types.ModuleType("orix.crystal_map")
+    orix_crystal_map.Phase = FakePhase
+
+    monkeypatch.setitem(sys.modules, "diffpy", diffpy_pkg)
+    monkeypatch.setitem(sys.modules, "diffpy.structure", diffpy_structure)
+    monkeypatch.setitem(sys.modules, "diffsims", diffsims_pkg)
+    monkeypatch.setitem(sys.modules, "diffsims.generators", diffsims_generators)
+    monkeypatch.setitem(
+        sys.modules,
+        "diffsims.generators.simulation_generator",
+        diffsims_sim_generator,
+    )
+    monkeypatch.setitem(sys.modules, "orix", orix_pkg)
+    monkeypatch.setitem(sys.modules, "orix.crystal_map", orix_crystal_map)
+
+    result = simulate_diffraction_with_diffsims(
+        [
+            PhaseCandidate(
+                name="pbs",
+                formula="PbS",
+                lattice_parameters={
+                    "a": 0.5936,
+                    "b": 0.5936,
+                    "c": 0.5936,
+                    "alpha": 90,
+                    "beta": 90,
+                    "gamma": 90,
+                    "space_group": "F m -3 m",
+                    "atom_sites": [
+                        {"element": "Pb", "abc": [0.0, 0.0, 0.0], "occupancy": 1.0},
+                        {"element": "S", "abc": [0.5, 0.5, 0.5], "occupancy": 1.0},
+                    ],
+                },
+            )
+        ],
+    )
+
+    assert result.warnings == []
+    assert received_space_groups == [225]
+    assert result.patterns[0].simulation_parameters["space_group_number"] == 225
+    assert (
+        result.patterns[0].simulation_parameters["space_group_source"]
+        == "candidate_space_group_symbol"
+    )
+    assert result.patterns[0].simulation_parameters["space_group_symbol"] == "F m -3 m"
+
+
+def test_diffsims_adapter_prefers_diffracting_vector_data_over_hkl_array() -> None:
+    class FakeDiffractingVector:
+        data = np.asarray([[0.1, 0.2, 0.0], [0.0, 0.0, 0.0]], dtype=np.float64)
+        hkl = np.asarray([[4.0, 1.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float64)
+        coordinates = hkl
+        intensity = np.asarray([9.0, 1.0], dtype=np.float64)
+
+        def __array__(self, dtype=None):
+            return np.asarray(self.hkl, dtype=dtype)
+
+    class FakeSimulation:
+        coordinates = FakeDiffractingVector()
+
+    spots = _extract_simulated_spots(
+        FakeSimulation(),
+        minimum_g_inv_nm=0.001,
+        max_spots=8,
+    )
+
+    assert len(spots) == 1
+    assert spots[0].gx.value == 1.0
+    assert spots[0].gy.value == 2.0
+    assert spots[0].h == 4
+    assert spots[0].k == 1
+    assert spots[0].intensity == 9.0
 
 
 def test_diffsims_adapter_scans_zone_axis_candidates(monkeypatch) -> None:
@@ -266,6 +401,7 @@ def test_diffsims_adapter_scans_zone_axis_candidates(monkeypatch) -> None:
                     "alpha": 90,
                     "beta": 90,
                     "gamma": 90,
+                    "space_group": "P1",
                     "atom_sites": [
                         {"element": "Si", "abc": [0.0, 0.0, 0.0], "occupancy": 1.0}
                     ],
@@ -304,6 +440,19 @@ def test_simulation_engine_diffsims_routes_through_optional_adapter(monkeypatch)
 
     assert report.provenance["method"] == "diffsims"
     assert "fake diffsims unavailable" in report.warnings
+
+
+def test_simulation_engine_baseline_no_longer_generates_placeholder_patterns() -> None:
+    report = simulate_from_diffraction(
+        DiffractionResult(phase_candidates=[PhaseCandidate(name="fake")]),
+        parameters={"simulation_engine": "baseline"},
+    )
+
+    assert report.patterns == []
+    assert report.matched_phase_candidates[0].name == "fake"
+    assert report.provenance["method"] == "unsupported_simulation_engine"
+    assert report.provenance["engine"] == "baseline"
+    assert any("no longer supported" in warning for warning in report.warnings)
 
 
 def test_simulation_engine_diffsims_closes_phase_matching_loop(monkeypatch) -> None:
@@ -411,6 +560,7 @@ def test_simulation_engine_diffsims_closes_phase_matching_loop(monkeypatch) -> N
                 "alpha": 90,
                 "beta": 90,
                 "gamma": 90,
+                "space_group": "P1",
                 "atom_sites": [
                     {"element": "Si", "abc": [0.0, 0.0, 0.0], "occupancy": 1.0}
                 ],
@@ -528,3 +678,195 @@ def test_simulation_engine_writes_best_zone_axis_from_matching(monkeypatch) -> N
     phase_match = report.patterns[1].simulation_parameters["phase_match"]
     assert phase_match["zone_axis"] == [1, 1, 0]
     assert phase_match["matched_spot_count"] == 2
+
+
+def test_simulation_engine_preserves_b4_zone_axis_when_locked(monkeypatch) -> None:
+    from autotem.simulation.diffsims_adapter import DiffsimsSimulationResult
+
+    def fake_simulate_diffraction_with_diffsims(candidates, **kwargs):
+        assert kwargs["zone_axis_candidates"] == [(0, 0, 1), (1, 1, 0)]
+        return DiffsimsSimulationResult(
+            patterns=[
+                SimulatedPattern(
+                    kind="diffraction",
+                    structure_id="fake",
+                    zone_axis=(0, 0, 1),
+                    simulation_parameters={"engine": "diffsims", "zone_axis_index": 0},
+                    spots=[
+                        SimulatedSpot(
+                            gx=Measurement(value=7.0, unit="1/nm"),
+                            gy=Measurement(value=7.0, unit="1/nm"),
+                            magnitude=Measurement(
+                                value=float(np.hypot(7.0, 7.0)),
+                                unit="1/nm",
+                            ),
+                        )
+                    ],
+                ),
+                SimulatedPattern(
+                    kind="diffraction",
+                    structure_id="fake",
+                    zone_axis=(1, 1, 0),
+                    simulation_parameters={"engine": "diffsims", "zone_axis_index": 1},
+                    spots=[
+                        SimulatedSpot(
+                            gx=Measurement(value=2.5, unit="1/nm"),
+                            gy=Measurement(value=0.0, unit="1/nm"),
+                            magnitude=Measurement(value=2.5, unit="1/nm"),
+                        ),
+                        SimulatedSpot(
+                            gx=Measurement(value=0.0, unit="1/nm"),
+                            gy=Measurement(value=2.5, unit="1/nm"),
+                            magnitude=Measurement(value=2.5, unit="1/nm"),
+                        ),
+                    ],
+                ),
+            ],
+            warnings=[],
+            provenance={"adapter": "diffsims", "active": True, "pattern_count": 2},
+        )
+
+    monkeypatch.setattr(
+        "autotem.simulation.basic.simulate_diffraction_with_diffsims",
+        fake_simulate_diffraction_with_diffsims,
+    )
+
+    diffraction = DiffractionResult(
+        peaks=[
+            DiffractionPeak(x=0.0, y=0.0, intensity=100.0),
+            DiffractionPeak(x=0.0, y=0.0, intensity=90.0),
+        ],
+        g_vectors=[
+            GVector(
+                gx=Measurement(value=2.5, unit="1/nm"),
+                gy=Measurement(value=0.0, unit="1/nm"),
+                magnitude=Measurement(value=2.5, unit="1/nm"),
+                source_peak_index=0,
+            ),
+            GVector(
+                gx=Measurement(value=0.0, unit="1/nm"),
+                gy=Measurement(value=2.5, unit="1/nm"),
+                magnitude=Measurement(value=2.5, unit="1/nm"),
+                source_peak_index=1,
+            ),
+        ],
+        phase_candidates=[
+            PhaseCandidate(name="fake", score=0.0, zone_axis=(0, 0, 1))
+        ],
+    )
+
+    report = simulate_from_diffraction(
+        diffraction,
+        parameters={
+            "simulation_engine": "diffsims",
+            "zone_axis_candidates": [[0, 0, 1], [1, 1, 0]],
+            "phase_match_previous_score_weight": 0.0,
+            "phase_match_min_spots": 2,
+            "phase_match_d_tolerance_rel": 0.02,
+            "phase_match_angle_tolerance_deg": 2.0,
+            "preserve_candidate_zone_axis": True,
+        },
+    )
+
+    phase_matching = report.provenance["phase_matching"]
+    assert phase_matching["zone_axis_locked"] is True
+    assert phase_matching["selected_zone_axis"] == [0, 0, 1]
+    assert phase_matching["per_phase"][0]["b5_suggested_zone_axis"] == [1, 1, 0]
+    assert report.matched_phase_candidates[0].zone_axis == (0, 0, 1)
+    assert diffraction.phase_candidates[0].zone_axis == (0, 0, 1)
+    assert any("B5 suggested a different zone axis" in warning for warning in report.warnings)
+
+
+def test_simulation_engine_preserves_b4_candidate_ranking_when_locked(monkeypatch) -> None:
+    from autotem.simulation.diffsims_adapter import DiffsimsSimulationResult
+
+    def fake_simulate_diffraction_with_diffsims(candidates, **kwargs):
+        return DiffsimsSimulationResult(
+            patterns=[
+                SimulatedPattern(
+                    kind="diffraction",
+                    structure_id="b4_first",
+                    zone_axis=(0, 0, 1),
+                    simulation_parameters={"engine": "diffsims", "zone_axis_index": 0},
+                    spots=[
+                        SimulatedSpot(
+                            gx=Measurement(value=8.0, unit="1/nm"),
+                            gy=Measurement(value=8.0, unit="1/nm"),
+                            magnitude=Measurement(
+                                value=float(np.hypot(8.0, 8.0)),
+                                unit="1/nm",
+                            ),
+                        )
+                    ],
+                ),
+                SimulatedPattern(
+                    kind="diffraction",
+                    structure_id="b5_better",
+                    zone_axis=(0, 0, 1),
+                    simulation_parameters={"engine": "diffsims", "zone_axis_index": 0},
+                    spots=[
+                        SimulatedSpot(
+                            gx=Measurement(value=2.5, unit="1/nm"),
+                            gy=Measurement(value=0.0, unit="1/nm"),
+                            magnitude=Measurement(value=2.5, unit="1/nm"),
+                        ),
+                        SimulatedSpot(
+                            gx=Measurement(value=0.0, unit="1/nm"),
+                            gy=Measurement(value=2.5, unit="1/nm"),
+                            magnitude=Measurement(value=2.5, unit="1/nm"),
+                        ),
+                    ],
+                ),
+            ],
+            warnings=[],
+            provenance={"adapter": "diffsims", "active": True, "pattern_count": 2},
+        )
+
+    monkeypatch.setattr(
+        "autotem.simulation.basic.simulate_diffraction_with_diffsims",
+        fake_simulate_diffraction_with_diffsims,
+    )
+
+    diffraction = DiffractionResult(
+        peaks=[
+            DiffractionPeak(x=0.0, y=0.0, intensity=100.0),
+            DiffractionPeak(x=0.0, y=0.0, intensity=90.0),
+        ],
+        g_vectors=[
+            GVector(
+                gx=Measurement(value=2.5, unit="1/nm"),
+                gy=Measurement(value=0.0, unit="1/nm"),
+                magnitude=Measurement(value=2.5, unit="1/nm"),
+                source_peak_index=0,
+            ),
+            GVector(
+                gx=Measurement(value=0.0, unit="1/nm"),
+                gy=Measurement(value=2.5, unit="1/nm"),
+                magnitude=Measurement(value=2.5, unit="1/nm"),
+                source_peak_index=1,
+            ),
+        ],
+        phase_candidates=[
+            PhaseCandidate(name="b4_first", identifier="b4_first", score=0.8),
+            PhaseCandidate(name="b5_better", identifier="b5_better", score=0.2),
+        ],
+    )
+
+    report = simulate_from_diffraction(
+        diffraction,
+        parameters={
+            "simulation_engine": "diffsims",
+            "phase_match_previous_score_weight": 0.0,
+            "phase_match_min_spots": 2,
+            "phase_match_d_tolerance_rel": 0.02,
+            "phase_match_angle_tolerance_deg": 2.0,
+            "preserve_candidate_ranking": True,
+        },
+    )
+
+    phase_matching = report.provenance["phase_matching"]
+    assert phase_matching["candidate_ranking_locked"] is True
+    assert phase_matching["selected_phase"] == "b4_first"
+    assert report.matched_phase_candidates[0].name == "b4_first"
+    assert report.matched_phase_candidates[1].name == "b5_better"
+    assert report.matched_phase_candidates[1].matched_spot_count == 2

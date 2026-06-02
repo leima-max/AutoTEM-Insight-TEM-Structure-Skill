@@ -10,6 +10,7 @@ import json
 import multiprocessing as mp
 import os
 import re
+import shlex
 import typing
 import urllib.parse
 import urllib.request
@@ -28,6 +29,7 @@ class PhaseLookupResult:
 
 
 _FORMULA_RE = re.compile(r"([A-Z][a-z]?)([0-9]*\.?[0-9]*)")
+_ELEMENT_RE = re.compile(r"[A-Z][a-z]?")
 _MP_API_DASHBOARD_URL = "https://next-gen.materialsproject.org/api"
 _SUPPORTED_SOURCES = {
     "local_builtin",
@@ -391,6 +393,19 @@ def _fetch_json(url: str, *, timeout_s: int) -> Any:
     return json.loads(payload.decode("utf-8"))
 
 
+def _fetch_text(url: str, *, timeout_s: int) -> str:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "AutoTEM-Insight/0.1 (+https://github.com/leima-max/AutoTEM-Insight-TEM-Structure-Skill)",
+            "Accept": "text/plain, text/cif, */*",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310
+        payload = resp.read()
+    return payload.decode("utf-8", errors="ignore")
+
+
 def _parse_formula_counts(formula: str) -> dict[str, float]:
     text = str(formula).strip().replace(" ", "")
     if not text:
@@ -539,6 +554,231 @@ def _lattice_vectors_to_cell(
     return a, b, c, alpha, beta, gamma
 
 
+def _species_name_to_element_map(attrs: dict[str, Any]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    raw_species = attrs.get("species")
+    if not isinstance(raw_species, list):
+        return mapping
+    for row in raw_species:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        symbols = row.get("chemical_symbols")
+        concentrations = row.get("concentration")
+        chosen: str | None = None
+        if isinstance(symbols, list):
+            ranked: list[tuple[float, str]] = []
+            for idx, symbol in enumerate(symbols):
+                if not isinstance(symbol, str) or symbol.lower() == "vacancy":
+                    continue
+                concentration = 1.0
+                if isinstance(concentrations, list) and idx < len(concentrations):
+                    try:
+                        concentration = float(concentrations[idx])
+                    except (TypeError, ValueError):
+                        concentration = 1.0
+                ranked.append((concentration, symbol))
+            if ranked:
+                chosen = max(ranked, key=lambda item: item[0])[1]
+        if chosen is None:
+            match = _ELEMENT_RE.search(name)
+            chosen = match.group(0) if match else None
+        if chosen:
+            mapping[name] = chosen
+    return mapping
+
+
+def _optimade_atom_sites(attrs: dict[str, Any]) -> list[dict[str, Any]]:
+    species_at_sites = attrs.get("species_at_sites")
+    if not isinstance(species_at_sites, list) or not species_at_sites:
+        return []
+
+    fractional = attrs.get("fractional_site_positions")
+    if isinstance(fractional, list):
+        try:
+            frac_array = np.asarray(fractional, dtype=np.float64)
+        except (TypeError, ValueError):
+            frac_array = np.empty((0, 0), dtype=np.float64)
+    else:
+        cartesian = attrs.get("cartesian_site_positions")
+        lattice_vectors = attrs.get("lattice_vectors")
+        try:
+            cart_array = np.asarray(cartesian, dtype=np.float64)
+            lattice_array = np.asarray(lattice_vectors, dtype=np.float64)
+            if cart_array.ndim != 2 or cart_array.shape[1] < 3:
+                return []
+            if lattice_array.shape != (3, 3):
+                return []
+            # OPTIMADE positions and lattice vectors are Angstrom; cart = frac @ lattice.
+            frac_array = cart_array[:, :3] @ np.linalg.inv(lattice_array)
+        except (TypeError, ValueError, np.linalg.LinAlgError):
+            return []
+
+    if frac_array.ndim != 2 or frac_array.shape[1] < 3:
+        return []
+    species_map = _species_name_to_element_map(attrs)
+    sites: list[dict[str, Any]] = []
+    for idx, raw_species in enumerate(species_at_sites):
+        if idx >= frac_array.shape[0]:
+            break
+        species_name = str(raw_species).strip()
+        element = species_map.get(species_name)
+        if element is None:
+            match = _ELEMENT_RE.search(species_name)
+            element = match.group(0) if match else None
+        if not element:
+            continue
+        coords = [round(float(value) % 1.0, 8) for value in frac_array[idx, :3]]
+        sites.append(
+            {
+                "element": element,
+                "abc": coords,
+                "occupancy": 1.0,
+                "source_index": idx,
+            }
+        )
+    return sites
+
+
+def _clean_cif_numeric(value: Any) -> float | None:
+    try:
+        token = str(value).strip().strip("'").strip('"')
+    except Exception:
+        return None
+    keep = []
+    seen_dot = False
+    seen_exp = False
+    for idx, ch in enumerate(token):
+        if ch in "+-" and idx == 0:
+            keep.append(ch)
+            continue
+        if ch.isdigit():
+            keep.append(ch)
+            continue
+        if ch == "." and not seen_dot and not seen_exp:
+            seen_dot = True
+            keep.append(ch)
+            continue
+        if ch in "eE" and not seen_exp and keep:
+            seen_exp = True
+            keep.append(ch)
+            continue
+        break
+    try:
+        return float("".join(keep))
+    except ValueError:
+        return None
+
+
+def _element_from_cif_label(value: str) -> str:
+    match = "".join(ch for ch in str(value).strip() if ch.isalpha())
+    if not match:
+        return "X"
+    return match[0].upper() + match[1:].lower()
+
+
+def _parse_atom_sites_from_cif_text(text: str) -> list[dict[str, Any]]:
+    lines = text.splitlines()
+    sites: list[dict[str, Any]] = []
+    idx = 0
+    while idx < len(lines):
+        if lines[idx].strip().lower() != "loop_":
+            idx += 1
+            continue
+        idx += 1
+        headers: list[str] = []
+        while idx < len(lines):
+            line = lines[idx].strip()
+            if not line or line.startswith("#"):
+                idx += 1
+                continue
+            if not line.startswith("_"):
+                break
+            headers.append(line.split()[0].lower())
+            idx += 1
+        if not headers or not any(header.startswith("_atom_site_") for header in headers):
+            continue
+        header_index = {header: pos for pos, header in enumerate(headers)}
+        required = {
+            "_atom_site_fract_x",
+            "_atom_site_fract_y",
+            "_atom_site_fract_z",
+        }
+        if not required.issubset(header_index):
+            continue
+        while idx < len(lines):
+            raw_line = lines[idx].strip()
+            if (
+                not raw_line
+                or raw_line.startswith("#")
+                or raw_line.lower() == "loop_"
+                or raw_line.startswith("_")
+            ):
+                break
+            try:
+                tokens = shlex.split(raw_line)
+            except ValueError:
+                tokens = raw_line.split()
+            if len(tokens) >= len(headers):
+                symbol = None
+                for key in ("_atom_site_type_symbol", "_atom_site_label"):
+                    pos = header_index.get(key)
+                    if pos is not None and pos < len(tokens):
+                        symbol = str(tokens[pos])
+                        break
+                x = _clean_cif_numeric(tokens[header_index["_atom_site_fract_x"]])
+                y = _clean_cif_numeric(tokens[header_index["_atom_site_fract_y"]])
+                z = _clean_cif_numeric(tokens[header_index["_atom_site_fract_z"]])
+                if symbol and x is not None and y is not None and z is not None:
+                    occupancy = 1.0
+                    occ_pos = header_index.get("_atom_site_occupancy")
+                    if occ_pos is not None and occ_pos < len(tokens):
+                        occupancy = _clean_cif_numeric(tokens[occ_pos]) or 1.0
+                    sites.append(
+                        {
+                            "element": _element_from_cif_label(symbol),
+                            "abc": [x, y, z],
+                            "occupancy": occupancy,
+                            "source_index": len(sites),
+                        }
+                    )
+            idx += 1
+    return sites
+
+
+def _parse_cif_scalar_fields(text: str) -> dict[str, Any]:
+    keymap = {
+        "_space_group_it_number": "space_group_number",
+        "_symmetry_int_tables_number": "space_group_number",
+        "_space_group_name_h-m_alt": "space_group",
+        "_symmetry_space_group_name_h-m": "space_group",
+    }
+    parsed: dict[str, Any] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.lower() == "loop_":
+            continue
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            parts = line.split()
+        if len(parts) < 2:
+            continue
+        key = parts[0].strip().lower()
+        if key not in keymap:
+            continue
+        value = parts[1]
+        if keymap[key] == "space_group_number":
+            number = _clean_cif_numeric(value)
+            if number is not None:
+                parsed["space_group_number"] = int(round(number))
+        else:
+            parsed[keymap[key]] = str(value)
+    return parsed
+
+
 def _cell_lengths_angstrom_to_nm(
     a: float,
     b: float,
@@ -602,21 +842,24 @@ def _fetch_mp_candidates(
         a, b, c, alpha, beta, gamma = cell
         # OPTIMADE lattice vectors are in Angstrom; convert to nm.
         a, b, c = _cell_lengths_angstrom_to_nm(a, b, c)
-        candidates.append(
-            {
-                "name": str(row.get("id", attrs.get("chemical_formula_reduced", "mp_candidate"))),
-                "formula": attrs.get("chemical_formula_reduced"),
-                "a": round(a, 6),
-                "b": round(b, 6),
-                "c": round(c, 6),
-                "alpha": round(alpha, 6),
-                "beta": round(beta, 6),
-                "gamma": round(gamma, 6),
-                "space_group": str(attrs.get("space_group_symbol", "P1")),
-                "source": "materials_project_optimade",
-                "identifier": str(row.get("id", "")),
-            }
-        )
+        candidate = {
+            "name": str(row.get("id", attrs.get("chemical_formula_reduced", "mp_candidate"))),
+            "formula": attrs.get("chemical_formula_reduced"),
+            "a": round(a, 6),
+            "b": round(b, 6),
+            "c": round(c, 6),
+            "alpha": round(alpha, 6),
+            "beta": round(beta, 6),
+            "gamma": round(gamma, 6),
+            "space_group": str(attrs.get("space_group_symbol", "P1")),
+            "source": "materials_project_optimade",
+            "identifier": str(row.get("id", "")),
+        }
+        atom_sites = _optimade_atom_sites(attrs)
+        if atom_sites:
+            candidate["atom_sites"] = atom_sites
+            candidate["structure_source"] = "optimade_structure"
+        candidates.append(candidate)
     if not candidates:
         warnings.append("Materials Project returned no valid lattice candidates.")
     return candidates, warnings
@@ -1188,22 +1431,34 @@ def _fetch_cod_candidates(
         cod_id = str(row.get("file", ""))
         if not cod_id:
             continue
-        candidates.append(
-            {
-                "name": f"COD_{cod_id}",
-                "formula": row.get("formula", hill),
-                "a": round(a, 6),
-                "b": round(b, 6),
-                "c": round(c, 6),
-                "alpha": round(alpha, 6),
-                "beta": round(beta, 6),
-                "gamma": round(gamma, 6),
-                "space_group": str(row.get("sg", "P1")),
-                "source": "crystallography_open_database",
-                "identifier": cod_id,
-                "cif_url": f"https://www.crystallography.net/cod/{cod_id}.cif",
-            }
-        )
+        cif_url = f"https://www.crystallography.net/cod/{cod_id}.cif"
+        candidate = {
+            "name": f"COD_{cod_id}",
+            "formula": row.get("formula", hill),
+            "a": round(a, 6),
+            "b": round(b, 6),
+            "c": round(c, 6),
+            "alpha": round(alpha, 6),
+            "beta": round(beta, 6),
+            "gamma": round(gamma, 6),
+            "space_group": str(row.get("sg", "P1")),
+            "source": "crystallography_open_database",
+            "identifier": cod_id,
+            "cif_url": cif_url,
+        }
+        try:
+            cif_text = _fetch_text(cif_url, timeout_s=max(1, int(timeout_s)))
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"COD CIF enrichment failed for COD_{cod_id}: {exc}")
+        else:
+            atom_sites = _parse_atom_sites_from_cif_text(cif_text)
+            if atom_sites:
+                candidate["atom_sites"] = atom_sites
+                candidate["structure_source"] = "cod_cif"
+            scalar_fields = _parse_cif_scalar_fields(cif_text)
+            for key, value in scalar_fields.items():
+                candidate[key] = value
+        candidates.append(candidate)
     if not candidates:
         warnings.append("COD returned no valid lattice candidates.")
     return candidates, warnings

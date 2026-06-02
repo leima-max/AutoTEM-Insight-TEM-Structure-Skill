@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import importlib.metadata
+import json
+import os
+import subprocess
+import sys
+import tempfile
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -139,7 +145,10 @@ def _material_result(
     max_measured_spots: int,
     min_matched_spots: int,
     simulate_func: Callable[..., DiffsimsSimulationResult],
+    progress_func: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    if progress_func is not None:
+        progress_func("candidate_lookup_start")
     candidate, lookup_warnings = _candidate_from_lookup(material)
     if candidate is None:
         return {
@@ -149,6 +158,8 @@ def _material_result(
             "warnings": lookup_warnings,
         }
 
+    if progress_func is not None:
+        progress_func("simulation_start")
     simulation = simulate_func(
         [candidate],
         voltage_kv=voltage_kv,
@@ -162,6 +173,8 @@ def _material_result(
         fallback_single_atom=False,
         pattern_shape=(64, 64),
     )
+    if progress_func is not None:
+        progress_func("simulation_done")
     warnings = [*lookup_warnings, *simulation.warnings]
     simulated_spot_count = sum(len(pattern.spots) for pattern in simulation.patterns)
     if not simulation.patterns or simulated_spot_count == 0:
@@ -179,11 +192,15 @@ def _material_result(
             "provenance": simulation.provenance,
         }
 
+    if progress_func is not None:
+        progress_func("phase_matching_start")
     diffraction = _diffraction_from_simulated_spots(
         candidate,
         simulation,
         max_measured_spots=max(1, int(max_measured_spots)),
     )
+    if progress_func is not None:
+        progress_func("phase_matching_done")
     match = match_diffsims_patterns_to_diffraction(
         diffraction,
         simulation.patterns,
@@ -227,6 +244,127 @@ def _material_result(
     }
 
 
+def _temporary_directory_root() -> str | None:
+    root = os.environ.get("AUTOTEM_TMP_DIR")
+    if root:
+        Path(root).mkdir(parents=True, exist_ok=True)
+        return root
+    if os.name == "nt":
+        windows_root = Path("C:/tmp")
+        try:
+            windows_root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        return str(windows_root)
+    return None
+
+
+def _tail_text(text: str, *, limit: int = 2000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def _material_result_with_timeout(
+    *,
+    timeout_s: float,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    timeout = max(1.0, float(timeout_s))
+    material = str(kwargs.get("material", "unknown"))
+    with tempfile.TemporaryDirectory(
+        prefix="autotem_diffsims_validation_",
+        dir=_temporary_directory_root(),
+    ) as tmp_dir:
+        input_path = Path(tmp_dir) / "request.json"
+        output_path = Path(tmp_dir) / "response.json"
+        progress_path = Path(tmp_dir) / "progress.jsonl"
+        stdout_path = Path(tmp_dir) / "stdout.txt"
+        stderr_path = Path(tmp_dir) / "stderr.txt"
+        request = {**dict(kwargs), "_progress_path": str(progress_path)}
+        input_path.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+        try:
+            with stdout_path.open("w", encoding="utf-8") as stdout_handle:
+                with stderr_path.open("w", encoding="utf-8") as stderr_handle:
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            "-m",
+                            "autotem.validation.diffsims_smoke_worker",
+                            "--input",
+                            str(input_path),
+                            "--output",
+                            str(output_path),
+                        ],
+                        cwd=Path.cwd(),
+                        stdout=stdout_handle,
+                        stderr=stderr_handle,
+                        text=True,
+                        timeout=timeout,
+                        check=False,
+                    )
+        except subprocess.TimeoutExpired:
+            progress = (
+                progress_path.read_text(encoding="utf-8").splitlines()
+                if progress_path.exists()
+                else []
+            )
+            return {
+                "material": material,
+                "ok": False,
+                "stage": "diffsims_timeout",
+                "warnings": [
+                    f"diffsims validation timed out after {timeout:.1f}s for '{material}'."
+                    + (f" Last progress: {progress[-1]}" if progress else "")
+                ],
+                "progress": progress,
+            }
+        if completed.returncode != 0:
+            stderr = stderr_path.read_text(encoding="utf-8") if stderr_path.exists() else ""
+            stdout = stdout_path.read_text(encoding="utf-8") if stdout_path.exists() else ""
+            detail = _tail_text((stderr or stdout).strip())
+            return {
+                "material": material,
+                "ok": False,
+                "stage": "diffsims_worker_failed",
+                "warnings": [
+                    "diffsims validation subprocess failed"
+                    + (f": {detail}" if detail else f" with exit code {completed.returncode}")
+                ],
+            }
+        if not output_path.exists():
+            return {
+                "material": material,
+                "ok": False,
+                "stage": "diffsims_worker_empty",
+                "warnings": ["diffsims validation subprocess exited without a result."],
+            }
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        if (
+            isinstance(payload, dict)
+            and payload.get("ok")
+            and isinstance(payload.get("result"), dict)
+        ):
+            return payload["result"]
+        error = (
+            str(payload.get("error", "unknown error"))
+            if isinstance(payload, dict)
+            else "invalid validation subprocess payload"
+        )
+        return {
+            "material": material,
+            "ok": False,
+            "stage": "diffsims_worker_failed",
+            "warnings": ["diffsims validation subprocess failed: " + error],
+        }
+    return {
+        "material": material,
+        "ok": False,
+        "stage": "diffsims_worker_invalid_result",
+        "warnings": ["diffsims validation subprocess returned an invalid result."],
+    }
+
+
 def run_diffsims_smoke_validation(
     *,
     materials: list[str] | tuple[str, ...] | None = None,
@@ -235,6 +373,7 @@ def run_diffsims_smoke_validation(
     max_simulated_spots: int = 128,
     max_measured_spots: int = 6,
     min_matched_spots: int = 3,
+    timeout_s: float | None = 30.0,
     simulate_func: Callable[..., DiffsimsSimulationResult] | None = None,
 ) -> dict[str, Any]:
     """Validate real diffsims simulation and template matching without pytest."""
@@ -245,20 +384,28 @@ def run_diffsims_smoke_validation(
     ]
     if not requested_materials:
         requested_materials = list(_DEFAULT_MATERIALS)
-    simulator = simulate_func or _simulate_diffraction_with_diffsims
     dependency_versions = _dependency_versions()
-    material_results = [
-        _material_result(
-            material=material,
-            voltage_kv=voltage_kv,
-            reciprocal_radius_inv_angstrom=reciprocal_radius_inv_angstrom,
-            max_simulated_spots=max_simulated_spots,
-            max_measured_spots=max_measured_spots,
-            min_matched_spots=min_matched_spots,
-            simulate_func=simulator,
-        )
-        for material in requested_materials
-    ]
+    material_results = []
+    for material in requested_materials:
+        kwargs = {
+            "material": material,
+            "voltage_kv": voltage_kv,
+            "reciprocal_radius_inv_angstrom": reciprocal_radius_inv_angstrom,
+            "max_simulated_spots": max_simulated_spots,
+            "max_measured_spots": max_measured_spots,
+            "min_matched_spots": min_matched_spots,
+        }
+        if simulate_func is None and timeout_s is not None and float(timeout_s) > 0:
+            material_results.append(
+                _material_result_with_timeout(timeout_s=float(timeout_s), **kwargs)
+            )
+        else:
+            material_results.append(
+                _material_result(
+                    **kwargs,
+                    simulate_func=simulate_func or _simulate_diffraction_with_diffsims,
+                )
+            )
     ok = all(bool(item.get("ok")) for item in material_results)
     missing = [
         name
@@ -287,6 +434,7 @@ def run_diffsims_smoke_validation(
             "max_simulated_spots": int(max_simulated_spots),
             "max_measured_spots": int(max_measured_spots),
             "min_matched_spots": int(min_matched_spots),
+            "timeout_s": None if timeout_s is None else float(timeout_s),
         },
         "warnings": list(dict.fromkeys(warnings)),
     }
