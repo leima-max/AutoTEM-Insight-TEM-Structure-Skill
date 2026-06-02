@@ -1,6 +1,29 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
+from types import ModuleType
+
 import matplotlib.pyplot as plt
+
+if importlib.util.find_spec("streamlit") is None:
+    streamlit_module = ModuleType("streamlit")
+    streamlit_module.__path__ = []
+    streamlit_module.session_state = {}
+    elements_module = ModuleType("streamlit.elements")
+    elements_module.__path__ = []
+    image_module = ModuleType("streamlit.elements.image")
+    image_module.image_to_url = lambda *args, **kwargs: ""
+    streamlit_module.elements = elements_module
+    elements_module.image = image_module
+    sys.modules.setdefault("streamlit", streamlit_module)
+    sys.modules.setdefault("streamlit.elements", elements_module)
+    sys.modules.setdefault("streamlit.elements.image", image_module)
+
+if importlib.util.find_spec("streamlit_drawable_canvas") is None:
+    canvas_module = ModuleType("streamlit_drawable_canvas")
+    canvas_module.st_canvas = lambda *args, **kwargs: None
+    sys.modules.setdefault("streamlit_drawable_canvas", canvas_module)
 
 from apps.b2_diffraction_ui import (
     _FALLBACK_DEFAULTS,
