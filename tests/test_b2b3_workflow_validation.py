@@ -293,6 +293,25 @@ def test_b5_validation_rejects_invalid_zone_axis_candidates(tmp_path: Path) -> N
         load_workflow_recipe(workflow)
 
 
+def test_b5_validation_accepts_deprecated_baseline_engine_for_compatibility(
+    tmp_path: Path,
+) -> None:
+    workflow = _write_workflow(
+        tmp_path / "deprecated_baseline_engine.yaml",
+        [
+            "workflow:",
+            "  name: deprecated_baseline_engine",
+            "  parameters:",
+            "    simulation:",
+            "      simulation_engine: baseline",
+        ],
+    )
+
+    recipe = load_workflow_recipe(workflow)
+
+    assert recipe.workflow.parameters["simulation"]["simulation_engine"] == "baseline"
+
+
 def test_b4_validation_rejects_invalid_materials_project_sort_mode(
     tmp_path: Path,
 ) -> None:

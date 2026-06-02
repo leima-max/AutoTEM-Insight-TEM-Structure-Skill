@@ -203,6 +203,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help="Minimum matched spots required for the closed-loop check.",
     )
+    validate_diffsims.add_argument(
+        "--timeout-s",
+        type=float,
+        default=30.0,
+        help="Maximum seconds per material before the real diffsims smoke subprocess is stopped.",
+    )
 
     return parser
 
@@ -401,6 +407,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_simulated_spots=max(1, int(args.max_simulated_spots)),
                 max_measured_spots=max(1, int(args.max_measured_spots)),
                 min_matched_spots=max(1, int(args.min_matched_spots)),
+                timeout_s=max(1.0, float(args.timeout_s)),
             )
         except Exception as exc:  # noqa: BLE001
             print(f"AutoTEM diffsims validation runtime error: {exc}", file=sys.stderr)

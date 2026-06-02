@@ -47,6 +47,7 @@ workflow:
       angle_tolerance_deg: 10.0
     simulation:
       simulation_engine: diffsims
+      diffsims_timeout_s: 30
       voltage_kv: 200
       reciprocal_radius_inv_angstrom: 1.5
       zone_axis_candidates:

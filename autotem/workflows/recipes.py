@@ -44,7 +44,8 @@ _SUPPORTED_MATERIALS_PROJECT_SORT_MODES = {
     "material_id",
     "none",
 }
-_SUPPORTED_SIMULATION_ENGINES = {"baseline", "diffsims"}
+_SUPPORTED_SIMULATION_ENGINES = {"diffsims"}
+_DEPRECATED_SIMULATION_ENGINES = {"baseline"}
 _SUPPORTED_ACCEPTANCE_OPS = {">=", "<=", ">", "<", "=="}
 _QUALITY_THRESHOLD_RANGE_01_KEYS = {
     "blur_risk_max",
@@ -1132,7 +1133,10 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("workflow.parameters.simulation must be a mapping.")
         if "simulation_engine" in simulation:
             engine = str(simulation["simulation_engine"]).strip().lower()
-            if engine not in _SUPPORTED_SIMULATION_ENGINES:
+            if (
+                engine not in _SUPPORTED_SIMULATION_ENGINES
+                and engine not in _DEPRECATED_SIMULATION_ENGINES
+            ):
                 raise ValueError(
                     "workflow.parameters.simulation.simulation_engine must be one of "
                     f"{sorted(_SUPPORTED_SIMULATION_ENGINES)}."
@@ -1150,6 +1154,16 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(
                     "workflow.parameters.simulation.reciprocal_radius_inv_angstrom must be > 0."
                 )
+        for timeout_key in ("diffsims_timeout_s", "timeout_s"):
+            if timeout_key in simulation:
+                timeout = _as_float(
+                    simulation[timeout_key],
+                    field_name=f"simulation.{timeout_key}",
+                )
+                if timeout <= 0:
+                    raise ValueError(
+                        f"workflow.parameters.simulation.{timeout_key} must be > 0."
+                    )
         if "max_candidates" in simulation:
             max_candidates = int(
                 _as_float(simulation["max_candidates"], field_name="simulation.max_candidates")
