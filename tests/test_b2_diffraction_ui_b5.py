@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: I001
+
 import importlib.util
 import sys
 from types import ModuleType

@@ -29,6 +29,7 @@ class PhaseLookupResult:
 
 
 _FORMULA_RE = re.compile(r"([A-Z][a-z]?)([0-9]*\.?[0-9]*)")
+_ELEMENT_RE = re.compile(r"[A-Z][a-z]?")
 _MP_API_DASHBOARD_URL = "https://next-gen.materialsproject.org/api"
 _SUPPORTED_SOURCES = {
     "local_builtin",
