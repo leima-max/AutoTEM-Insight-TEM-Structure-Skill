@@ -10,6 +10,7 @@ workflow:
     - diffraction_peaks
     - index_diffraction
     - phase_match
+    - simulate
     - report
   parameters:
     calibration:
@@ -38,9 +39,61 @@ workflow:
       min_peak_distance: 3.0
       center_exclusion_radius: 3.0
       phase_top_n: 3
-      candidate_phases:
+      phase_candidate_materials:
         - Silicon
         - Titanium Dioxide
+      phase_lookup_sources:
+        - local_builtin
+        - materials_project_optimade
+        - cod
+        - materials_project_api
+      phase_lookup_limit_per_source: 5
+      phase_lookup_timeout_s: 8
+      candidate_phase_params:
+        - name: Silicon
+          formula: Si
+          source: workflow_reference_lattice
+          a: 0.5431
+          b: 0.5431
+          c: 0.5431
+          alpha: 90
+          beta: 90
+          gamma: 90
+          space_group: "Fd-3m"
+        - name: Titanium Dioxide
+          formula: TiO2
+          source: workflow_reference_lattice
+          a: 0.4594
+          b: 0.4594
+          c: 0.2959
+          alpha: 90
+          beta: 90
+          gamma: 90
+          space_group: "P42/mnm"
+      indexing_mode: lattice_fit
+      max_hkl: 4
+      d_tolerance_rel: 0.10
+      angle_tolerance_deg: 12.0
+    simulation:
+      simulation_engine: diffsims
+      reciprocal_radius_inv_angstrom: 1.0
+      with_direct_beam: true
+      max_excitation_error: 0.01
+      zone_axis_candidates:
+        - [0, 0, 1]
+        - [1, 1, 0]
+        - [1, 1, 1]
+      rotation_axis: [0, 0, 1]
+      rotation_angles_deg: [0]
+      max_simulated_spots: 256
+      minimum_simulated_g_inv_nm: 0.001
+      fallback_single_atom: true
+      pattern_sigma: 10
+      pattern_normalize: true
+      phase_match_enabled: true
+      phase_match_min_spots: 2
+      phase_match_previous_score_weight: 0.35
+      phase_match_max_rotation_candidates: 64
 
 outputs:
   formats:

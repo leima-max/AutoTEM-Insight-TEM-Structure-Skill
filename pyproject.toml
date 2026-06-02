@@ -38,7 +38,14 @@ io = [
   "mrcfile>=1.4",
   "ncempy>=1.12"
 ]
+crystallography = [
+  "mp-api>=0.41",
+  "pymatgen>=2024.5"
+]
 gpl_adapters = [
+  "diffsims>=0.7",
+  "diffpy.structure>=3.0",
+  "orix>=0.13",
   "py4DSTEM>=0.14.14",
   "pyxem>=0.21.0"
 ]
@@ -53,7 +60,8 @@ include = ["autotem*"]
 testpaths = ["tests"]
 addopts = "-q -m smoke"
 markers = [
-  "smoke: minimal runnable smoke tests for the current main-branch scope"
+  "smoke: minimal runnable smoke tests for the current main-branch scope",
+  "real_diffsims: opt-in tests that execute the real diffsims/orix simulation stack"
 ]
 
 [tool.ruff]

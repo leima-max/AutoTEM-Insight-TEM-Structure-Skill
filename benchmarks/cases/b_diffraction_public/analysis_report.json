@@ -1,0 +1,436 @@
+{
+  "schema_version": "0.1.0",
+  "summary": "Public minimal B-case report fixture (diffraction and B4 indexing metrics).",
+  "workflow": {
+    "schema_version": "0.1.0",
+    "name": "benchmark_public_minimal_b4",
+    "description": "",
+    "steps": [
+      {
+        "name": "load",
+        "status": "done",
+        "parameters": {},
+        "inputs": [],
+        "outputs": [],
+        "warnings": []
+      },
+      {
+        "name": "assess_quality",
+        "status": "done",
+        "parameters": {},
+        "inputs": [],
+        "outputs": [],
+        "warnings": []
+      },
+      {
+        "name": "calibrate",
+        "status": "done",
+        "parameters": {},
+        "inputs": [],
+        "outputs": [],
+        "warnings": []
+      },
+      {
+        "name": "preprocess",
+        "status": "done",
+        "parameters": {},
+        "inputs": [],
+        "outputs": [],
+        "warnings": []
+      },
+      {
+        "name": "fft",
+        "status": "done",
+        "parameters": {},
+        "inputs": [],
+        "outputs": [],
+        "warnings": []
+      },
+      {
+        "name": "diffraction_peaks",
+        "status": "done",
+        "parameters": {},
+        "inputs": [],
+        "outputs": [],
+        "warnings": []
+      },
+      {
+        "name": "index_diffraction",
+        "status": "done",
+        "parameters": {},
+        "inputs": [],
+        "outputs": [],
+        "warnings": []
+      },
+      {
+        "name": "phase_match",
+        "status": "done",
+        "parameters": {},
+        "inputs": [],
+        "outputs": [],
+        "warnings": []
+      },
+      {
+        "name": "benchmark",
+        "status": "done",
+        "parameters": {},
+        "inputs": [],
+        "outputs": [],
+        "warnings": []
+      }
+    ],
+    "parameters": {
+      "diffraction": {
+        "candidate_phase_params": [
+          {
+            "name": "cubic_probe",
+            "a": 0.4,
+            "b": 0.4,
+            "c": 0.4,
+            "alpha": 90,
+            "beta": 90,
+            "gamma": 90,
+            "space_group": "Pm-3m"
+          }
+        ],
+        "indexing_mode": "lattice_fit"
+      }
+    },
+    "output_formats": [
+      "json"
+    ],
+    "save_intermediates": true,
+    "provenance": {}
+  },
+  "dataset": null,
+  "quality": null,
+  "calibration": null,
+  "preprocessing": null,
+  "diffraction": {
+    "schema_version": "0.1.0",
+    "peaks": [
+      {
+        "x": 50.0,
+        "y": 40.0,
+        "intensity": 320.0,
+        "sigma_x": null,
+        "sigma_y": null,
+        "confidence": 0.95,
+        "warnings": []
+      },
+      {
+        "x": 40.0,
+        "y": 50.0,
+        "intensity": 300.0,
+        "sigma_x": null,
+        "sigma_y": null,
+        "confidence": 0.95,
+        "warnings": []
+      },
+      {
+        "x": 50.0,
+        "y": 50.0,
+        "intensity": 200.0,
+        "sigma_x": null,
+        "sigma_y": null,
+        "confidence": 0.9,
+        "warnings": []
+      }
+    ],
+    "center": [
+      40.0,
+      40.0
+    ],
+    "g_vectors": [
+      {
+        "gx": {
+          "value": 2.5,
+          "unit": "1/nm",
+          "uncertainty": 0.01,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.95,
+          "provenance": {},
+          "warnings": []
+        },
+        "gy": {
+          "value": 0.0,
+          "unit": "1/nm",
+          "uncertainty": 0.01,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.95,
+          "provenance": {},
+          "warnings": []
+        },
+        "magnitude": {
+          "value": 2.5,
+          "unit": "1/nm",
+          "uncertainty": 0.01,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.95,
+          "provenance": {},
+          "warnings": []
+        },
+        "angle": null,
+        "source_peak_index": 0
+      },
+      {
+        "gx": {
+          "value": 0.0,
+          "unit": "1/nm",
+          "uncertainty": 0.01,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.95,
+          "provenance": {},
+          "warnings": []
+        },
+        "gy": {
+          "value": 2.5,
+          "unit": "1/nm",
+          "uncertainty": 0.01,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.95,
+          "provenance": {},
+          "warnings": []
+        },
+        "magnitude": {
+          "value": 2.5,
+          "unit": "1/nm",
+          "uncertainty": 0.01,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.95,
+          "provenance": {},
+          "warnings": []
+        },
+        "angle": null,
+        "source_peak_index": 1
+      },
+      {
+        "gx": {
+          "value": 2.5,
+          "unit": "1/nm",
+          "uncertainty": 0.01,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.9,
+          "provenance": {},
+          "warnings": []
+        },
+        "gy": {
+          "value": 2.5,
+          "unit": "1/nm",
+          "uncertainty": 0.01,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.9,
+          "provenance": {},
+          "warnings": []
+        },
+        "magnitude": {
+          "value": 3.5355339059,
+          "unit": "1/nm",
+          "uncertainty": 0.015,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.9,
+          "provenance": {},
+          "warnings": []
+        },
+        "angle": null,
+        "source_peak_index": 2
+      }
+    ],
+    "d_spacings": [
+      {
+        "value": 0.4,
+        "unit": "nm",
+        "uncertainty": 0.001,
+        "method": "fixture",
+        "parameters": {},
+        "confidence": 0.95,
+        "provenance": {},
+        "warnings": []
+      },
+      {
+        "value": 0.4,
+        "unit": "nm",
+        "uncertainty": 0.001,
+        "method": "fixture",
+        "parameters": {},
+        "confidence": 0.95,
+        "provenance": {},
+        "warnings": []
+      },
+      {
+        "value": 0.2828427125,
+        "unit": "nm",
+        "uncertainty": 0.001,
+        "method": "fixture",
+        "parameters": {},
+        "confidence": 0.9,
+        "provenance": {},
+        "warnings": []
+      }
+    ],
+    "indexed_spots": [
+      {
+        "peak_index": 0,
+        "h": 1,
+        "k": 0,
+        "l": 0,
+        "d_spacing": {
+          "value": 0.4,
+          "unit": "nm",
+          "uncertainty": null,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.95,
+          "provenance": {},
+          "warnings": []
+        },
+        "error": {
+          "value": 0.0,
+          "unit": "relative",
+          "uncertainty": null,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.95,
+          "provenance": {},
+          "warnings": []
+        },
+        "confidence": 0.95
+      },
+      {
+        "peak_index": 1,
+        "h": 0,
+        "k": 1,
+        "l": 0,
+        "d_spacing": {
+          "value": 0.4,
+          "unit": "nm",
+          "uncertainty": null,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.95,
+          "provenance": {},
+          "warnings": []
+        },
+        "error": {
+          "value": 0.0,
+          "unit": "relative",
+          "uncertainty": null,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.95,
+          "provenance": {},
+          "warnings": []
+        },
+        "confidence": 0.95
+      },
+      {
+        "peak_index": 2,
+        "h": 1,
+        "k": 1,
+        "l": 0,
+        "d_spacing": {
+          "value": 0.2828427125,
+          "unit": "nm",
+          "uncertainty": null,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.9,
+          "provenance": {},
+          "warnings": []
+        },
+        "error": {
+          "value": 0.0,
+          "unit": "relative",
+          "uncertainty": null,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.9,
+          "provenance": {},
+          "warnings": []
+        },
+        "confidence": 0.9
+      }
+    ],
+    "phase_candidates": [
+      {
+        "name": "cubic_probe",
+        "formula": "X",
+        "source": "public_benchmark_fixture",
+        "identifier": "b_diffraction_public",
+        "score": 0.95,
+        "matched_spot_count": 3,
+        "mean_d_error": {
+          "value": 0.0,
+          "unit": "relative",
+          "uncertainty": null,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.95,
+          "provenance": {},
+          "warnings": []
+        },
+        "mean_angle_error": {
+          "value": 0.0,
+          "unit": "deg",
+          "uncertainty": null,
+          "method": "fixture",
+          "parameters": {},
+          "confidence": 0.95,
+          "provenance": {},
+          "warnings": []
+        },
+        "zone_axis": [
+          0,
+          0,
+          1
+        ],
+        "warnings": []
+      }
+    ],
+    "fft_image": null,
+    "confidence": 0.95,
+    "provenance": {
+      "b4_indexing": {
+        "active": true,
+        "mode": "b4_mvp",
+        "selected_phase": "cubic_probe"
+      },
+      "b3_b4_consistency": {
+        "peak_count": 3,
+        "indexed_nonzero_count": 3,
+        "indexed_nonzero_fraction": 1.0,
+        "phase_candidate_count": 1,
+        "top_phase_score": 0.95
+      }
+    },
+    "warnings": []
+  },
+  "atom_lattice": null,
+  "strain": null,
+  "microstructure": null,
+  "z_contrast": null,
+  "spectroscopy": null,
+  "fourdstem": null,
+  "simulation": null,
+  "ai_inference": null,
+  "benchmark": null,
+  "figures": [],
+  "tables": [],
+  "artifacts": [],
+  "warnings": [],
+  "provenance": {
+    "quality_gates": {
+      "passed": true,
+      "blocking_warning_count": 0
+    }
+  }
+}

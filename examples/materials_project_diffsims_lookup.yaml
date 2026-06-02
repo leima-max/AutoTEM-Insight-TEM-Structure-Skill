@@ -1,0 +1,65 @@
+workflow:
+  name: materials_project_diffsims_lookup
+  description: Resolve Materials Project structures, index FFT peaks, then close the diffsims matching loop.
+  steps:
+    - load
+    - assess_quality
+    - calibrate
+    - preprocess
+    - analyze
+    - simulate
+    - report
+  parameters:
+    calibration:
+      method: reference
+      known_d_spacing: 0.3135
+      known_d_spacing_unit: nm
+      measured_radius_px: 10
+    preprocessing:
+      recipe: min_max
+      background_method: none
+    diffraction:
+      top_k_peaks: 24
+      min_peak_distance: 3
+      center_exclusion_radius: 4
+      peak_threshold_strategy: auto
+      phase_candidate_materials:
+        - mp-149
+      # You can also use common names such as "quartz"; AutoTEM resolves common
+      # aliases to formulas before querying Materials Project.
+      phase_lookup_sources:
+        - materials_project_api
+      phase_lookup_limit_per_source: 3
+      phase_lookup_timeout_s: 8
+      materials_project_sort_by: stability
+      materials_project_include_deprecated: false
+      materials_project_filter_stable: false
+      materials_project_max_energy_above_hull: 0.05
+      materials_project_prefer_experimental: true
+      materials_project_candidate_pool_size: 20
+      indexing_mode: lattice_fit
+      phase_top_n: 3
+      max_hkl: 4
+      d_tolerance_rel: 0.10
+      angle_tolerance_deg: 12.0
+    simulation:
+      simulation_engine: diffsims
+      voltage_kv: 200
+      reciprocal_radius_inv_angstrom: 1.5
+      zone_axis_candidates:
+        - [0, 0, 1]
+        - [1, 1, 0]
+        - [1, 1, 1]
+      rotation_axis: [0, 0, 1]
+      rotation_angles_deg: [0]
+      max_simulated_spots: 256
+      minimum_simulated_g_inv_nm: 0.001
+      fallback_single_atom: false
+      phase_match_enabled: true
+      phase_match_d_tolerance_rel: 0.08
+      phase_match_angle_tolerance_deg: 10.0
+      phase_match_min_spots: 2
+      phase_match_previous_score_weight: 0.25
+outputs:
+  formats: [json, csv, html]
+  save_intermediates: true

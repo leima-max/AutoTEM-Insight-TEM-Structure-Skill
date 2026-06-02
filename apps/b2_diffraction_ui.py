@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 import os
 import re
 from datetime import datetime
@@ -17,7 +18,15 @@ from scipy.optimize import least_squares
 from streamlit_drawable_canvas import st_canvas
 
 from autotem.calibration import calibrate_dataset
-from autotem.core import DiffractionPeak, IndexedSpot, Measurement, PhaseCandidate
+from autotem.core import (
+    DiffractionPeak,
+    DiffractionResult,
+    IndexedSpot,
+    Measurement,
+    PhaseCandidate,
+    SimulatedPattern,
+    SimulationResult,
+)
 from autotem.diffraction.b4_indexing import run_b4_indexing
 from autotem.diffraction.basic import run_diffraction_analysis
 from autotem.diffraction.fft import compute_fft_analysis
@@ -27,8 +36,13 @@ from autotem.diffraction.peak_detection import (
     SUPPORTED_PEAK_DETECTORS,
     SUPPORTED_THRESHOLD_STRATEGIES,
 )
+from autotem.diffraction.phase_lookup import (
+    materials_project_api_setup_guidance,
+    supported_phase_lookup_sources,
+)
 from autotem.io import load_tem_dataset, read_image
 from autotem.preprocessing import SUPPORTED_DENOISE_METHODS, assess_quality, preprocess_dataset
+from autotem.simulation.basic import simulate_from_diffraction
 
 # Compatibility patch for streamlit-drawable-canvas on newer Streamlit.
 if not hasattr(st_image, "image_to_url"):
@@ -50,9 +64,9 @@ if not hasattr(st_image, "image_to_url"):
     st_image.image_to_url = _image_to_url_compat
 
 
-_APP_TITLE = "AutoTEM B1-B3 Interactive Preview"
-_UI_BUILD_TAG = "b1_b3_interactive_v23_vector_aux_edit_2026-05-27"
-_WORKFLOW_TEMPLATE = "configs/hrtem_b1_b3.yaml"
+_APP_TITLE = "AutoTEM B1-B5 Diffraction Debug UI"
+_UI_BUILD_TAG = "b1_b5_debug_ui_2026-05-30"
+_WORKFLOW_TEMPLATE = "configs/hrtem_fft_phase.yaml"
 _OUTPUT_ROOT_ENV = "AUTOTEM_UI_OUTPUT_ROOT"
 
 PHASE_OPTIONS = ["Silicon", "Gold", "Graphite", "Titanium Dioxide"]
@@ -68,6 +82,14 @@ INDEXING_MODE_LABELS: dict[str, str] = {
 SUPPORTED_BACKGROUND_METHODS = ["none", "gaussian", "rolling_ball"]
 SUPPORTED_FFT_CENTER_MODES = ["auto", "geometric"]
 SUPPORTED_INDEXING_MODES = ["auto", "baseline", "lattice_fit"]
+SUPPORTED_SIMULATION_ENGINES = ["baseline", "diffsims"]
+SUPPORTED_MP_SORT_MODES = ["stability", "energy_above_hull", "material_id", "none"]
+DEFAULT_PHASE_LOOKUP_SOURCES = [
+    "local_builtin",
+    "materials_project_optimade",
+    "cod",
+    "materials_project_api",
+]
 
 DEFAULT_B4_CANDIDATES_JSON = json.dumps(
     [
@@ -136,9 +158,16 @@ _FALLBACK_DEFAULTS: dict[str, Any] = {
         "clip_percentile_high": 99.0,
         "denoise_method": "wiener",
         "denoise_sigma": 0.8,
+        "median_size": 3,
         "wiener_window": 5,
+        "wiener_noise": 0.0,
+        "nlm_h": 0.05,
+        "nlm_patch_size": 5,
+        "nlm_patch_distance": 6,
         "background_method": "gaussian",
         "background_sigma": 12.0,
+        "background_opening_size": 31,
+        "background_clip_zero": False,
     },
     "diffraction": {
         "auto_peak_tuning": True,
@@ -160,11 +189,39 @@ _FALLBACK_DEFAULTS: dict[str, Any] = {
         "direct_beam_center_uncertainty_px": 0.35,
         "indexing_mode": "auto",
         "phase_top_n": 3,
-        "candidate_phases": ["Silicon", "Gold", "Graphite"],
+        "phase_candidate_materials": ["Silicon", "Gold", "Graphite"],
         "max_hkl": 4,
         "d_tolerance_rel": 0.10,
         "angle_tolerance_deg": 12.0,
         "b4_strict_mode": False,
+        "phase_lookup_sources": list(DEFAULT_PHASE_LOOKUP_SOURCES),
+        "phase_lookup_limit_per_source": 3,
+        "phase_lookup_timeout_s": 10.0,
+        "materials_project_sort_by": "stability",
+        "materials_project_include_deprecated": False,
+        "materials_project_filter_stable": False,
+        "materials_project_max_energy_above_hull": 0.0,
+        "materials_project_prefer_experimental": True,
+        "materials_project_candidate_pool_size": 20,
+    },
+    "simulation": {
+        "enabled": True,
+        "simulation_engine": "baseline",
+        "reciprocal_radius_inv_angstrom": 1.0,
+        "max_simulated_spots": 128,
+        "minimum_simulated_g_inv_nm": 0.001,
+        "with_direct_beam": True,
+        "max_excitation_error": 0.01,
+        "fallback_single_atom": True,
+        "zone_axis_candidates": [[0, 0, 1]],
+        "rotation_axis": [0, 0, 1],
+        "rotation_angles_deg": [0.0],
+        "phase_match_enabled": True,
+        "phase_match_min_spots": 2,
+        "phase_match_previous_score_weight": 0.35,
+        "phase_match_max_rotation_candidates": 64,
+        "timeout_s": 20.0,
+        "auto_rerun": False,
     },
 }
 
@@ -232,6 +289,99 @@ def _num(value: Any, fallback: float) -> float:
 def _choice(options: list[str], value: Any, fallback: str) -> str:
     text = str(value)
     return text if text in options else fallback
+
+
+def _comma_list(raw_value: Any) -> list[str]:
+    if isinstance(raw_value, list):
+        return [str(item).strip() for item in raw_value if str(item).strip()]
+    text = str(raw_value or "")
+    return [item.strip() for item in re.split(r"[,;\n]+", text) if item.strip()]
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in values:
+        text = str(item).strip()
+        key = text.casefold()
+        if text and key not in seen:
+            out.append(text)
+            seen.add(key)
+    return out
+
+
+def _phase_material_defaults(diff_defaults: dict[str, Any]) -> list[str]:
+    raw = _dedupe_strings(
+        [
+            *_comma_list(diff_defaults.get("phase_candidate_materials", [])),
+            *_comma_list(diff_defaults.get("material_phase_candidates", [])),
+            *_comma_list(diff_defaults.get("candidate_phases", [])),
+            *_comma_list(diff_defaults.get("phase_lookup_materials", [])),
+            *_comma_list(diff_defaults.get("phase_lookup_formula", [])),
+            *_comma_list(diff_defaults.get("materials_project_ids", [])),
+        ]
+    )
+    return raw or PHASE_OPTIONS[:3]
+
+
+def _json_or_default(raw_text: str, fallback: Any) -> tuple[Any, list[str]]:
+    text = str(raw_text or "").strip()
+    if not text:
+        return fallback, []
+    try:
+        return json.loads(text), []
+    except Exception as exc:  # noqa: BLE001
+        return fallback, [f"JSON parse failed: {exc}"]
+
+
+def _zone_axis_tuple(raw_axis: Any) -> tuple[int, int, int] | None:
+    if not isinstance(raw_axis, (list, tuple)) or len(raw_axis) < 3:
+        return None
+    try:
+        axis = tuple(int(round(float(raw_axis[idx]))) for idx in range(3))
+    except (TypeError, ValueError):
+        return None
+    return None if axis == (0, 0, 0) else axis
+
+
+def _parse_zone_axis_candidates(raw_text: str) -> tuple[list[tuple[int, int, int]], list[str]]:
+    payload, warnings = _json_or_default(raw_text, [[0, 0, 1]])
+    axes: list[tuple[int, int, int]] = []
+    single_axis = _zone_axis_tuple(payload)
+    if single_axis is not None:
+        axes.append(single_axis)
+    elif isinstance(payload, list):
+        for raw_axis in payload:
+            axis = _zone_axis_tuple(raw_axis)
+            if axis is not None:
+                axes.append(axis)
+    if not axes:
+        warnings.append("zone_axis_candidates has no valid non-zero [h,k,l] rows.")
+        axes = [(0, 0, 1)]
+    unique: list[tuple[int, int, int]] = []
+    seen: set[tuple[int, int, int]] = set()
+    for axis in axes:
+        if axis in seen:
+            continue
+        seen.add(axis)
+        unique.append(axis)
+    return unique, warnings
+
+
+def _parse_float_vector(raw_text: str, fallback: list[float]) -> tuple[list[float], list[str]]:
+    payload, warnings = _json_or_default(raw_text, fallback)
+    if not isinstance(payload, list):
+        warnings.append("Expected a JSON list of numbers.")
+        return list(fallback), warnings
+    values: list[float] = []
+    for item in payload:
+        value = _to_float(item)
+        if value is not None:
+            values.append(float(value))
+    if not values:
+        warnings.append("No valid numeric values found.")
+        values = list(fallback)
+    return values, warnings
 
 
 def _to_float(value: Any) -> float | None:
@@ -1571,6 +1721,48 @@ def _phase_placeholders(names: list[str], top_n: int) -> list[PhaseCandidate]:
     ]
 
 
+def _phase_candidate_param_key(row: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(row.get("name", "")).strip().casefold(),
+        str(row.get("identifier", "")).strip().casefold(),
+        str(row.get("source", "")).strip().casefold(),
+    )
+
+
+def _phase_candidate_to_param(candidate: PhaseCandidate) -> dict[str, Any] | None:
+    lattice = dict(candidate.lattice_parameters or {})
+    required = {"a", "b", "c"}
+    if not required.issubset(lattice):
+        return None
+    row = dict(lattice)
+    row.update(
+        {
+            "name": candidate.name,
+            "formula": candidate.formula,
+            "source": candidate.source or "diffraction_phase_candidates",
+            "identifier": candidate.identifier,
+        }
+    )
+    return {key: value for key, value in row.items() if value is not None}
+
+
+def _merge_candidate_phase_params(
+    base_rows: list[dict[str, Any]],
+    phase_candidates: list[PhaseCandidate],
+) -> list[dict[str, Any]]:
+    rows = [dict(row) for row in base_rows if isinstance(row, dict)]
+    existing = {_phase_candidate_param_key(row) for row in rows}
+    for candidate in phase_candidates:
+        row = _phase_candidate_to_param(candidate)
+        if row is None:
+            continue
+        key = _phase_candidate_param_key(row)
+        if key not in existing:
+            rows.append(row)
+            existing.add(key)
+    return rows
+
+
 def _build_peak_rows(
     *,
     peaks: list[DiffractionPeak],
@@ -1650,6 +1842,279 @@ def _build_phase_rows(phase_candidates: list[PhaseCandidate]) -> list[dict[str, 
             }
         )
     return rows
+
+
+def _diffraction_from_manual_result(manual_result: dict[str, Any]) -> DiffractionResult:
+    d_by_peak = [item for item in manual_result.get("d_by_peak", []) if item is not None]
+    return DiffractionResult(
+        peaks=list(manual_result.get("peaks", [])),
+        g_vectors=list(manual_result.get("g_vectors", [])),
+        d_spacings=list(d_by_peak),
+        indexed_spots=list(manual_result.get("indexed_spots", [])),
+        phase_candidates=list(manual_result.get("phase_candidates", [])),
+        provenance=dict(manual_result.get("provenance", {})),
+        warnings=list(manual_result.get("warnings", [])),
+    )
+
+
+def _simulation_worker(
+    diffraction_payload: dict[str, Any],
+    parameters: dict[str, Any],
+    queue: Any,
+) -> None:
+    try:
+        diffraction = DiffractionResult.model_validate(diffraction_payload)
+        simulation = simulate_from_diffraction(diffraction, parameters=parameters)
+        queue.put(
+            {
+                "ok": True,
+                "simulation": simulation.model_dump(mode="json"),
+                "diffraction": diffraction.model_dump(mode="json"),
+            }
+        )
+    except BaseException as exc:  # noqa: BLE001
+        queue.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+
+def _run_b5_simulation_with_timeout(
+    diffraction: DiffractionResult,
+    *,
+    parameters: dict[str, Any],
+    timeout_s: float,
+) -> tuple[SimulationResult, DiffractionResult, list[str]]:
+    engine = str(parameters.get("simulation_engine", "baseline")).strip().lower()
+    if engine != "diffsims":
+        simulation = simulate_from_diffraction(diffraction, parameters=parameters)
+        return simulation, diffraction, list(simulation.warnings)
+
+    timeout = max(1.0, float(timeout_s))
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    process = ctx.Process(
+        target=_simulation_worker,
+        args=(diffraction.model_dump(mode="json"), dict(parameters), queue),
+    )
+    process.start()
+    process.join(timeout)
+    if process.is_alive():
+        process.terminate()
+        process.join(2.0)
+        warning = (
+            "B5 diffsims simulation timed out in the UI subprocess "
+            f"after {timeout:.1f}s; reduce candidates/zone axes or use baseline mode."
+        )
+        return (
+            SimulationResult(
+                matched_phase_candidates=list(diffraction.phase_candidates),
+                warnings=[warning],
+                provenance={
+                    "method": "diffsims",
+                    "ui_timeout": True,
+                    "timeout_s": float(timeout),
+                },
+            ),
+            diffraction,
+            [warning],
+        )
+
+    if queue.empty():
+        warning = "B5 diffsims subprocess exited without returning a result."
+        return (
+            SimulationResult(
+                matched_phase_candidates=list(diffraction.phase_candidates),
+                warnings=[warning],
+                provenance={"method": "diffsims", "ui_worker_empty": True},
+            ),
+            diffraction,
+            [warning],
+        )
+
+    payload = queue.get()
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        error = str(payload.get("error", "unknown diffsims subprocess error"))
+        warning = f"B5 diffsims subprocess failed: {error}"
+        return (
+            SimulationResult(
+                matched_phase_candidates=list(diffraction.phase_candidates),
+                warnings=[warning],
+                provenance={"method": "diffsims", "ui_worker_failed": True},
+            ),
+            diffraction,
+            [warning],
+        )
+
+    simulation = SimulationResult.model_validate(payload["simulation"])
+    updated_diffraction = DiffractionResult.model_validate(payload["diffraction"])
+    return simulation, updated_diffraction, list(simulation.warnings)
+
+
+def _build_simulation_phase_rows(simulation: SimulationResult | None) -> list[dict[str, Any]]:
+    if simulation is None:
+        return []
+    rows: list[dict[str, Any]] = []
+    phase_matching = _as_mapping(simulation.provenance.get("phase_matching", {}))
+    per_phase = phase_matching.get("per_phase", [])
+    per_phase_rows = {
+        str(row.get("phase_name")): dict(row)
+        for row in per_phase
+        if isinstance(row, dict) and str(row.get("phase_name", "")).strip()
+    } if isinstance(per_phase, list) else {}
+    for candidate in simulation.matched_phase_candidates:
+        row = per_phase_rows.get(candidate.name, {})
+        rows.append(
+            {
+                "name": candidate.name,
+                "formula": candidate.formula,
+                "source": candidate.source,
+                "identifier": candidate.identifier,
+                "score": candidate.score,
+                "matched_spot_count": candidate.matched_spot_count,
+                "mean_d_error": (
+                    None
+                    if candidate.mean_d_error is None
+                    else candidate.mean_d_error.value
+                ),
+                "mean_angle_error": (
+                    None
+                    if candidate.mean_angle_error is None
+                    else candidate.mean_angle_error.value
+                ),
+                "zone_axis": candidate.zone_axis,
+                "best_pattern_index": row.get("best_pattern_index"),
+                "simulated_spot_count": row.get("simulated_spot_count"),
+                "phase_match_rotation_deg": row.get("rotation_deg"),
+            }
+        )
+    return rows
+
+
+def _build_simulated_spot_rows(simulation: SimulationResult | None) -> list[dict[str, Any]]:
+    if simulation is None:
+        return []
+    rows: list[dict[str, Any]] = []
+    for pattern_idx, pattern in enumerate(simulation.patterns):
+        for spot_idx, spot in enumerate(pattern.spots):
+            rows.append(
+                {
+                    "pattern_index": pattern_idx,
+                    "structure_id": pattern.structure_id,
+                    "zone_axis": pattern.zone_axis,
+                    "rotation_angle_deg": pattern.simulation_parameters.get(
+                        "rotation_angle_deg"
+                    ),
+                    "spot_index": spot_idx,
+                    "gx": spot.gx.value,
+                    "gy": spot.gy.value,
+                    "magnitude": None if spot.magnitude is None else spot.magnitude.value,
+                    "intensity": spot.intensity,
+                    "h": spot.h,
+                    "k": spot.k,
+                    "l": spot.l,
+                }
+            )
+    return rows
+
+
+def _best_simulation_pattern(simulation: SimulationResult | None) -> SimulatedPattern | None:
+    if simulation is None or not simulation.patterns:
+        return None
+    phase_matching = _as_mapping(simulation.provenance.get("phase_matching", {}))
+    per_phase = phase_matching.get("per_phase", [])
+    selected_phase = str(phase_matching.get("selected_phase", ""))
+    if isinstance(per_phase, list):
+        for row in per_phase:
+            if not isinstance(row, dict):
+                continue
+            if selected_phase and str(row.get("phase_name", "")) != selected_phase:
+                continue
+            idx = row.get("best_pattern_index")
+            if isinstance(idx, int) and 0 <= idx < len(simulation.patterns):
+                return simulation.patterns[idx]
+    for pattern in simulation.patterns:
+        if _as_mapping(pattern.simulation_parameters.get("phase_match", {})):
+            return pattern
+    return simulation.patterns[0]
+
+
+def _plot_b5_simulation_overlay(
+    diffraction: DiffractionResult,
+    simulation: SimulationResult | None,
+) -> Any | None:
+    pattern = _best_simulation_pattern(simulation)
+    if pattern is None or not pattern.spots or not diffraction.g_vectors:
+        return None
+
+    phase_match = _as_mapping(pattern.simulation_parameters.get("phase_match", {}))
+    rotation_deg = _num(phase_match.get("rotation_deg"), 0.0)
+    theta = np.deg2rad(float(rotation_deg))
+    cr = float(np.cos(theta))
+    sr = float(np.sin(theta))
+
+    measured: dict[int, tuple[float, float]] = {}
+    for idx, g_vector in enumerate(diffraction.g_vectors):
+        gx = _measurement_value(g_vector.gx)
+        gy = _measurement_value(g_vector.gy)
+        if gx is not None and gy is not None:
+            measured[idx] = (float(gx), float(gy))
+
+    simulated: dict[int, tuple[float, float]] = {}
+    for idx, spot in enumerate(pattern.spots):
+        gx = _measurement_value(spot.gx)
+        gy = _measurement_value(spot.gy)
+        if gx is None or gy is None:
+            continue
+        simulated[idx] = (float(gx) * cr - float(gy) * sr, float(gx) * sr + float(gy) * cr)
+
+    if not measured or not simulated:
+        return None
+
+    fig, ax = plt.subplots(figsize=(6, 6), dpi=160)
+    ax.axhline(0.0, color="0.7", linewidth=0.6)
+    ax.axvline(0.0, color="0.7", linewidth=0.6)
+    measured_xy = np.asarray(list(measured.values()), dtype=float)
+    simulated_xy = np.asarray(list(simulated.values()), dtype=float)
+    ax.scatter(
+        measured_xy[:, 0],
+        measured_xy[:, 1],
+        s=40,
+        facecolors="none",
+        edgecolors="#1f77b4",
+        linewidths=1.3,
+        label="measured",
+    )
+    ax.scatter(
+        simulated_xy[:, 0],
+        simulated_xy[:, 1],
+        s=36,
+        marker="x",
+        c="#d64b3a",
+        linewidths=1.3,
+        label="simulated",
+    )
+    pairs = phase_match.get("matched_pairs", [])
+    if isinstance(pairs, list):
+        for pair in pairs:
+            if not isinstance(pair, dict):
+                continue
+            m_idx = pair.get("measured_g_index")
+            s_idx = pair.get("simulated_spot_index")
+            if not isinstance(m_idx, int) or not isinstance(s_idx, int):
+                continue
+            if m_idx in measured and s_idx in simulated:
+                mx, my = measured[m_idx]
+                sx, sy = simulated[s_idx]
+                ax.plot([mx, sx], [my, sy], color="0.35", linewidth=0.8, alpha=0.55)
+    stacked = np.vstack([measured_xy, simulated_xy])
+    limit = max(1.0, float(np.nanmax(np.abs(stacked))) * 1.15)
+    ax.set_xlim(-limit, limit)
+    ax.set_ylim(-limit, limit)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("gx (1/nm)")
+    ax.set_ylabel("gy (1/nm)")
+    ax.set_title("B5 measured vs simulated diffraction")
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    return fig
 
 
 def _build_manual_diffraction(
@@ -1997,8 +2462,8 @@ def main() -> None:
     st.set_page_config(page_title=_APP_TITLE, layout="wide")
     st.title(_APP_TITLE)
     st.caption(
-        "B1/B2/B3 interactive preview on current main-branch pipeline parameters "
-        "(quality, calibration, preprocessing, FFT peaks, indexing, phase match)."
+        "B1/B2/B3/B4/B5 interactive debugging for quality, calibration, "
+        "preprocessing, FFT peaks, indexing, phase lookup, and simulation matching."
     )
     st.caption(f"UI build: `{_UI_BUILD_TAG}`")
 
@@ -2007,6 +2472,7 @@ def main() -> None:
     cal_defaults = _as_mapping(merged_defaults.get("calibration"))
     prep_defaults = _as_mapping(merged_defaults.get("preprocessing"))
     diff_defaults = _as_mapping(merged_defaults.get("diffraction"))
+    sim_defaults = _as_mapping(merged_defaults.get("simulation"))
 
     st.sidebar.header("Run Setup")
     input_mode = st.sidebar.radio(
@@ -2228,17 +2694,42 @@ def main() -> None:
             value=_num(prep_defaults.get("denoise_sigma"), 0.8),
             step=0.1,
         )
-        median_size = st.number_input("median_size", min_value=1, value=3, step=1)
+        median_size = st.number_input(
+            "median_size",
+            min_value=1,
+            value=int(_num(prep_defaults.get("median_size"), 3)),
+            step=1,
+        )
         wiener_window = st.number_input(
             "wiener_window",
             min_value=3,
             value=int(_num(prep_defaults.get("wiener_window"), 5)),
             step=1,
         )
-        wiener_noise = st.number_input("wiener_noise", min_value=0.0, value=0.0, step=0.01)
-        nlm_h = st.number_input("nlm_h", min_value=0.0, value=0.05, step=0.01)
-        nlm_patch_size = st.number_input("nlm_patch_size", min_value=3, value=5, step=1)
-        nlm_patch_distance = st.number_input("nlm_patch_distance", min_value=1, value=6, step=1)
+        wiener_noise = st.number_input(
+            "wiener_noise",
+            min_value=0.0,
+            value=_num(prep_defaults.get("wiener_noise"), 0.0),
+            step=0.01,
+        )
+        nlm_h = st.number_input(
+            "nlm_h",
+            min_value=0.0,
+            value=_num(prep_defaults.get("nlm_h"), 0.05),
+            step=0.01,
+        )
+        nlm_patch_size = st.number_input(
+            "nlm_patch_size",
+            min_value=3,
+            value=int(_num(prep_defaults.get("nlm_patch_size"), 5)),
+            step=1,
+        )
+        nlm_patch_distance = st.number_input(
+            "nlm_patch_distance",
+            min_value=1,
+            value=int(_num(prep_defaults.get("nlm_patch_distance"), 6)),
+            step=1,
+        )
         background_method_default = _choice(
             SUPPORTED_BACKGROUND_METHODS,
             prep_defaults.get("background_method", "gaussian"),
@@ -2258,12 +2749,15 @@ def main() -> None:
         background_opening_size = st.number_input(
             "background_opening_size",
             min_value=3,
-            value=31,
+            value=int(_num(prep_defaults.get("background_opening_size"), 31)),
             step=2,
         )
-        background_clip_zero = st.checkbox("background_clip_zero", value=False)
+        background_clip_zero = st.checkbox(
+            "background_clip_zero",
+            value=bool(prep_defaults.get("background_clip_zero", False)),
+        )
 
-    with st.sidebar.expander("B3 Diffraction", expanded=True):
+    with st.sidebar.expander("B3/B4 Diffraction + Indexing", expanded=True):
         auto_peak_tuning = st.checkbox(
             "auto_peak_tuning",
             value=bool(diff_defaults.get("auto_peak_tuning", True)),
@@ -2409,13 +2903,18 @@ def main() -> None:
             value=int(_num(diff_defaults.get("phase_top_n"), 3)),
             step=1,
         )
-        candidate_phases_default = diff_defaults.get("candidate_phases", PHASE_OPTIONS[:3])
-        candidate_phases_default = [x for x in candidate_phases_default if x in PHASE_OPTIONS]
-        candidate_phases = st.multiselect(
-            "candidate_phases",
-            options=PHASE_OPTIONS,
-            default=candidate_phases_default if candidate_phases_default else PHASE_OPTIONS[:3],
+        phase_materials_default = _phase_material_defaults(diff_defaults)
+        phase_materials_text = st.text_area(
+            "materials / phases",
+            value=", ".join(phase_materials_default),
+            height=80,
+            placeholder="PbS, TiO2, quartz, mp-149",
+            help=(
+                "Comma-, semicolon-, or newline-separated names. Letter case is preserved "
+                "for chemical formulas, so PbS stays PbS."
+            ),
         )
+        candidate_phase_names = _dedupe_strings(_comma_list(phase_materials_text))
         b4_strict_mode = st.checkbox(
             "b4_strict_mode",
             value=bool(diff_defaults.get("b4_strict_mode", False)),
@@ -2447,6 +2946,233 @@ def main() -> None:
             height=190,
         )
 
+        st.markdown("**Crystal sources**")
+        st.caption(
+            "B4 lookup runs automatically when B4 indexing is active and at least "
+            "one crystal source is selected."
+        )
+        lookup_sources_all = sorted(supported_phase_lookup_sources())
+        lookup_sources_config = [
+            item
+            for item in diff_defaults.get("phase_lookup_sources", DEFAULT_PHASE_LOOKUP_SOURCES)
+            if item in lookup_sources_all
+        ]
+        if diff_defaults.get("phase_lookup_enabled") is False:
+            lookup_sources_default = ["local_builtin"]
+        else:
+            lookup_sources_default = lookup_sources_config or [
+                item for item in DEFAULT_PHASE_LOOKUP_SOURCES if item in lookup_sources_all
+            ]
+        phase_lookup_sources = st.multiselect(
+            "phase_lookup_sources",
+            options=lookup_sources_all,
+            default=lookup_sources_default or ["local_builtin"],
+            disabled=indexing_mode == "baseline",
+        )
+        phase_lookup_active = indexing_mode != "baseline" and bool(phase_lookup_sources)
+        phase_lookup_elements_text = st.text_input(
+            "phase_lookup_elements",
+            value=", ".join(_comma_list(diff_defaults.get("phase_lookup_elements", []))),
+            disabled=not phase_lookup_active,
+        )
+        materials_project_config_path = st.text_input(
+            "materials_project_config_path",
+            value=str(diff_defaults.get("materials_project_config_path", "")),
+            disabled=not phase_lookup_active,
+        )
+        phase_lookup_limit_per_source = st.number_input(
+            "phase_lookup_limit_per_source",
+            min_value=1,
+            value=int(_num(diff_defaults.get("phase_lookup_limit_per_source"), 3)),
+            step=1,
+            disabled=not phase_lookup_active,
+        )
+        phase_lookup_timeout_s = st.number_input(
+            "phase_lookup_timeout_s",
+            min_value=0.1,
+            value=_num(diff_defaults.get("phase_lookup_timeout_s"), 10.0),
+            step=0.5,
+            disabled=not phase_lookup_active,
+        )
+        mp_sort_by = st.selectbox(
+            "materials_project_sort_by",
+            options=SUPPORTED_MP_SORT_MODES,
+            index=SUPPORTED_MP_SORT_MODES.index(
+                _choice(
+                    SUPPORTED_MP_SORT_MODES,
+                    diff_defaults.get("materials_project_sort_by", "stability"),
+                    "stability",
+                )
+            ),
+            disabled=not phase_lookup_active,
+        )
+        mp_include_deprecated = st.checkbox(
+            "materials_project_include_deprecated",
+            value=bool(diff_defaults.get("materials_project_include_deprecated", False)),
+            disabled=not phase_lookup_active,
+        )
+        mp_filter_stable = st.checkbox(
+            "materials_project_filter_stable",
+            value=bool(diff_defaults.get("materials_project_filter_stable", False)),
+            disabled=not phase_lookup_active,
+        )
+        mp_max_energy = st.number_input(
+            "materials_project_max_energy_above_hull (0 disables)",
+            min_value=0.0,
+            value=_num(diff_defaults.get("materials_project_max_energy_above_hull"), 0.0),
+            step=0.01,
+            format="%.4f",
+            disabled=not phase_lookup_active,
+        )
+        mp_prefer_experimental = st.checkbox(
+            "materials_project_prefer_experimental",
+            value=bool(diff_defaults.get("materials_project_prefer_experimental", True)),
+            disabled=not phase_lookup_active,
+        )
+        mp_candidate_pool_size = st.number_input(
+            "materials_project_candidate_pool_size",
+            min_value=1,
+            value=int(_num(diff_defaults.get("materials_project_candidate_pool_size"), 20)),
+            step=1,
+            disabled=not phase_lookup_active,
+        )
+        if phase_lookup_active and any(
+            source == "materials_project_api" for source in phase_lookup_sources
+        ):
+            st.info(materials_project_api_setup_guidance(materials_project_config_path or None))
+            st.caption(
+                "UI runs Materials Project API lookup in an isolated child process so "
+                "native crashes or timeouts return B4 warnings instead of closing Streamlit."
+            )
+
+    with st.sidebar.expander("B5 Simulation / Phase Matching", expanded=False):
+        b5_enabled = st.checkbox(
+            "Run B5 simulation step",
+            value=bool(sim_defaults.get("enabled", True)),
+        )
+        simulation_engine = st.selectbox(
+            "simulation_engine",
+            options=SUPPORTED_SIMULATION_ENGINES,
+            index=SUPPORTED_SIMULATION_ENGINES.index(
+                _choice(
+                    SUPPORTED_SIMULATION_ENGINES,
+                    sim_defaults.get("simulation_engine", "baseline"),
+                    "baseline",
+                )
+            ),
+            disabled=not b5_enabled,
+            help=(
+                "Use baseline for quick UI debugging; diffsims runs in a "
+                "timeout-limited subprocess."
+            ),
+        )
+        st.caption(
+            "B5 uses the current active peak set, B1 voltage, B3/B4 phase candidates, "
+            "and B4 d/angle tolerances."
+        )
+        b5_auto_rerun = st.checkbox(
+            "Auto rerun B5 on parameter change",
+            value=bool(sim_defaults.get("auto_rerun", False)),
+            disabled=not b5_enabled,
+        )
+        b5_timeout_s = st.number_input(
+            "diffsims timeout_s",
+            min_value=1.0,
+            value=_num(sim_defaults.get("timeout_s"), 20.0),
+            step=1.0,
+            disabled=not b5_enabled or simulation_engine != "diffsims",
+        )
+        reciprocal_radius = st.number_input(
+            "reciprocal_radius_inv_angstrom",
+            min_value=0.01,
+            value=_num(sim_defaults.get("reciprocal_radius_inv_angstrom"), 1.0),
+            step=0.1,
+            disabled=not b5_enabled,
+        )
+        max_simulated_spots = st.number_input(
+            "max_simulated_spots",
+            min_value=1,
+            value=int(_num(sim_defaults.get("max_simulated_spots"), 128)),
+            step=16,
+            disabled=not b5_enabled,
+        )
+        min_simulated_g = st.number_input(
+            "minimum_simulated_g_inv_nm",
+            min_value=0.0,
+            value=_num(sim_defaults.get("minimum_simulated_g_inv_nm"), 0.001),
+            step=0.001,
+            format="%.6f",
+            disabled=not b5_enabled,
+        )
+        sim_with_direct_beam = st.checkbox(
+            "with_direct_beam",
+            value=bool(sim_defaults.get("with_direct_beam", True)),
+            disabled=not b5_enabled,
+        )
+        sim_max_excitation_error = st.number_input(
+            "max_excitation_error",
+            min_value=1e-6,
+            value=_num(sim_defaults.get("max_excitation_error"), 0.01),
+            step=0.005,
+            format="%.6f",
+            disabled=not b5_enabled,
+        )
+        sim_fallback_single_atom = st.checkbox(
+            "fallback_single_atom",
+            value=bool(sim_defaults.get("fallback_single_atom", True)),
+            disabled=not b5_enabled,
+        )
+        zone_axis_text = st.text_area(
+            "zone_axis_candidates JSON",
+            value=json.dumps(
+                sim_defaults.get("zone_axis_candidates", [[0, 0, 1]]),
+                ensure_ascii=False,
+            ),
+            height=80,
+            disabled=not b5_enabled,
+        )
+        rotation_axis_text = st.text_input(
+            "rotation_axis JSON",
+            value=json.dumps(sim_defaults.get("rotation_axis", [0, 0, 1])),
+            disabled=not b5_enabled,
+        )
+        rotation_angles_text = st.text_input(
+            "rotation_angles_deg JSON",
+            value=json.dumps(sim_defaults.get("rotation_angles_deg", [0.0])),
+            disabled=not b5_enabled,
+        )
+        phase_match_enabled = st.checkbox(
+            "phase_match_enabled",
+            value=bool(sim_defaults.get("phase_match_enabled", True)),
+            disabled=not b5_enabled,
+        )
+        phase_match_min_spots = st.number_input(
+            "phase_match_min_spots",
+            min_value=1,
+            value=int(_num(sim_defaults.get("phase_match_min_spots"), 2)),
+            step=1,
+            disabled=not b5_enabled or not phase_match_enabled,
+        )
+        phase_match_previous_score_weight = st.number_input(
+            "phase_match_previous_score_weight",
+            min_value=0.0,
+            max_value=1.0,
+            value=_num(sim_defaults.get("phase_match_previous_score_weight"), 0.35),
+            step=0.05,
+            disabled=not b5_enabled or not phase_match_enabled,
+        )
+        phase_match_max_rotation_candidates = st.number_input(
+            "phase_match_max_rotation_candidates",
+            min_value=1,
+            value=int(_num(sim_defaults.get("phase_match_max_rotation_candidates"), 64)),
+            step=1,
+            disabled=not b5_enabled or not phase_match_enabled,
+        )
+        if b5_enabled and simulation_engine == "diffsims":
+            st.warning(
+                "Real diffsims can hang in this environment; the UI uses a subprocess timeout."
+            )
+
     st.sidebar.subheader("Manual Point Selection Params")
     overlay_label_mode = st.sidebar.selectbox(
         "Overlay numbering",
@@ -2455,7 +3181,7 @@ def main() -> None:
     )
     manual_min_distance = st.sidebar.slider("Manual dedup distance (px)", 0.5, 12.0, 2.0, 0.1)
     manual_max_points = st.sidebar.slider("Manual max points", 2, 256, 64, 1)
-    with st.sidebar.expander("手动模式：两点向量合成参数", expanded=False):
+    with st.sidebar.expander("Manual mode: two-point vector synthesis", expanded=False):
         vector_expand_order = st.slider(
             "Vector expansion order",
             min_value=1,
@@ -2466,7 +3192,7 @@ def main() -> None:
         vector_snap_mode = st.selectbox(
             "Vector snap method",
             options=["none", "local_max"],
-            index=0,
+            index=1,
             help=(
                 "`none` keeps strict lattice coordinates from the two basis vectors. "
                 "`local_max` optionally shifts synthesized points to nearby FFT maxima. "
@@ -2652,6 +3378,20 @@ def main() -> None:
     candidate_phase_params, candidate_phase_warnings = _parse_candidate_phase_params(
         candidate_phase_params_text
     )
+    phase_lookup_elements = _comma_list(phase_lookup_elements_text)
+    zone_axis_candidates, zone_axis_warnings = _parse_zone_axis_candidates(zone_axis_text)
+    rotation_axis_values, rotation_axis_warnings = _parse_float_vector(
+        rotation_axis_text,
+        [0.0, 0.0, 1.0],
+    )
+    if len(rotation_axis_values) < 3:
+        rotation_axis_warnings.append("rotation_axis must contain at least three numbers.")
+        rotation_axis_values = [0.0, 0.0, 1.0]
+    rotation_axis_values = rotation_axis_values[:3]
+    rotation_angles, rotation_angle_warnings = _parse_float_vector(
+        rotation_angles_text,
+        [0.0],
+    )
     diffraction_params: dict[str, Any] = {
         "auto_peak_tuning": bool(auto_peak_tuning),
         "peak_detector": str(peak_detector),
@@ -2674,7 +3414,8 @@ def main() -> None:
         "direct_beam_center_uncertainty_px": float(direct_beam_center_uncertainty_px),
         "indexing_mode": str(indexing_mode),
         "phase_top_n": int(phase_top_n),
-        "candidate_phases": list(candidate_phases),
+        "phase_candidate_materials": list(candidate_phase_names),
+        "candidate_phases": list(candidate_phase_names),
         "candidate_phase_params": list(candidate_phase_params),
         "max_hkl": int(max_hkl),
         "d_tolerance_rel": float(d_tolerance_rel),
@@ -2687,6 +3428,49 @@ def main() -> None:
         diffraction_params["direct_beam_search_radius"] = float(direct_beam_search_radius)
     if cif_candidates_dir.strip():
         diffraction_params["cif_candidates_dir"] = str(cif_candidates_dir.strip())
+    if phase_lookup_active:
+        diffraction_params.update(
+            {
+                "phase_lookup_sources": list(phase_lookup_sources),
+                "phase_lookup_limit_per_source": int(phase_lookup_limit_per_source),
+                "phase_lookup_timeout_s": float(phase_lookup_timeout_s),
+                "materials_project_sort_by": str(mp_sort_by),
+                "materials_project_include_deprecated": bool(mp_include_deprecated),
+                "materials_project_filter_stable": bool(mp_filter_stable),
+                "materials_project_prefer_experimental": bool(mp_prefer_experimental),
+                "materials_project_candidate_pool_size": int(mp_candidate_pool_size),
+            }
+        )
+        if "materials_project_api" in phase_lookup_sources:
+            diffraction_params["materials_project_api_isolate"] = True
+        if phase_lookup_elements:
+            diffraction_params["phase_lookup_elements"] = phase_lookup_elements
+        if materials_project_config_path.strip():
+            diffraction_params["materials_project_config_path"] = (
+                materials_project_config_path.strip()
+            )
+        if float(mp_max_energy) > 0:
+            diffraction_params["materials_project_max_energy_above_hull"] = float(mp_max_energy)
+
+    b5_params: dict[str, Any] = {
+        "simulation_engine": str(simulation_engine),
+        "voltage_kv": float(voltage_kv),
+        "reciprocal_radius_inv_angstrom": float(reciprocal_radius),
+        "max_simulated_spots": int(max_simulated_spots),
+        "minimum_simulated_g_inv_nm": float(min_simulated_g),
+        "with_direct_beam": bool(sim_with_direct_beam),
+        "max_excitation_error": float(sim_max_excitation_error),
+        "fallback_single_atom": bool(sim_fallback_single_atom),
+        "zone_axis_candidates": [list(axis) for axis in zone_axis_candidates],
+        "rotation_axis": [float(item) for item in rotation_axis_values],
+        "rotation_angles_deg": [float(item) for item in rotation_angles],
+        "phase_match_enabled": bool(phase_match_enabled),
+        "phase_match_d_tolerance_rel": float(d_tolerance_rel),
+        "phase_match_angle_tolerance_deg": float(angle_tolerance_deg),
+        "phase_match_min_spots": int(phase_match_min_spots),
+        "phase_match_previous_score_weight": float(phase_match_previous_score_weight),
+        "phase_match_max_rotation_candidates": int(phase_match_max_rotation_candidates),
+    }
 
     manual_table_from_upload = _decode_uploaded_text(manual_table_upload).strip()
     manual_table_from_text = str(manual_table_text or "").strip()
@@ -2836,6 +3620,10 @@ def main() -> None:
     calibration = cache["calibration"]
     preprocessing = cache["preprocessing"]
     diffraction_auto = cache["diffraction_auto"]
+    manual_candidate_phase_params = _merge_candidate_phase_params(
+        candidate_phase_params,
+        list(diffraction_auto.phase_candidates),
+    )
     original_image = np.asarray(cache["original_image"], dtype=np.float32)
     processed_image = np.asarray(cache["processed_image"], dtype=np.float32)
     fft_analysis = cache["fft_analysis"]
@@ -3755,8 +4543,8 @@ def main() -> None:
                 getattr(calibration, "diffraction_scale", None)
             ),
             "diffraction": diffraction_params,
-            "candidate_phase_params": candidate_phase_params,
-            "candidate_phases": list(candidate_phases),
+            "candidate_phase_params": manual_candidate_phase_params,
+            "candidate_phases": list(candidate_phase_names),
             "manual_refine": manual_refine_diagnostics,
             "vector_synthesis": vector_synth_diagnostics,
             "auto_remove_peak_ids": [int(i) for i in auto_remove_peak_ids],
@@ -3772,8 +4560,8 @@ def main() -> None:
             fft_center=(float(fft_analysis.center[0]), float(fft_analysis.center[1])),
             calibration=calibration,
             diff_params=diffraction_params,
-            candidate_phase_params=candidate_phase_params,
-            candidate_phases=list(candidate_phases),
+            candidate_phase_params=manual_candidate_phase_params,
+            candidate_phases=list(candidate_phase_names),
         )
         manual_result = _with_manual_context(
             manual_result,
@@ -3843,6 +4631,11 @@ def main() -> None:
         d_by_peak=list(manual_result["d_by_peak"]),
         indexed_spots=list(manual_result["indexed_spots"]),
     )
+    active_peak_source_label = (
+        "Review set (active)"
+        if selection_mode == MODE_AUTO_EDIT
+        else "Vector synthesis set (active)"
+    )
     align_target_rows = auto_rows if align_target_mode == "Auto (pipeline)" else selected_rows
     align_target_candidates = _build_align_candidates(align_target_rows, id_key="peak_id")
     align_signature = _json_signature(
@@ -3878,48 +4671,177 @@ def main() -> None:
             "result": align_result,
         }
 
-    selected_tab_label = (
-        "Auto review set"
-        if selection_mode == MODE_AUTO_EDIT
-        else "Vector synthesis set"
+    b5_source_mode = active_peak_source_label
+    b5_source_diffraction = _diffraction_from_manual_result(manual_result)
+    b5_signature = _json_signature(
+        {
+            "enabled": bool(b5_enabled),
+            "source_mode": str(b5_source_mode),
+            "diffraction": b5_source_diffraction.model_dump(mode="json"),
+            "parameters": b5_params,
+        }
     )
-    tab_selected, tab_auto, tab_manual_align, tab_b1, tab_diag = st.tabs(
+    b5_cache = st.session_state.get("b1b5_simulation_cache")
+    b5_cached = isinstance(b5_cache, dict) and b5_cache.get("signature") == b5_signature
+    b5_col1, b5_col2 = st.columns([0.22, 0.78])
+    with b5_col1:
+        b5_run_clicked = st.button(
+            "Run / refresh B5",
+            type="secondary",
+            disabled=not b5_enabled,
+            help="Runs simulation and experimental-vs-simulated phase matching.",
+        )
+    with b5_col2:
+        if b5_enabled:
+            st.caption(
+                f"B5 source: `{b5_source_mode}` | engine: `{simulation_engine}` | "
+                f"cached: `{b5_cached}`"
+            )
+        else:
+            st.caption("B5 simulation is disabled in the sidebar.")
+    should_auto_run_b5 = bool(b5_enabled) and (
+        bool(b5_auto_rerun) or str(simulation_engine) == "baseline"
+    )
+    need_b5_run = bool(b5_enabled) and (
+        b5_run_clicked or (should_auto_run_b5 and not b5_cached)
+    )
+    if need_b5_run:
+        with st.spinner("Running B5 simulation / phase matching..."):
+            simulation_result, b5_updated_diffraction, b5_warnings = (
+                _run_b5_simulation_with_timeout(
+                    b5_source_diffraction.model_copy(deep=True),
+                    parameters=b5_params,
+                    timeout_s=float(b5_timeout_s),
+                )
+            )
+        st.session_state["b1b5_simulation_cache"] = {
+            "signature": b5_signature,
+            "simulation": simulation_result,
+            "diffraction": b5_updated_diffraction,
+            "warnings": b5_warnings,
+        }
+        b5_cache = st.session_state.get("b1b5_simulation_cache")
+        b5_cached = True
+
+    if (
+        bool(b5_enabled)
+        and isinstance(b5_cache, dict)
+        and b5_cache.get("signature") == b5_signature
+    ):
+        b5_simulation = b5_cache.get("simulation")
+        b5_diffraction_used = b5_cache.get("diffraction")
+        b5_run_warnings = list(b5_cache.get("warnings", []))
+    else:
+        b5_simulation = None
+        b5_diffraction_used = b5_source_diffraction
+        b5_run_warnings = []
+
+    tab_peak_sets, tab_b5, tab_manual_align, tab_b1, tab_diag = st.tabs(
         [
-            selected_tab_label,
-            "Auto (pipeline)",
+            "Peak sets / Phase candidates",
+            "B5 simulation",
             "Manual table align",
             "B1 details",
             "Warnings / Provenance",
         ]
     )
 
-    with tab_selected:
+    with tab_peak_sets:
+        peak_rows = selected_rows
+        phase_candidates = list(manual_result["phase_candidates"])
         if selection_mode == MODE_AUTO_EDIT:
-            st.caption(
-                "Active peak set after applying canvas edits. Auto-detected and manually "
-                "added spots are merged, intensity-sorted, and analyzed through the same B3/B4 "
-                "metric path."
+            source_caption = (
+                "Active reviewed set after canvas edits, merge, and intensity sorting."
             )
         else:
-            st.caption(
-                "Active vector-mode spot set synthesized from the two basis points. "
-                "This panel uses the current B3/B4 code paths for metrics and indexing."
-            )
-        st.dataframe(selected_rows, use_container_width=True, height=300)
-        st.subheader("Selected Phase Candidates")
+            source_caption = "Active vector-mode set synthesized from the two basis spots."
+
+        source_cols = st.columns(3)
+        source_cols[0].metric("Peak rows", str(len(peak_rows)))
+        source_cols[1].metric("Phase candidates", str(len(phase_candidates)))
+        source_cols[2].metric("Pipeline original", str(len(auto_rows)))
+        st.caption(f"Source: `{active_peak_source_label}`")
+        st.caption(source_caption)
+        st.dataframe(peak_rows, use_container_width=True, height=300)
+        st.subheader("Phase Candidates")
         st.dataframe(
-            _build_phase_rows(list(manual_result["phase_candidates"])),
+            _build_phase_rows(phase_candidates),
             use_container_width=True,
         )
 
-    with tab_auto:
-        st.caption("Original pipeline output (`run_diffraction_analysis`) before review edits.")
-        st.dataframe(auto_rows, use_container_width=True, height=300)
-        st.subheader("Auto Phase Candidates")
-        st.dataframe(
-            _build_phase_rows(list(diffraction_auto.phase_candidates)),
-            use_container_width=True,
+    with tab_b5:
+        st.caption(
+            "B5 debug panel for simulated diffraction, zone-axis candidates, and "
+            "experimental-vs-simulated phase matching."
         )
+        if not b5_enabled:
+            st.info("Enable `Run B5 simulation step` in the sidebar to debug B5.")
+        elif b5_simulation is None:
+            st.info("Click `Run / refresh B5` to run B5 simulation for the current peak set.")
+        else:
+            phase_matching = _as_mapping(b5_simulation.provenance.get("phase_matching", {}))
+            adapter = _as_mapping(b5_simulation.provenance.get("adapter", {}))
+            metric_cols = st.columns(6)
+            metric_cols[0].metric(
+                "Engine",
+                str(b5_simulation.provenance.get("method", b5_params.get("simulation_engine"))),
+            )
+            metric_cols[1].metric(
+                "Patterns",
+                str(len(b5_simulation.patterns)),
+            )
+            metric_cols[2].metric(
+                "Matched phases",
+                str(len(b5_simulation.matched_phase_candidates)),
+            )
+            metric_cols[3].metric(
+                "Selected phase",
+                str(phase_matching.get("selected_phase", "-")),
+            )
+            metric_cols[4].metric(
+                "Selected zone axis",
+                str(phase_matching.get("selected_zone_axis", "-")),
+            )
+            metric_cols[5].metric(
+                "Adapter active",
+                str(adapter.get("active", "")),
+            )
+
+            overlay_fig_b5 = _plot_b5_simulation_overlay(
+                b5_diffraction_used
+                if isinstance(b5_diffraction_used, DiffractionResult)
+                else b5_source_diffraction,
+                b5_simulation,
+            )
+            if overlay_fig_b5 is not None:
+                st.pyplot(overlay_fig_b5, clear_figure=True)
+            else:
+                st.info("No B5 reciprocal-space overlay is available for this result.")
+
+            st.subheader("B5 Phase Match Candidates")
+            phase_rows = _build_simulation_phase_rows(b5_simulation)
+            if phase_rows:
+                st.dataframe(phase_rows, use_container_width=True, height=260)
+            else:
+                st.info("No B5 matched phase candidates recorded.")
+
+            st.subheader("Simulated Spots")
+            spot_rows = _build_simulated_spot_rows(b5_simulation)
+            if spot_rows:
+                st.dataframe(spot_rows, use_container_width=True, height=260)
+            else:
+                st.info("No simulated spots recorded.")
+
+            st.subheader("B5 Parameters")
+            st.json(
+                {
+                    "source_mode": b5_source_mode,
+                    "parameters": b5_params,
+                    "phase_matching": phase_matching,
+                    "adapter": adapter,
+                    "warnings": b5_run_warnings,
+                }
+            )
 
     with tab_manual_align:
         st.caption(
@@ -4060,8 +4982,12 @@ def main() -> None:
     with tab_diag:
         warnings = []
         warnings.extend(list(candidate_phase_warnings))
+        warnings.extend(list(zone_axis_warnings))
+        warnings.extend(list(rotation_axis_warnings))
+        warnings.extend(list(rotation_angle_warnings))
         warnings.extend(list(manual_table_parse_warnings))
         warnings.extend(list(align_result.get("warnings", [])))
+        warnings.extend(list(b5_run_warnings))
         warnings.extend(list(dataset.warnings))
         warnings.extend(list(quality.warnings))
         warnings.extend(list(calibration.warnings))
@@ -4085,6 +5011,11 @@ def main() -> None:
         st.json(diffraction_auto.provenance)
         st.markdown("**Selected-point provenance**")
         st.json(manual_result["provenance"])
+        st.markdown("**B5 simulation provenance**")
+        if isinstance(b5_simulation, SimulationResult):
+            st.json(b5_simulation.provenance)
+        else:
+            st.info("B5 simulation has not been run for the current signature.")
         st.markdown("**Manual-table alignment summary**")
         st.json(
             {
@@ -4106,6 +5037,8 @@ def main() -> None:
                     "input_path": str(input_path),
                     "output_dir": str(run_dir),
                     "signature_len": len(signature),
+                    "diffraction": diffraction_params,
+                    "simulation": b5_params,
                 },
                 sort_keys=False,
                 allow_unicode=False,

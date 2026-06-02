@@ -297,7 +297,7 @@ def test_cli_preview_b1b3_launches_streamlit(monkeypatch, tmp_path: Path, capsys
     captured = capsys.readouterr()
 
     assert exit_code == 0
-    assert "Launching B1-B3 preview UI" in captured.out
+    assert "Launching B1-B5 diffraction debug UI" in captured.out
     cmd = called["cmd"]
     assert isinstance(cmd, list)
     assert "streamlit" in cmd
@@ -331,5 +331,111 @@ def test_cli_preview_b1b3_nonzero_streamlit_exit_returns_runtime_error(
     exit_code = main(["preview-b1b3"])
     captured = capsys.readouterr()
 
-    assert "Launching B1-B3 preview UI" in captured.out
+    assert "Launching B1-B5 diffraction debug UI" in captured.out
     assert exit_code == EXIT_RUNTIME_ERROR
+
+
+def test_cli_configure_mp_api_show_guidance(tmp_path: Path, capsys) -> None:
+    config_path = tmp_path / "mp.json"
+    exit_code = main(["configure-mp-api", "--show", "--config", str(config_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Materials Project API key is not configured" in captured.out
+    assert str(config_path) in captured.out
+
+
+def test_cli_configure_mp_api_writes_key_from_stdin(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    config_path = tmp_path / "mp.json"
+
+    class _FakeStdin:
+        def read(self) -> str:
+            return "secret-key\n"
+
+    monkeypatch.setattr("autotem.cli.sys.stdin", _FakeStdin())
+    exit_code = main(
+        ["configure-mp-api", "--api-key-stdin", "--config", str(config_path)]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "stored" in captured.out
+    assert "secret-key" in config_path.read_text(encoding="utf-8")
+
+
+def test_cli_configure_mp_api_check_missing_returns_config_error(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    monkeypatch.delenv("MP_API_KEY", raising=False)
+    exit_code = main(
+        ["configure-mp-api", "--check", "--config", str(tmp_path / "missing.json")]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_CONFIG_ERROR
+    assert "Materials Project API key is not configured" in captured.err
+
+
+def test_cli_validate_diffsims_success(monkeypatch, capsys) -> None:
+    called: dict[str, object] = {}
+
+    def fake_validate(**kwargs):
+        called.update(kwargs)
+        return {
+            "status": "passed",
+            "ok": True,
+            "dependencies": {"diffsims": "0.7.0"},
+            "materials": [{"material": "si", "ok": True}],
+            "warnings": [],
+        }
+
+    monkeypatch.setattr("autotem.cli.run_diffsims_smoke_validation", fake_validate)
+    exit_code = main(
+        [
+            "validate-diffsims",
+            "--materials",
+            "si",
+            "--voltage-kv",
+            "300",
+            "--reciprocal-radius",
+            "1.2",
+            "--max-simulated-spots",
+            "64",
+            "--max-measured-spots",
+            "4",
+            "--min-matched-spots",
+            "2",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "diffsims validation passed" in captured.out
+    assert called["materials"] == ["si"]
+    assert called["voltage_kv"] == 300.0
+    assert called["reciprocal_radius_inv_angstrom"] == 1.2
+    assert called["max_simulated_spots"] == 64
+    assert called["max_measured_spots"] == 4
+    assert called["min_matched_spots"] == 2
+
+
+def test_cli_validate_diffsims_failure_returns_runtime_error(
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(
+        "autotem.cli.run_diffsims_smoke_validation",
+        lambda **_: {"status": "failed", "ok": False, "warnings": ["missing diffsims"]},
+    )
+
+    exit_code = main(["validate-diffsims", "--materials", "si"])
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_RUNTIME_ERROR
+    assert "diffsims validation failed" in captured.out
