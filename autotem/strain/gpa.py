@@ -646,10 +646,23 @@ def _unwrap_phase_for_displacement(
         return np.unwrap(np.unwrap(np.asarray(phase, dtype=np.float64), axis=0), axis=1)
     phase_arr = np.asarray(phase, dtype=np.float64)
     if quality_mask is not None and quality_mask.shape == phase_arr.shape and np.any(quality_mask):
-        unwrapped = unwrap_phase(np.ma.array(phase_arr, mask=~quality_mask.astype(bool)))
+        mask = np.asarray(quality_mask, dtype=bool)
+        y_idx, x_idx = np.nonzero(mask)
+        y0, y1 = int(np.min(y_idx)), int(np.max(y_idx)) + 1
+        x0, x1 = int(np.min(x_idx)), int(np.max(x_idx)) + 1
+        crop_phase = phase_arr[y0:y1, x0:x1]
+        crop_mask = mask[y0:y1, x0:x1]
+        if bool(np.all(crop_mask)):
+            unwrapped = unwrap_phase(crop_phase)
+        else:
+            unwrapped = unwrap_phase(np.ma.array(crop_phase, mask=~crop_mask))
         if np.ma.isMaskedArray(unwrapped):
-            return np.asarray(unwrapped.filled(0.0), dtype=np.float64)
-        return np.asarray(unwrapped, dtype=np.float64)
+            unwrapped_crop = np.asarray(unwrapped.filled(0.0), dtype=np.float64)
+        else:
+            unwrapped_crop = np.asarray(unwrapped, dtype=np.float64)
+        out = np.zeros_like(phase_arr, dtype=np.float64)
+        out[y0:y1, x0:x1] = unwrapped_crop
+        return out
     return np.asarray(unwrap_phase(phase_arr), dtype=np.float64)
 
 
