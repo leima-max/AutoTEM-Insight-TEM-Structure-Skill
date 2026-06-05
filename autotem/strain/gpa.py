@@ -652,7 +652,11 @@ def _unwrap_phase_for_displacement(
             if crop_mask is not None and crop_mask.shape == crop_arr.shape:
                 crop_arr = np.where(crop_mask, crop_arr, 0.0)
             return np.unwrap(np.unwrap(crop_arr, axis=0), axis=1)
-        if crop_mask is not None and crop_mask.shape == crop_arr.shape and not bool(np.all(crop_mask)):
+        if (
+            crop_mask is not None
+            and crop_mask.shape == crop_arr.shape
+            and not bool(np.all(crop_mask))
+        ):
             unwrapped = unwrap_phase(np.ma.array(crop_arr, mask=~crop_mask))
         else:
             unwrapped = unwrap_phase(crop_arr)
@@ -900,7 +904,8 @@ def _normalize_reference_regions(
         raise ValueError("GPA reference_regions must contain exactly two entries for g1 and g2.")
     if reference_region is not None:
         warnings.append(
-            "Both GPA reference_region and reference_regions were provided; using per-g reference_regions."
+            "Both GPA reference_region and reference_regions were provided; "
+            "using per-g reference_regions."
         )
     refs = tuple(
         _normalize_reference_region(
@@ -914,7 +919,8 @@ def _normalize_reference_regions(
     )
     if refs[0] is None and refs[1] is None:
         warnings.append(
-            "GPA reference_regions not provided; using supplied g-vectors as the absolute reference."
+            "GPA reference_regions not provided; "
+            "using supplied g-vectors as the absolute reference."
         )
     return refs  # type: ignore[return-value]
 
