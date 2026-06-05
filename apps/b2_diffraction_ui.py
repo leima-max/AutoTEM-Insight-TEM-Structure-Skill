@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import inspect
 import json
 import multiprocessing as mp
 import os
@@ -17,6 +19,8 @@ from PIL import Image, ImageDraw
 from scipy.optimize import least_squares
 from streamlit_drawable_canvas import st_canvas
 
+import autotem.strain.gpa as gpa_module
+import autotem.strain.gpa_export as gpa_export_module
 from autotem.calibration import calibrate_dataset
 from autotem.core import (
     DiffractionPeak,
@@ -44,6 +48,33 @@ from autotem.io import load_tem_dataset, read_image
 from autotem.preprocessing import SUPPORTED_DENOISE_METHODS, assess_quality, preprocess_dataset
 from autotem.simulation.basic import simulate_from_diffraction
 from autotem.simulation.process_utils import collect_process_queue_payload
+from autotem.strain.gpa import GPAFieldResult
+
+
+def _stale_gpa_export(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+    raise RuntimeError("C2 GPA export helpers are stale; refresh the C2 GPA panel.")
+
+
+def _identity_gpa_display_values(
+    values: np.ndarray,
+    *,
+    sigma_px: float,
+    valid_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    del sigma_px, valid_mask
+    return np.asarray(values, dtype=np.float64)
+
+
+SUPPORTED_GPA_EXPORT_COLORMAPS = list(
+    getattr(gpa_export_module, "SUPPORTED_GPA_EXPORT_COLORMAPS", [])
+)
+get_gpa_colormap = gpa_export_module.get_gpa_colormap
+export_gpa_maps = getattr(gpa_export_module, "export_gpa_maps", _stale_gpa_export)
+smooth_gpa_display_values = getattr(
+    gpa_export_module,
+    "smooth_gpa_display_values",
+    _identity_gpa_display_values,
+)
 
 # Compatibility patch for streamlit-drawable-canvas on newer Streamlit.
 if not hasattr(st_image, "image_to_url"):
@@ -154,6 +185,7 @@ _FALLBACK_DEFAULTS: dict[str, Any] = {
         "detector_pixel_size_um": 14.0,
     },
     "preprocessing": {
+        "enabled": False,
         "recipe": "auto",
         "clip_percentile_low": 1.0,
         "clip_percentile_high": 99.0,
@@ -243,6 +275,47 @@ def _json_signature(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
 
 
+def _compute_gpa_fields_compat(image: np.ndarray, **kwargs: Any) -> GPAFieldResult:
+    """Call C2 GPA and recover when Streamlit holds a stale imported module."""
+
+    func = gpa_module.compute_gpa_fields
+    supported = set(inspect.signature(func).parameters)
+    requested_new_kwargs = {"apply_quality_mask", "reference_regions"}.intersection(kwargs)
+    if not requested_new_kwargs.issubset(supported):
+        reloaded = importlib.reload(gpa_module)
+        func = reloaded.compute_gpa_fields
+        supported = set(inspect.signature(func).parameters)
+    unsupported = set(kwargs).difference(supported)
+    if unsupported:
+        kwargs = dict(kwargs)
+        for key in unsupported:
+            kwargs.pop(key, None)
+    return func(image, **kwargs)
+
+
+def _ensure_gpa_export_colormaps() -> list[str]:
+    """Refresh C2 GPA export helpers when Streamlit keeps a stale module cache."""
+
+    global SUPPORTED_GPA_EXPORT_COLORMAPS, export_gpa_maps, get_gpa_colormap
+    global smooth_gpa_display_values
+
+    module = gpa_export_module
+    options = list(getattr(module, "SUPPORTED_GPA_EXPORT_COLORMAPS", []))
+    expected_options = {"BlOr", "Matplotlib Turbo"}
+    if (
+        not expected_options.issubset(set(options))
+        or not hasattr(module, "export_gpa_maps")
+        or not hasattr(module, "smooth_gpa_display_values")
+    ):
+        module = importlib.reload(module)
+        options = list(getattr(module, "SUPPORTED_GPA_EXPORT_COLORMAPS", []))
+    SUPPORTED_GPA_EXPORT_COLORMAPS = options
+    export_gpa_maps = module.export_gpa_maps
+    get_gpa_colormap = module.get_gpa_colormap
+    smooth_gpa_display_values = module.smooth_gpa_display_values
+    return options
+
+
 def _default_output_root() -> Path:
     from_env = os.environ.get(_OUTPUT_ROOT_ENV)
     if from_env:
@@ -289,6 +362,22 @@ def _num(value: Any, fallback: float) -> float:
         except ValueError:
             return float(fallback)
     return float(fallback)
+
+
+def _bool_value(value: Any, fallback: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(fallback)
+    if isinstance(value, (int, float)):
+        return bool(int(value))
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in {"1", "true", "yes", "on"}:
+            return True
+        if token in {"0", "false", "no", "off"}:
+            return False
+    return bool(fallback)
 
 
 def _choice(options: list[str], value: Any, fallback: str) -> str:
@@ -858,6 +947,240 @@ def _to_fft_display_image(
     sx = crop_w_actual / disp_w
     sy = crop_h_actual / disp_h
     return img, sx, sy, float(x0), float(y0)
+
+
+def _normalize_c2_gpa_reference_region(
+    region: tuple[float, float, float, float] | None,
+    image_shape: tuple[int, int],
+    *,
+    min_size_px: int = 2,
+) -> tuple[int, int, int, int] | None:
+    if region is None:
+        return None
+    h, w = int(image_shape[0]), int(image_shape[1])
+    if h <= 0 or w <= 0:
+        return None
+    try:
+        y0_raw, y1_raw, x0_raw, x1_raw = [float(value) for value in region]
+    except (TypeError, ValueError):
+        return None
+    values = [y0_raw, y1_raw, x0_raw, x1_raw]
+    if not all(np.isfinite(value) for value in values):
+        return None
+
+    y0 = int(np.floor(min(y0_raw, y1_raw)))
+    y1 = int(np.ceil(max(y0_raw, y1_raw)))
+    x0 = int(np.floor(min(x0_raw, x1_raw)))
+    x1 = int(np.ceil(max(x0_raw, x1_raw)))
+    y0 = int(np.clip(y0, 0, h))
+    y1 = int(np.clip(y1, 0, h))
+    x0 = int(np.clip(x0, 0, w))
+    x1 = int(np.clip(x1, 0, w))
+    if y1 - y0 < int(min_size_px) or x1 - x0 < int(min_size_px):
+        return None
+    return y0, y1, x0, x1
+
+
+def _to_c2_gpa_reference_roi_canvas_image(
+    image: np.ndarray,
+    *,
+    reference_region: tuple[int, int, int, int] | None = None,
+    max_side: int = 760,
+) -> tuple[Image.Image, float, float]:
+    arr = _normalize_for_display(np.asarray(image))
+    if arr.ndim != 2:
+        arr = np.squeeze(arr)
+    if arr.ndim != 2:
+        raise ValueError("C2 GPA reference ROI canvas needs a 2D image.")
+
+    h, w = int(arr.shape[0]), int(arr.shape[1])
+    scale = min(1.0, float(max_side) / max(1.0, float(max(h, w))))
+    disp_w = max(1, int(round(float(w) * scale)))
+    disp_h = max(1, int(round(float(h) * scale)))
+    sx = float(w) / float(disp_w)
+    sy = float(h) / float(disp_h)
+    img = Image.fromarray((np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8), mode="L")
+    img = img.convert("RGB").resize((disp_w, disp_h), resample=Image.BILINEAR)
+
+    region = _normalize_c2_gpa_reference_region(reference_region, (h, w))
+    if region is not None:
+        y0, y1, x0, x1 = region
+        draw = ImageDraw.Draw(img, mode="RGBA")
+        rect = [
+            float(x0) / sx,
+            float(y0) / sy,
+            float(x1) / sx,
+            float(y1) / sy,
+        ]
+        draw.rectangle(rect, fill=(255, 75, 75, 28))
+        draw.rectangle(rect, outline=(255, 75, 75, 230), width=3)
+    return img, sx, sy
+
+
+def _extract_c2_gpa_reference_roi_from_canvas(
+    canvas_result: Any,
+    *,
+    image_shape: tuple[int, int],
+    sx: float,
+    sy: float,
+) -> tuple[int, int, int, int] | None:
+    json_data = getattr(canvas_result, "json_data", None)
+    if not isinstance(json_data, dict):
+        return None
+    objects = json_data.get("objects")
+    if not isinstance(objects, list):
+        return None
+
+    for obj in reversed(objects):
+        if not isinstance(obj, dict):
+            continue
+        obj_type = str(obj.get("type", "") or "").lower()
+        if obj_type and obj_type != "rect":
+            continue
+        try:
+            angle = abs(float(obj.get("angle", 0.0) or 0.0))
+            left = float(obj.get("left", 0.0))
+            top = float(obj.get("top", 0.0))
+            width = float(obj.get("width", 0.0)) * float(obj.get("scaleX", 1.0) or 1.0)
+            height = float(obj.get("height", 0.0)) * float(obj.get("scaleY", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            continue
+        if angle > 1e-3 or abs(width) < 1.0 or abs(height) < 1.0:
+            continue
+        region = _normalize_c2_gpa_reference_region(
+            (
+                float(top) * float(sy),
+                float(top + height) * float(sy),
+                float(left) * float(sx),
+                float(left + width) * float(sx),
+            ),
+            image_shape,
+            min_size_px=4,
+        )
+        if region is not None:
+            return region
+    return None
+
+
+def _render_c2_gpa_reference_roi_selector(
+    *,
+    image: np.ndarray,
+    image_shape: tuple[int, int],
+    label: str,
+    state_prefix: str,
+    default_region: tuple[int, int, int, int],
+    canvas_max_side: int = 520,
+) -> tuple[int, int, int, int] | None:
+    h, w = int(image_shape[0]), int(image_shape[1])
+    state_keys = {
+        "y0": f"{state_prefix}_y0",
+        "y1": f"{state_prefix}_y1",
+        "x0": f"{state_prefix}_x0",
+        "x1": f"{state_prefix}_x1",
+    }
+    roi_state_region = _normalize_c2_gpa_reference_region(
+        (
+            st.session_state.get(state_keys["y0"], default_region[0]),
+            st.session_state.get(state_keys["y1"], default_region[1]),
+            st.session_state.get(state_keys["x0"], default_region[2]),
+            st.session_state.get(state_keys["x1"], default_region[3]),
+        ),
+        (h, w),
+    ) or default_region
+    for roi_key, roi_value in zip(state_keys.values(), roi_state_region, strict=True):
+        st.session_state[roi_key] = int(roi_value)
+
+    nonce_key = f"{state_prefix}_canvas_nonce"
+    if nonce_key not in st.session_state:
+        st.session_state[nonce_key] = 0
+    header_cols = st.columns([0.70, 0.30])
+    with header_cols[0]:
+        st.write(label)
+    with header_cols[1]:
+        if st.button("Reset canvas", key=f"{state_prefix}_reset_canvas", width="stretch"):
+            st.session_state[nonce_key] = int(st.session_state.get(nonce_key, 0)) + 1
+
+    roi_canvas_bg, roi_sx, roi_sy = _to_c2_gpa_reference_roi_canvas_image(
+        image,
+        reference_region=roi_state_region,
+        max_side=canvas_max_side,
+    )
+    roi_canvas_result = st_canvas(
+        fill_color="rgba(255, 75, 75, 0.18)",
+        stroke_width=2,
+        stroke_color="#ff4b4b",
+        background_image=roi_canvas_bg,
+        update_streamlit=True,
+        height=roi_canvas_bg.height,
+        width=roi_canvas_bg.width,
+        drawing_mode="rect",
+        display_toolbar=False,
+        key=f"{state_prefix}-canvas-v1-{int(st.session_state.get(nonce_key, 0))}",
+    )
+    canvas_region = _extract_c2_gpa_reference_roi_from_canvas(
+        roi_canvas_result,
+        image_shape=(h, w),
+        sx=float(roi_sx),
+        sy=float(roi_sy),
+    )
+    if canvas_region is not None:
+        roi_state_region = canvas_region
+        for roi_key, roi_value in zip(state_keys.values(), roi_state_region, strict=True):
+            st.session_state[roi_key] = int(roi_value)
+        st.session_state[nonce_key] = int(st.session_state.get(nonce_key, 0)) + 1
+        st.rerun()
+
+    roi_cols = st.columns(4)
+    with roi_cols[0]:
+        y0 = st.number_input(
+            f"{label} y0",
+            min_value=0,
+            max_value=max(0, h - 1),
+            value=int(roi_state_region[0]),
+            step=1,
+            key=state_keys["y0"],
+        )
+    with roi_cols[1]:
+        y1 = st.number_input(
+            f"{label} y1",
+            min_value=1,
+            max_value=h,
+            value=int(roi_state_region[1]),
+            step=1,
+            key=state_keys["y1"],
+        )
+    with roi_cols[2]:
+        x0 = st.number_input(
+            f"{label} x0",
+            min_value=0,
+            max_value=max(0, w - 1),
+            value=int(roi_state_region[2]),
+            step=1,
+            key=state_keys["x0"],
+        )
+    with roi_cols[3]:
+        x1 = st.number_input(
+            f"{label} x1",
+            min_value=1,
+            max_value=w,
+            value=int(roi_state_region[3]),
+            step=1,
+            key=state_keys["x1"],
+        )
+    region = _normalize_c2_gpa_reference_region(
+        (float(y0), float(y1), float(x0), float(x1)),
+        (h, w),
+    )
+    if region is None:
+        st.warning(f"{label} is too small after clipping; reference refinement will be disabled.")
+    else:
+        y0_i, y1_i, x0_i, x1_i = region
+        st.caption(
+            f"{label}: "
+            f"`y={int(y0_i)}:{int(y1_i)}, x={int(x0_i)}:{int(x1_i)}` | "
+            f"size=`{int(y1_i - y0_i)} x {int(x1_i - x0_i)} px`."
+        )
+    return region
 
 
 def _extract_canvas_points_xy(
@@ -1651,6 +1974,931 @@ def _array_from_reference(array_ref: Any) -> np.ndarray | None:
     return None
 
 
+def _row_float(row: dict[str, Any], key: str) -> float | None:
+    value = row.get(key)
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if np.isfinite(out) else None
+
+
+def _c2_gpa_candidate_rows(
+    peak_rows: list[dict[str, Any]],
+    *,
+    fft_center_xy: tuple[float, float] | None,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    cx = None if fft_center_xy is None else float(fft_center_xy[0])
+    cy = None if fft_center_xy is None else float(fft_center_xy[1])
+    for row in peak_rows:
+        peak_x = _row_float(row, "x")
+        peak_y = _row_float(row, "y")
+        if peak_x is None or peak_y is None or cx is None or cy is None:
+            continue
+        c2_gx = float(peak_x - cx)
+        c2_gy = float(peak_y - cy)
+        c2_magnitude = float(np.hypot(c2_gx, c2_gy))
+        if c2_magnitude <= 1e-9:
+            continue
+        b_gx = _row_float(row, "gx")
+        b_gy = _row_float(row, "gy")
+        b_magnitude = _row_float(row, "g_magnitude")
+        if b_magnitude is None and b_gx is not None and b_gy is not None:
+            b_magnitude = float(np.hypot(b_gx, b_gy))
+        peak_id_raw = row.get("peak_id")
+        try:
+            peak_id = int(peak_id_raw)
+        except (TypeError, ValueError):
+            peak_id = len(candidates)
+        intensity = _row_float(row, "intensity")
+        confidence = _row_float(row, "peak_confidence")
+        score = (0.0 if intensity is None else max(0.0, intensity)) + (
+            0.0 if confidence is None else 0.1 * confidence
+        )
+        candidates.append(
+            {
+                "peak_id": peak_id,
+                "gx": float(c2_gx),
+                "gy": float(c2_gy),
+                "g_magnitude": float(c2_magnitude),
+                "g_unit": "fft_pixel",
+                "peak_x": float(peak_x),
+                "peak_y": float(peak_y),
+                "b_gx": b_gx,
+                "b_gy": b_gy,
+                "b_g_magnitude": b_magnitude,
+                "b_g_unit": str(row.get("g_unit", "-") or "-"),
+                "intensity": intensity,
+                "peak_confidence": confidence,
+                "score": float(score),
+                "label": (
+                    f"peak {peak_id} | FFT dx={c2_gx:.5g}, dy={c2_gy:.5g}"
+                ),
+            }
+        )
+    return candidates
+
+
+def _c2_gpa_pair_angle_deg(
+    first: dict[str, Any],
+    second: dict[str, Any],
+) -> float:
+    a = np.asarray([float(first["gx"]), float(first["gy"])], dtype=np.float64)
+    b = np.asarray([float(second["gx"]), float(second["gy"])], dtype=np.float64)
+    denom = max(float(np.linalg.norm(a) * np.linalg.norm(b)), 1e-12)
+    cos_abs = abs(float(np.dot(a, b)) / denom)
+    cos_abs = float(np.clip(cos_abs, 0.0, 1.0))
+    return float(np.degrees(np.arccos(cos_abs)))
+
+
+def _c2_gpa_unit_for_basis(rows: list[dict[str, Any]]) -> tuple[str, str, list[str]]:
+    warnings: list[str] = []
+    b_units = {
+        str(row.get("b_g_unit", row.get("g_unit", ""))).strip().lower().replace(" ", "")
+        for row in rows
+    }
+    warnings.append(
+        "C2 GPA uses raw FFT peak offsets from the active B peak table as its basis. "
+        "B3 diffraction-calibrated g-values are shown for context only and are not used "
+        "to position the GPA Bragg masks."
+    )
+    if any(unit in {"1/nm", "nm^-1", "cycles/nm"} for unit in b_units):
+        warnings.append(
+            "B3 active peaks include calibrated 1/nm values; C2 intentionally avoids "
+            "converting them back through pixel_size_nm because diffraction calibration "
+            "can be inconsistent with the real-space FFT grid."
+        )
+    return "fft_pixel", "FFT pixel offset", warnings
+
+
+def _c2_gpa_basis_payload(
+    *,
+    rows: list[dict[str, Any]],
+    mode: str,
+    angle_deg: float,
+    center_xy: tuple[float, float] | None,
+    warnings: list[str],
+) -> dict[str, Any]:
+    gpa_unit, display_unit, unit_warnings = _c2_gpa_unit_for_basis(rows)
+    return {
+        "mode": mode,
+        "rows": rows,
+        "g_vectors": [(float(row["gx"]), float(row["gy"])) for row in rows],
+        "g_vector_unit": gpa_unit,
+        "display_unit": display_unit,
+        "angle_deg": float(angle_deg),
+        "center_xy": (
+            [float(center_xy[0]), float(center_xy[1])] if center_xy is not None else None
+        ),
+        "warnings": list(dict.fromkeys(list(warnings) + unit_warnings)),
+    }
+
+
+def _select_c2_gpa_auto_basis(
+    peak_rows: list[dict[str, Any]],
+    *,
+    fft_center_xy: tuple[float, float] | None,
+    min_angle_deg: float = 15.0,
+) -> dict[str, Any]:
+    candidates = _c2_gpa_candidate_rows(peak_rows, fft_center_xy=fft_center_xy)
+    if len(candidates) < 2:
+        raise ValueError("Need at least two B3 active g-vectors for C2 GPA auto mode.")
+    ranked = sorted(
+        candidates,
+        key=lambda row: (float(row["score"]), float(row["g_magnitude"])),
+        reverse=True,
+    )
+    best_pair: tuple[dict[str, Any], dict[str, Any], float] | None = None
+    for i, first in enumerate(ranked):
+        for second in ranked[i + 1 :]:
+            angle_deg = _c2_gpa_pair_angle_deg(first, second)
+            if best_pair is None or angle_deg > best_pair[2]:
+                best_pair = (first, second, angle_deg)
+            if angle_deg >= min_angle_deg:
+                return _c2_gpa_basis_payload(
+                    rows=[first, second],
+                    mode="auto",
+                    angle_deg=angle_deg,
+                    center_xy=fft_center_xy,
+                    warnings=[],
+                )
+    if best_pair is None:
+        raise ValueError("Could not evaluate B3 active g-vector pairs.")
+    first, second, angle_deg = best_pair
+    raise ValueError(
+        "No sufficiently non-collinear B3 g-vector pair found for C2 GPA "
+        f"(best acute angle={angle_deg:.2f} deg, required={min_angle_deg:.2f} deg)."
+    )
+
+
+def _select_c2_gpa_manual_basis(
+    peak_rows: list[dict[str, Any]],
+    peak_ids: tuple[int, int],
+    *,
+    fft_center_xy: tuple[float, float] | None,
+    min_angle_deg: float = 5.0,
+) -> dict[str, Any]:
+    candidates = {
+        int(row["peak_id"]): row
+        for row in _c2_gpa_candidate_rows(peak_rows, fft_center_xy=fft_center_xy)
+    }
+    first_id, second_id = int(peak_ids[0]), int(peak_ids[1])
+    if first_id == second_id:
+        raise ValueError("Manual C2 GPA basis needs two different B3 peak IDs.")
+    if first_id not in candidates or second_id not in candidates:
+        raise ValueError("Manual C2 GPA peak IDs must exist in the active B3 peak set.")
+    first = candidates[first_id]
+    second = candidates[second_id]
+    angle_deg = _c2_gpa_pair_angle_deg(first, second)
+    if angle_deg < min_angle_deg:
+        raise ValueError(
+            "Manual C2 GPA basis vectors are too close to collinear "
+            f"(acute angle={angle_deg:.2f} deg)."
+        )
+    return _c2_gpa_basis_payload(
+        rows=[first, second],
+        mode="manual",
+        angle_deg=angle_deg,
+        center_xy=fft_center_xy,
+        warnings=[],
+    )
+
+
+def _c2_gpa_pixel_size_nm_from_calibration(calibration: Any) -> float | None:
+    measurement = getattr(calibration, "pixel_size", None)
+    value = _measurement_value(measurement)
+    if value is None or value <= 0:
+        return None
+    unit = str(getattr(measurement, "unit", "") or getattr(calibration, "pixel_unit", "nm"))
+    unit = unit.lower().replace(" ", "").replace("/pixel", "").replace("perpixel", "")
+    if unit in {"nm", "nanometer", "nanometers"}:
+        return float(value)
+    if unit in {"angstrom", "angstroms", "a"}:
+        return float(value) * 0.1
+    if unit in {"pm", "picometer", "picometers"}:
+        return float(value) * 0.001
+    return None
+
+
+def _default_c2_gpa_mask_sigma_px(image_shape: tuple[int, int]) -> float:
+    """Use a broader C2 UI sideband mask by default."""
+
+    del image_shape
+    return 20.0
+
+
+def _resolve_c2_gpa_input_image(
+    *,
+    original_image: np.ndarray,
+    processed_image: np.ndarray,
+    preprocessing_enabled: bool,
+) -> tuple[str, np.ndarray, list[str]]:
+    raw = np.asarray(original_image, dtype=np.float64)
+    processed = np.asarray(processed_image, dtype=np.float64)
+    input_source = "B2 preprocessed image" if preprocessing_enabled else "Raw input image"
+    gpa_image = processed if preprocessing_enabled else raw
+    warnings: list[str] = []
+    if gpa_image.shape != processed.shape:
+        warnings.append(
+            "Raw and B2 image shapes differ; C2 GPA is using the B2 image so active "
+            "FFT peak coordinates stay aligned."
+        )
+        input_source = "B2 preprocessed image"
+        gpa_image = processed
+    return input_source, gpa_image, warnings
+
+
+def _robust_symmetric_limit(
+    values: np.ndarray,
+    *,
+    fallback: float,
+    valid_mask: np.ndarray | None = None,
+) -> float:
+    arr = np.asarray(values, dtype=np.float64)
+    if valid_mask is not None and valid_mask.shape == arr.shape:
+        arr = arr[valid_mask]
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return float(fallback)
+    return max(float(np.percentile(np.abs(finite), 98.0)), float(fallback), 1e-9)
+
+
+def _plot_c2_gpa_maps(
+    fields: GPAFieldResult,
+    *,
+    colormap_name: str,
+    strain_scale: float,
+    strain_unit: str,
+    displacement_abs_limit: float,
+    strain_abs_limit: float,
+    rotation_abs_limit: float,
+    view_mode: str = "Displacement diagnostics",
+    display_smoothing_sigma_px: float = 0.0,
+    mask_invalid: bool = False,
+) -> plt.Figure:
+    ux = np.asarray(fields.displacement_x, dtype=np.float64)
+    uy = np.asarray(fields.displacement_y, dtype=np.float64)
+    exx = np.asarray(fields.strain_xx, dtype=np.float64) * strain_scale
+    eyy = np.asarray(fields.strain_yy, dtype=np.float64) * strain_scale
+    shear_exy = np.asarray(fields.strain_xy, dtype=np.float64) * strain_scale
+    rot = np.asarray(fields.rotation_xy, dtype=np.float64)
+    exy_dist = (np.asarray(fields.strain_xy, dtype=np.float64) - rot) * strain_scale
+    eyx_dist = (np.asarray(fields.strain_xy, dtype=np.float64) + rot) * strain_scale
+    valid_mask = np.asarray(fields.quality_mask, dtype=bool)
+
+    disp_lim = (
+        max(
+            _robust_symmetric_limit(ux, fallback=0.1, valid_mask=valid_mask),
+            _robust_symmetric_limit(uy, fallback=0.1, valid_mask=valid_mask),
+        )
+        if displacement_abs_limit <= 0
+        else float(displacement_abs_limit)
+    )
+    strain_lim = (
+        max(
+            _robust_symmetric_limit(exx, fallback=0.01 * strain_scale, valid_mask=valid_mask),
+            _robust_symmetric_limit(eyy, fallback=0.01 * strain_scale, valid_mask=valid_mask),
+            _robust_symmetric_limit(
+                shear_exy,
+                fallback=0.01 * strain_scale,
+                valid_mask=valid_mask,
+            ),
+        )
+        if strain_abs_limit <= 0
+        else float(strain_abs_limit)
+    )
+    distortion_lim = (
+        max(
+            _robust_symmetric_limit(exx, fallback=0.01 * strain_scale, valid_mask=valid_mask),
+            _robust_symmetric_limit(eyy, fallback=0.01 * strain_scale, valid_mask=valid_mask),
+            _robust_symmetric_limit(
+                exy_dist,
+                fallback=0.01 * strain_scale,
+                valid_mask=valid_mask,
+            ),
+            _robust_symmetric_limit(
+                eyx_dist,
+                fallback=0.01 * strain_scale,
+                valid_mask=valid_mask,
+            ),
+        )
+        if strain_abs_limit <= 0
+        else float(strain_abs_limit)
+    )
+    rot_lim = (
+        _robust_symmetric_limit(rot, fallback=0.01, valid_mask=valid_mask)
+        if rotation_abs_limit <= 0
+        else float(rotation_abs_limit)
+    )
+
+    view_key = str(view_mode).casefold()
+    shared_colorbar = False
+    if "distortion" in view_key:
+        panels = [
+            (exx, f"exx [{strain_unit}]", distortion_lim),
+            (exy_dist, f"exy [{strain_unit}]", distortion_lim),
+            (eyx_dist, f"eyx [{strain_unit}]", distortion_lim),
+            (eyy, f"eyy [{strain_unit}]", distortion_lim),
+        ]
+        fig, axes = plt.subplots(2, 2, figsize=(11.5, 9.2), constrained_layout=True)
+        shared_colorbar = True
+    elif "strain" in view_key:
+        panels = [
+            (exx, f"exx strain [{strain_unit}]", strain_lim),
+            (eyy, f"eyy strain [{strain_unit}]", strain_lim),
+            (shear_exy, f"exy strain [{strain_unit}]", strain_lim),
+            (rot, "rotation wxy [rad]", rot_lim),
+        ]
+        fig, axes = plt.subplots(2, 2, figsize=(11.5, 9.2), constrained_layout=True)
+    else:
+        panels = [
+            (ux, "ux displacement [px]", disp_lim),
+            (uy, "uy displacement [px]", disp_lim),
+            (exx, f"exx strain [{strain_unit}]", strain_lim),
+            (eyy, f"eyy strain [{strain_unit}]", strain_lim),
+            (shear_exy, f"exy strain [{strain_unit}]", strain_lim),
+            (rot, "rotation wxy [rad]", rot_lim),
+        ]
+        fig, axes = plt.subplots(2, 3, figsize=(14.5, 8.2), constrained_layout=True)
+
+    fig.patch.set_facecolor("#efefef")
+    cmap = get_gpa_colormap(colormap_name).copy()
+    cmap.set_bad("#eeeeee")
+    last_im = None
+    axes_flat = np.asarray(axes).ravel()
+    smoothing_mask = valid_mask if mask_invalid else None
+    for ax, (data, title, limit) in zip(axes_flat, panels, strict=False):
+        plot_data = smooth_gpa_display_values(
+            data,
+            sigma_px=float(display_smoothing_sigma_px),
+            valid_mask=smoothing_mask,
+        )
+        display_data = np.ma.masked_where(~valid_mask, plot_data) if mask_invalid else plot_data
+        im = ax.imshow(
+            display_data,
+            cmap=cmap,
+            vmin=-limit,
+            vmax=limit,
+            interpolation="bilinear",
+            resample=True,
+            aspect="equal",
+        )
+        last_im = im
+        ax.set_facecolor("#eeeeee")
+        ax.set_title(title, loc="left", fontsize=11, fontweight="bold")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_color("#f7f7f7")
+            spine.set_linewidth(1.2)
+        if not shared_colorbar:
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    for ax in axes_flat[len(panels) :]:
+        ax.set_visible(False)
+    if shared_colorbar and last_im is not None:
+        fig.colorbar(last_im, ax=list(axes_flat[: len(panels)]), fraction=0.032, pad=0.012)
+    return fig
+
+
+def _c2_gpa_blocking_warnings(warnings: list[str]) -> list[str]:
+    blocking_markers = (
+        "far above a plausible local lattice shift",
+        "strain exceeds 20%",
+        "rotation exceeds 0.2 rad",
+        "quality mask has no valid pixels",
+        "valid-pixel fraction is only",
+    )
+    return [
+        str(warning)
+        for warning in warnings
+        if any(marker in str(warning) for marker in blocking_markers)
+    ]
+
+
+def _render_c2_gpa_panel(
+    *,
+    original_image: np.ndarray,
+    processed_image: np.ndarray,
+    preprocessing_enabled: bool,
+    fft_log_magnitude: np.ndarray,
+    peak_rows: list[dict[str, Any]],
+    fft_center_xy: tuple[float, float] | None,
+    calibration: Any,
+    active_peak_source_label: str,
+    run_dir: Path,
+) -> tuple[Any | None, list[str]]:
+    st.caption(
+        "C2 GPA uses the current B active peak set. Auto mode chooses two strong "
+        "non-collinear B3 g-vectors; manual mode lets you pick two active peak IDs."
+    )
+
+    processed_shape = tuple(np.asarray(processed_image).shape)
+    if len(processed_shape) != 2:
+        st.error("C2 GPA needs a 2D B2 image/FFT coordinate frame.")
+        return None, ["C2 GPA needs a 2D B2 image/FFT coordinate frame."]
+
+    input_source, gpa_image, input_warnings = _resolve_c2_gpa_input_image(
+        original_image=original_image,
+        processed_image=processed_image,
+        preprocessing_enabled=preprocessing_enabled,
+    )
+    h, w = gpa_image.shape
+    geometric_center_xy = (float(processed_shape[1]) / 2.0, float(processed_shape[0]) / 2.0)
+
+    for warning in input_warnings:
+        st.warning(warning)
+
+    basis_payload: dict[str, Any] | None = None
+    basis_error = ""
+    basis_center_xy = geometric_center_xy
+    center_mode = "Geometric FFT center"
+    candidates: list[dict[str, Any]] = []
+    pixel_size_nm = _c2_gpa_pixel_size_nm_from_calibration(calibration)
+
+    with st.container():
+        st.markdown("**GPA basis**")
+        center_mode = st.radio(
+            "C2 GPA basis center",
+            options=[
+                "Geometric FFT center",
+                "B active FFT center",
+            ],
+            index=0,
+            horizontal=True,
+            key="b1c2_gpa_basis_center_mode",
+            help=(
+                "Geometric centering keeps the GPA Bragg masks tied to the image FFT grid. "
+                "The B active center can be useful for B3-calibrated workflows but may "
+                "shift g by subpixels or pixels compared with a purely geometric FFT frame."
+            ),
+        )
+        if center_mode == "B active FFT center":
+            basis_center_xy = fft_center_xy
+            if basis_center_xy is None:
+                st.warning("B active FFT center is unavailable; using the geometric FFT center.")
+                basis_center_xy = geometric_center_xy
+        else:
+            basis_center_xy = geometric_center_xy
+        if fft_center_xy is not None:
+            center_delta = float(
+                np.hypot(
+                    float(fft_center_xy[0]) - float(geometric_center_xy[0]),
+                    float(fft_center_xy[1]) - float(geometric_center_xy[1]),
+                )
+            )
+            st.caption(
+                "center: "
+                f"geometric=({geometric_center_xy[0]:.2f}, {geometric_center_xy[1]:.2f}) | "
+                f"B active=({float(fft_center_xy[0]):.2f}, {float(fft_center_xy[1]):.2f}) | "
+                f"delta={center_delta:.3g} px"
+            )
+
+        candidates = _c2_gpa_candidate_rows(peak_rows, fft_center_xy=basis_center_xy)
+        if len(candidates) >= 2:
+            mode = st.radio(
+                "C2 GPA basis mode",
+                options=["Auto from B active peaks", "Manual pick from B active peaks"],
+                horizontal=True,
+                key="b1c2_gpa_basis_mode",
+            )
+            min_angle_deg = st.slider(
+                "Minimum acute angle between basis vectors",
+                min_value=5.0,
+                max_value=45.0,
+                value=15.0,
+                step=1.0,
+                key="b1c2_gpa_min_angle_deg",
+            )
+            if mode == "Auto from B active peaks":
+                try:
+                    basis_payload = _select_c2_gpa_auto_basis(
+                        peak_rows,
+                        fft_center_xy=basis_center_xy,
+                        min_angle_deg=float(min_angle_deg),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    basis_error = str(exc)
+            else:
+                option_ids = [int(row["peak_id"]) for row in candidates]
+                label_by_id = {int(row["peak_id"]): str(row["label"]) for row in candidates}
+                cols = st.columns(2)
+                with cols[0]:
+                    first_id = st.selectbox(
+                        "g1 active peak",
+                        options=option_ids,
+                        format_func=lambda value: label_by_id.get(int(value), str(value)),
+                        key="b1c2_gpa_manual_peak_1",
+                    )
+                with cols[1]:
+                    default_second = 1 if len(option_ids) > 1 else 0
+                    second_id = st.selectbox(
+                        "g2 active peak",
+                        options=option_ids,
+                        index=default_second,
+                        format_func=lambda value: label_by_id.get(int(value), str(value)),
+                        key="b1c2_gpa_manual_peak_2",
+                    )
+                try:
+                    basis_payload = _select_c2_gpa_manual_basis(
+                        peak_rows,
+                        (int(first_id), int(second_id)),
+                        fft_center_xy=basis_center_xy,
+                        min_angle_deg=5.0,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    basis_error = str(exc)
+        else:
+            basis_error = "C2 GPA needs at least two active B3 FFT peaks with a known FFT center."
+
+        if basis_error:
+            st.error(basis_error)
+        elif basis_payload is not None:
+            basis_rows = list(basis_payload["rows"])
+            st.caption(
+                f"active set: `{active_peak_source_label}` | acute angle: "
+                f"`{float(basis_payload['angle_deg']):.2f} deg` | unit: "
+                f"`{basis_payload['display_unit']}`"
+            )
+            basis_center_for_display = basis_payload.get("center_xy") or [
+                float(basis_center_xy[0]),
+                float(basis_center_xy[1]),
+            ]
+            st.dataframe(
+                [
+                    {
+                        "basis": f"g{i + 1}",
+                        "peak_id": row["peak_id"],
+                        "peak_x": row.get("peak_x"),
+                        "peak_y": row.get("peak_y"),
+                        "center_x": float(basis_center_for_display[0]),
+                        "center_y": float(basis_center_for_display[1]),
+                        "gx": row["gx"],
+                        "gy": row["gy"],
+                        "|g|": row["g_magnitude"],
+                        "C2_unit": row["g_unit"],
+                        "B_gx": row.get("b_gx"),
+                        "B_gy": row.get("b_gy"),
+                        "B_unit": row.get("b_g_unit"),
+                        "GPA_unit": basis_payload["g_vector_unit"],
+                    }
+                    for i, row in enumerate(basis_rows)
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+            for warning in basis_payload.get("warnings", []):
+                st.warning(str(warning))
+
+        st.markdown("**Reference and display**")
+        mask_sigma = st.number_input(
+            "Bragg mask sigma [FFT px]",
+            min_value=0.5,
+            max_value=max(4.0, float(min(h, w) / 3.0)),
+            value=_default_c2_gpa_mask_sigma_px((h, w)),
+            step=0.5,
+            help=(
+                "Gaussian sigma around each selected Bragg spot. The C2 UI default is "
+                "20 FFT pixels; lower values are useful for sensitive GPA comparisons, "
+                "while much larger values can mix neighboring spots."
+            ),
+            key="b1c2_gpa_mask_sigma_px_v4",
+        )
+        use_reference = st.checkbox(
+            "Use reference ROI",
+            value=False,
+            key="b1c2_gpa_use_reference_roi",
+        )
+        colour_options = _ensure_gpa_export_colormaps()
+        colour_default_index = colour_options.index("BlOr") if "BlOr" in colour_options else 0
+        strain_display_unit = st.selectbox(
+            "Strain display unit",
+            options=["fraction", "%"],
+            index=1,
+            key="b1c2_gpa_strain_unit_v3",
+        )
+        default_strain_abs = 0.15 if strain_display_unit == "fraction" else 15.0
+        displacement_abs = st.number_input(
+            "Displacement range [px]",
+            min_value=0.0,
+            value=0.0,
+            step=0.1,
+            help="0 uses robust auto range.",
+            key="b1c2_gpa_displacement_abs_v2",
+        )
+        colour_map = st.selectbox(
+            "Colour",
+            options=colour_options,
+            index=colour_default_index,
+            key="b1c2_gpa_colour_map",
+        )
+        display_smoothing_sigma = st.number_input(
+            "Display smoothing sigma [px]",
+            min_value=0.0,
+            max_value=8.0,
+            value=1.25,
+            step=0.25,
+            help="Display/RGB-only smoothing; scalar data TIFF/NPY outputs are unchanged.",
+            key="b1c2_gpa_display_smoothing_sigma_v1",
+        )
+        strain_abs = st.number_input(
+            "Strain range",
+            min_value=0.0,
+            value=float(default_strain_abs),
+            step=0.1 if strain_display_unit == "%" else 0.001,
+            format="%.4f",
+            help="0 uses robust auto range.",
+            key="b1c2_gpa_strain_abs_v5",
+        )
+        rotation_abs = st.number_input(
+            "Rotation range [rad]",
+            min_value=0.0,
+            value=0.0,
+            step=0.005,
+            format="%.4f",
+            help="0 uses robust auto range.",
+            key="b1c2_gpa_rotation_abs_v2",
+        )
+        mask_invalid = st.checkbox(
+            "Mask low-quality pixels",
+            value=False,
+            help="Disabled by default for full-field display.",
+            key="b1c2_gpa_mask_invalid_v2",
+        )
+
+    reference_region: tuple[int, int, int, int] | None = None
+    reference_regions: (
+        tuple[tuple[int, int, int, int] | None, tuple[int, int, int, int] | None] | None
+    ) = None
+    if use_reference:
+        y0_default, y1_default = h // 4, (3 * h) // 4
+        x0_default, x1_default = w // 4, (3 * w) // 4
+        default_region = _normalize_c2_gpa_reference_region(
+            (y0_default, y1_default, x0_default, x1_default),
+            (int(h), int(w)),
+        ) or (0, int(h), 0, int(w))
+        basis_rows_for_labels = (
+            list(basis_payload.get("rows", [])) if isinstance(basis_payload, dict) else []
+        )
+
+        def _roi_label(index: int) -> str:
+            if index < len(basis_rows_for_labels):
+                peak_id = basis_rows_for_labels[index].get("peak_id", "-")
+                return f"g{index + 1} reference ROI (peak {peak_id})"
+            return f"g{index + 1} reference ROI"
+
+        roi_selector_cols = st.columns(2)
+        with roi_selector_cols[0]:
+            g1_reference_region = _render_c2_gpa_reference_roi_selector(
+                image=gpa_image,
+                image_shape=(int(h), int(w)),
+                label=_roi_label(0),
+                state_prefix="b1c2_gpa_g1_roi_v1",
+                default_region=default_region,
+            )
+        with roi_selector_cols[1]:
+            g2_reference_region = _render_c2_gpa_reference_roi_selector(
+                image=gpa_image,
+                image_shape=(int(h), int(w)),
+                label=_roi_label(1),
+                state_prefix="b1c2_gpa_g2_roi_v1",
+                default_region=default_region,
+            )
+        reference_regions = (g1_reference_region, g2_reference_region)
+        if g1_reference_region is not None and g1_reference_region == g2_reference_region:
+            reference_region = g1_reference_region
+
+    signature = _json_signature(
+        {
+            "source": active_peak_source_label,
+            "image_shape": [int(h), int(w)],
+            "input_source": input_source,
+            "basis": basis_payload,
+            "pixel_size_nm": pixel_size_nm,
+            "reference_region": reference_region,
+            "reference_regions": reference_regions,
+            "mask_sigma_px": float(mask_sigma),
+            "hann_window": False,
+            "apply_quality_mask": False,
+        }
+    )
+    cache = st.session_state.get("b1c2_gpa_cache")
+    with st.container():
+        st.markdown("**Compute**")
+        if basis_payload is None:
+            st.info("Resolve a valid g1/g2 basis before running C2 GPA.")
+        unit_requires_pixel = (
+            basis_payload is not None and str(basis_payload["g_vector_unit"]) == "1/nm"
+        )
+        if unit_requires_pixel and pixel_size_nm is None:
+            st.error(
+                "C2 GPA basis uses B3 g-vectors in 1/nm, but B1 pixel_size_nm is missing; "
+                "enable calibration or use an uncalibrated FFT-pixel active set."
+            )
+        run_clicked = st.button(
+            "Run / refresh C2 GPA",
+            type="primary",
+            key="b1c2_gpa_run",
+            disabled=basis_payload is None or (unit_requires_pixel and pixel_size_nm is None),
+            use_container_width=True,
+        )
+
+    if run_clicked:
+        with st.spinner(f"Running C2 GPA on the {input_source}..."):
+            try:
+                if basis_payload is None:
+                    raise ValueError("C2 GPA needs a valid g1/g2 basis before running.")
+                fields = _compute_gpa_fields_compat(
+                    gpa_image,
+                    g_vectors=list(basis_payload["g_vectors"]),
+                    g_vector_unit=str(basis_payload["g_vector_unit"]),
+                    pixel_size_nm=pixel_size_nm,
+                    reference_region=reference_region,
+                    reference_regions=reference_regions,
+                    mask_sigma_px=float(mask_sigma),
+                    hann_window=False,
+                    apply_quality_mask=False,
+                    refine_reference=True,
+                    provenance_method=(
+                        "gpa_b3_ui_auto"
+                        if basis_payload["mode"] == "auto"
+                        else "gpa_b3_ui_manual"
+                    ),
+                )
+                fields.provenance["ui_basis"] = {
+                    "input_source": str(input_source),
+                    "basis_center_mode": str(center_mode),
+                    "basis_center_xy": basis_payload.get("center_xy"),
+                    "basis_rows": [
+                        {
+                            "basis": f"g{i + 1}",
+                            "peak_id": int(row["peak_id"]),
+                            "peak_x": float(row["peak_x"]),
+                            "peak_y": float(row["peak_y"]),
+                            "g_fft_pixel_offset": [float(row["gx"]), float(row["gy"])],
+                        }
+                        for i, row in enumerate(basis_payload.get("rows", []))
+                    ],
+                    "b_active_fft_center_xy": (
+                        [float(fft_center_xy[0]), float(fft_center_xy[1])]
+                        if fft_center_xy is not None
+                        else None
+                    ),
+                    "geometric_fft_center_xy": [
+                        float(geometric_center_xy[0]),
+                        float(geometric_center_xy[1]),
+                    ],
+                    "raw_image_shape": [int(v) for v in np.asarray(original_image).shape],
+                    "processed_image_shape": [int(v) for v in np.asarray(processed_image).shape],
+                    "reference_region": (
+                        [int(v) for v in reference_region]
+                        if reference_region is not None
+                        else None
+                    ),
+                    "reference_regions": (
+                        {
+                            "g1": (
+                                [int(v) for v in reference_regions[0]]
+                                if reference_regions[0] is not None
+                                else None
+                            ),
+                            "g2": (
+                                [int(v) for v in reference_regions[1]]
+                                if reference_regions[1] is not None
+                                else None
+                            ),
+                        }
+                        if reference_regions is not None
+                        else None
+                    ),
+                }
+                result = fields.to_strain_result(map_inline_mode="preview")
+            except Exception as exc:  # noqa: BLE001
+                st.session_state["b1c2_gpa_cache"] = {
+                    "signature": signature,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                st.error(f"C2 GPA failed: {exc}")
+                return None, [str(exc)]
+            st.session_state["b1c2_gpa_cache"] = {
+                "signature": signature,
+                "fields": fields,
+                "result": result,
+                "basis": basis_payload,
+                "input_source": input_source,
+            }
+            st.success("C2 GPA finished.")
+            cache = st.session_state.get("b1c2_gpa_cache")
+
+    if not isinstance(cache, dict) or cache.get("signature") != signature:
+        st.info("Run C2 GPA to generate displacement and strain maps for this B active set.")
+        return None, []
+    if cache.get("error"):
+        st.error(str(cache["error"]))
+        return None, [str(cache["error"])]
+
+    fields = cache.get("fields")
+    result = cache.get("result")
+    if not isinstance(fields, GPAFieldResult) or result is None:
+        st.info("Run C2 GPA to generate displacement and strain maps for this B active set.")
+        return None, []
+
+    stats = dict(result.provenance.get("map_stats", {}))
+    strain_scale = 100.0 if strain_display_unit == "%" else 1.0
+    strain_unit = "%" if strain_display_unit == "%" else "fraction"
+    metrics = st.columns(6)
+    metrics[0].metric("C2 confidence", f"{float(result.confidence or 0.0):.3f}")
+    metrics[1].metric("mean exx", f"{float(stats.get('mean_exx', 0.0)) * strain_scale:.4g}")
+    metrics[2].metric("mean eyy", f"{float(stats.get('mean_eyy', 0.0)) * strain_scale:.4g}")
+    metrics[3].metric("mean exy", f"{float(stats.get('mean_exy', 0.0)) * strain_scale:.4g}")
+    metrics[4].metric("mean rotation", f"{float(stats.get('mean_rotation', 0.0)):.4g}")
+    metrics[5].metric(
+        "valid pixels",
+        f"{float(result.provenance.get('quality', {}).get('valid_pixel_fraction', 0.0)):.3f}",
+    )
+    st.caption(
+        "C2 run parameters: "
+        f"input=`{cache.get('input_source', input_source)}` | "
+        f"mask_sigma_px=`{float(mask_sigma):.2f}` | "
+        f"display ranges: displacement=`{float(displacement_abs):.3g}`, "
+        f"strain=`{float(strain_abs):.3g}`, rotation=`{float(rotation_abs):.3g}` "
+        "(0 means auto)."
+    )
+
+    fig = _plot_c2_gpa_maps(
+        fields,
+        colormap_name=str(colour_map),
+        strain_scale=strain_scale,
+        strain_unit=strain_unit,
+        displacement_abs_limit=float(displacement_abs),
+        strain_abs_limit=float(strain_abs),
+        rotation_abs_limit=float(rotation_abs),
+        display_smoothing_sigma_px=float(display_smoothing_sigma),
+        mask_invalid=bool(mask_invalid),
+    )
+    st.pyplot(fig, clear_figure=True)
+    export_cols = st.columns([1, 3])
+    export_clicked = export_cols[0].button(
+        "Export C2 GPA data/RGB",
+        key="b1c2_gpa_export",
+    )
+    export_cols[1].caption(
+        "Writes scalar data TIFF/NPY files, RGB TIFF maps, FFT, "
+        "ColourBar, and Phase 1/2 intermediate maps."
+    )
+    if export_clicked:
+        selected_points_xy = [
+            (float(row["peak_x"]), float(row["peak_y"]))
+            for row in basis_payload.get("rows", [])
+            if row.get("peak_x") is not None and row.get("peak_y") is not None
+        ]
+        try:
+            export_manifest = export_gpa_maps(
+                fields,
+                run_dir / "c2_gpa",
+                image=gpa_image,
+                fft_log_magnitude=np.asarray(fft_log_magnitude, dtype=np.float64),
+                fft_center_xy=fft_center_xy,
+                selected_points_xy=selected_points_xy,
+                colormap_name=str(colour_map),
+                strain_scale=float(strain_scale),
+                strain_unit=str(strain_unit),
+                displacement_abs_limit=float(displacement_abs),
+                strain_abs_limit=float(strain_abs),
+                rotation_abs_limit=float(rotation_abs),
+                display_smoothing_sigma_px=float(display_smoothing_sigma),
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"C2 GPA export failed: {exc}")
+        else:
+            st.success(f"C2 GPA export written: {export_manifest['manifest_path']}")
+            with st.expander("C2 GPA export manifest", expanded=False):
+                st.json(export_manifest)
+    c2_warnings = list(result.warnings)
+    blocking_warnings = _c2_gpa_blocking_warnings(c2_warnings)
+    if blocking_warnings:
+        st.error(
+            "C2 GPA result is not reportable as a strain map. "
+            "The selected B g-vectors or the input image do not satisfy GPA assumptions."
+        )
+        for warning in dict.fromkeys(blocking_warnings):
+            st.warning(str(warning))
+        with st.expander("C2 GPA provenance", expanded=False):
+            st.json(result.provenance)
+        return result, c2_warnings
+
+    if c2_warnings:
+        for warning in dict.fromkeys(c2_warnings):
+            st.warning(str(warning))
+    else:
+        st.success("No C2 GPA warnings.")
+    with st.expander("C2 GPA provenance", expanded=False):
+        st.json(result.provenance)
+    return result, c2_warnings
+
+
 def _build_demo_input(run_dir: Path) -> Path:
     rng = np.random.default_rng(20260524)
     h, w = 256, 256
@@ -1673,7 +2921,13 @@ def _save_uploaded(uploaded_file, run_dir: Path) -> Path:
     input_dir = run_dir / "inputs"
     input_dir.mkdir(parents=True, exist_ok=True)
     path = input_dir / _safe_name(uploaded_file.name)
-    path.write_bytes(uploaded_file.getbuffer())
+    buffer = uploaded_file.getbuffer()
+    expected_size = int(getattr(buffer, "nbytes", len(buffer)))
+    if path.exists() and path.stat().st_size == expected_size:
+        return path
+    tmp_path = input_dir / f"{path.name}.tmp"
+    tmp_path.write_bytes(bytes(buffer))
+    tmp_path.replace(path)
     return path
 
 
@@ -2872,6 +4126,7 @@ def _render_preview_images(
     original_image: np.ndarray,
     processed_image: np.ndarray,
     fft_image_norm: np.ndarray,
+    processed_caption: str,
 ) -> None:
     img_col1, img_col2, img_col3 = st.columns(3)
     with img_col1:
@@ -2883,7 +4138,7 @@ def _render_preview_images(
     with img_col2:
         st.image(
             _normalize_for_display(processed_image),
-            caption="Preprocessed",
+            caption=processed_caption,
             use_container_width=True,
         )
     with img_col3:
@@ -3092,10 +4347,15 @@ def main() -> None:
         )
 
     with st.sidebar.expander("B2 Preprocessing", expanded=False):
+        preprocessing_enabled = st.checkbox(
+            "Enable denoise / preprocessing",
+            value=_bool_value(prep_defaults.get("enabled"), False),
+        )
         recipe = st.selectbox(
             "recipe",
             options=["auto", "min_max"],
             index=0 if str(prep_defaults.get("recipe", "auto")) == "auto" else 1,
+            disabled=not preprocessing_enabled,
         )
         clip_low = st.number_input(
             "clip_percentile_low",
@@ -3103,6 +4363,7 @@ def main() -> None:
             max_value=99.9,
             value=_num(prep_defaults.get("clip_percentile_low"), 1.0),
             step=0.5,
+            disabled=not preprocessing_enabled,
         )
         clip_high = st.number_input(
             "clip_percentile_high",
@@ -3110,6 +4371,7 @@ def main() -> None:
             max_value=100.0,
             value=_num(prep_defaults.get("clip_percentile_high"), 99.0),
             step=0.5,
+            disabled=not preprocessing_enabled,
         )
         denoise_method = st.selectbox(
             "denoise_method",
@@ -3119,48 +4381,56 @@ def main() -> None:
                 if str(prep_defaults.get("denoise_method", "wiener")) in SUPPORTED_DENOISE_METHODS
                 else "auto"
             ),
+            disabled=not preprocessing_enabled,
         )
         denoise_sigma = st.number_input(
             "denoise_sigma",
             min_value=0.0,
             value=_num(prep_defaults.get("denoise_sigma"), 0.8),
             step=0.1,
+            disabled=not preprocessing_enabled,
         )
         median_size = st.number_input(
             "median_size",
             min_value=1,
             value=int(_num(prep_defaults.get("median_size"), 3)),
             step=1,
+            disabled=not preprocessing_enabled,
         )
         wiener_window = st.number_input(
             "wiener_window",
             min_value=3,
             value=int(_num(prep_defaults.get("wiener_window"), 5)),
             step=1,
+            disabled=not preprocessing_enabled,
         )
         wiener_noise = st.number_input(
             "wiener_noise",
             min_value=0.0,
             value=_num(prep_defaults.get("wiener_noise"), 0.0),
             step=0.01,
+            disabled=not preprocessing_enabled,
         )
         nlm_h = st.number_input(
             "nlm_h",
             min_value=0.0,
             value=_num(prep_defaults.get("nlm_h"), 0.05),
             step=0.01,
+            disabled=not preprocessing_enabled,
         )
         nlm_patch_size = st.number_input(
             "nlm_patch_size",
             min_value=3,
             value=int(_num(prep_defaults.get("nlm_patch_size"), 5)),
             step=1,
+            disabled=not preprocessing_enabled,
         )
         nlm_patch_distance = st.number_input(
             "nlm_patch_distance",
             min_value=1,
             value=int(_num(prep_defaults.get("nlm_patch_distance"), 6)),
             step=1,
+            disabled=not preprocessing_enabled,
         )
         background_method_default = _choice(
             SUPPORTED_BACKGROUND_METHODS,
@@ -3171,22 +4441,26 @@ def main() -> None:
             "background_method",
             options=SUPPORTED_BACKGROUND_METHODS,
             index=SUPPORTED_BACKGROUND_METHODS.index(background_method_default),
+            disabled=not preprocessing_enabled,
         )
         background_sigma = st.number_input(
             "background_sigma",
             min_value=0.0,
             value=_num(prep_defaults.get("background_sigma"), 12.0),
             step=0.5,
+            disabled=not preprocessing_enabled,
         )
         background_opening_size = st.number_input(
             "background_opening_size",
             min_value=3,
             value=int(_num(prep_defaults.get("background_opening_size"), 31)),
             step=2,
+            disabled=not preprocessing_enabled,
         )
         background_clip_zero = st.checkbox(
             "background_clip_zero",
             value=bool(prep_defaults.get("background_clip_zero", False)),
+            disabled=not preprocessing_enabled,
         )
 
     with st.sidebar.expander("B3/B4 Diffraction + Indexing", expanded=True):
@@ -3843,6 +5117,8 @@ def main() -> None:
             pass
 
     preprocessing_params: dict[str, Any] = {
+        "enabled": bool(preprocessing_enabled),
+        "denoise_enabled": bool(preprocessing_enabled),
         "clip_percentile_low": float(clip_low),
         "clip_percentile_high": float(clip_high),
         "denoise_method": str(denoise_method),
@@ -4071,8 +5347,9 @@ def main() -> None:
     run_clicked = st.button(run_button_label, type="primary")
     has_cache = isinstance(st.session_state.get("b1b3_analysis_cache"), dict)
     last_signature = st.session_state.get("b1b3_last_signature")
+    cache_is_current = has_cache and last_signature == signature
     if auto_rerun:
-        need_run = run_clicked or (not has_cache) or (last_signature != signature)
+        need_run = run_clicked or (not cache_is_current)
     else:
         need_run = run_clicked or (not has_cache)
 
@@ -4118,6 +5395,12 @@ def main() -> None:
     if not isinstance(cache, dict):
         st.info(f"Click `{run_button_label}` to render previews.")
         return
+    if st.session_state.get("b1b3_last_signature") != signature:
+        st.warning(
+            "Current controls differ from the displayed analysis. Click the run button "
+            "to refresh B1/B2/B3 with the current raw/preprocessing selection."
+        )
+        return
 
     dataset = cache["dataset"]
     quality = cache["quality"]
@@ -4132,6 +5415,14 @@ def main() -> None:
     processed_image = np.asarray(cache["processed_image"], dtype=np.float32)
     fft_analysis = cache["fft_analysis"]
     fft_warnings = list(cache.get("fft_warnings", []))
+    preprocessing_mode = str(preprocessing.provenance.get("mode", "")).strip().lower()
+    raw_passthrough_active = (
+        preprocessing_mode == "raw_passthrough"
+        or "raw_passthrough" in set(preprocessing.operations)
+    )
+    b2_image_caption = (
+        "B2 image (raw input)" if raw_passthrough_active else "B2 image (preprocessed)"
+    )
 
     fft_image_norm = _normalize_for_display(
         np.asarray(fft_analysis.log_magnitude, dtype=np.float32)
@@ -4201,6 +5492,7 @@ def main() -> None:
         original_image=original_image,
         processed_image=processed_image,
         fft_image_norm=fft_image_norm,
+        processed_caption=b2_image_caption,
     )
 
     manual_points_xy: list[tuple[float, float]] = []
@@ -5242,9 +6534,10 @@ def main() -> None:
         b5_diffraction_used = b5_source_diffraction
         b5_run_warnings = []
 
-    tab_peak_sets, tab_b5, tab_manual_align, tab_b1, tab_diag = st.tabs(
+    tab_peak_sets, tab_c2, tab_b5, tab_manual_align, tab_b1, tab_diag = st.tabs(
         [
             "Peak sets / Phase candidates",
+            "C2 GPA strain",
             "B5 simulation",
             "Manual table align",
             "B1 details",
@@ -5273,6 +6566,19 @@ def main() -> None:
         st.dataframe(
             _build_phase_rows(phase_candidates),
             use_container_width=True,
+        )
+
+    with tab_c2:
+        c2_gpa_result, c2_gpa_warnings = _render_c2_gpa_panel(
+            original_image=original_image,
+            processed_image=processed_image,
+            preprocessing_enabled=bool(preprocessing_params.get("enabled", False)),
+            fft_log_magnitude=fft_analysis.log_magnitude,
+            peak_rows=selected_rows,
+            fft_center_xy=tuple(float(v) for v in fft_analysis.center),
+            calibration=calibration,
+            active_peak_source_label=active_peak_source_label,
+            run_dir=run_dir,
         )
 
     with tab_b5:
@@ -5545,6 +6851,7 @@ def main() -> None:
         warnings.extend(list(rotation_angle_warnings))
         warnings.extend(list(manual_table_parse_warnings))
         warnings.extend(list(align_result.get("warnings", [])))
+        warnings.extend(list(c2_gpa_warnings))
         warnings.extend(list(b5_run_warnings))
         warnings.extend(list(dataset.warnings))
         warnings.extend(list(quality.warnings))
@@ -5569,6 +6876,11 @@ def main() -> None:
         st.json(diffraction_auto.provenance)
         st.markdown("**Selected-point provenance**")
         st.json(manual_result["provenance"])
+        st.markdown("**C2 GPA provenance**")
+        if c2_gpa_result is not None:
+            st.json(c2_gpa_result.provenance)
+        else:
+            st.info("C2 GPA has not been run for the current active peak set.")
         st.markdown("**B5 simulation provenance**")
         if isinstance(b5_simulation, SimulationResult):
             st.json(b5_simulation.provenance)
@@ -5595,6 +6907,7 @@ def main() -> None:
                     "input_path": str(input_path),
                     "output_dir": str(run_dir),
                     "signature_len": len(signature),
+                    "preprocessing": preprocessing_params,
                     "diffraction": diffraction_params,
                     "simulation": b5_params,
                 },

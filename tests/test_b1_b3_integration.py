@@ -52,6 +52,38 @@ def _write_b1_b3_workflow(path: Path) -> Path:
     return path
 
 
+def _write_b1_b3_raw_workflow(path: Path) -> Path:
+    path.write_text(
+        "\n".join(
+            [
+                "workflow:",
+                "  name: b1_b3_raw_input",
+                "  steps: [load, assess_quality, calibrate, preprocess, analyze, report]",
+                "  parameters:",
+                "    calibration:",
+                "      method: reference",
+                "      known_d_spacing: 0.2",
+                "      known_d_spacing_unit: nm",
+                "      measured_radius_px: 10",
+                "    preprocessing:",
+                "      enabled: false",
+                "      denoise_method: gaussian",
+                "      background_method: gaussian",
+                "    diffraction:",
+                "      peak_detector: local_max",
+                "      top_k_peaks: 8",
+                "      min_peak_distance: 3",
+                "      center_exclusion_radius: 4",
+                "outputs:",
+                "  formats: [json]",
+                "  save_intermediates: true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def _synthetic_image(size: int = 80) -> np.ndarray:
     spectrum = np.zeros((size, size), dtype=np.complex128)
     cy = size // 2
@@ -103,3 +135,25 @@ def test_b1_b3_end_to_end_pipeline_outputs(tmp_path: Path) -> None:
     assert (output_dir / "tables" / "diffraction_peaks.csv").exists()
     assert (output_dir / "tables" / "d_spacings.csv").exists()
     assert (output_dir / "tables" / "indexed_spots.csv").exists()
+
+
+def test_b1_b3_workflow_can_analyze_raw_input_without_b2_denoise(tmp_path: Path) -> None:
+    input_path = tmp_path / "b1_b3_raw_input.npy"
+    np.save(input_path, _synthetic_image())
+    workflow_path = _write_b1_b3_raw_workflow(tmp_path / "b1_b3_raw_workflow.yaml")
+    output_dir = tmp_path / "raw_outputs"
+
+    run_result = TEMAnalysisSkill().run(
+        input_path=input_path,
+        workflow_path=workflow_path,
+        output_dir=output_dir,
+    )
+    report = read_json(Path(run_result["report_path"]), AnalysisReport)
+
+    assert report.preprocessing is not None
+    assert report.preprocessing.operations == ["raw_passthrough"]
+    assert report.preprocessing.provenance["mode"] == "raw_passthrough"
+    assert report.preprocessing.image is not None
+    assert report.preprocessing.image.uri == str(input_path)
+    assert report.diffraction is not None
+    assert report.diffraction.provenance["method"] == "run_diffraction_analysis"

@@ -626,6 +626,12 @@ def _validate_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
     if preprocessing is not None:
         if not isinstance(preprocessing, dict):
             raise ValueError("workflow.parameters.preprocessing must be a mapping.")
+        for bool_key in ("enabled", "apply_preprocessing", "denoise_enabled"):
+            if bool_key in preprocessing:
+                _as_bool(
+                    preprocessing[bool_key],
+                    field_name=f"preprocessing.{bool_key}",
+                )
         recipe = preprocessing.get("recipe")
         if recipe is not None and str(recipe) not in _SUPPORTED_PREPROCESS_RECIPES:
             raise ValueError(
