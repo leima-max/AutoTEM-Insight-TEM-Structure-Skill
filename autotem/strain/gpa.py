@@ -695,13 +695,30 @@ def _displacement_from_phases(
 ) -> tuple[np.ndarray, np.ndarray]:
     g_inv = np.linalg.inv(np.asarray(g_vectors, dtype=np.float64))
     p1, p2 = [
-        _unwrap_phase_for_displacement(np.asarray(phase, dtype=np.float64), quality_mask)
+        _center_unwrapped_phase(
+            _unwrap_phase_for_displacement(np.asarray(phase, dtype=np.float64), quality_mask),
+            quality_mask,
+        )
         for phase in phase_maps
     ]
     factor = -1.0 / _TWO_PI
     ux = factor * (g_inv[0, 0] * p1 + g_inv[0, 1] * p2)
     uy = factor * (g_inv[1, 0] * p1 + g_inv[1, 1] * p2)
     return _mask_fill(ux, quality_mask), _mask_fill(uy, quality_mask)
+
+
+def _center_unwrapped_phase(
+    phase: np.ndarray,
+    quality_mask: np.ndarray | None,
+) -> np.ndarray:
+    arr = np.asarray(phase, dtype=np.float64)
+    if quality_mask is None or quality_mask.shape != arr.shape or not np.any(quality_mask):
+        return arr
+    samples = arr[np.asarray(quality_mask, dtype=bool)]
+    samples = samples[np.isfinite(samples)]
+    if samples.size == 0:
+        return arr
+    return arr - float(np.median(samples))
 
 
 def _strain_from_phase_gradients(
