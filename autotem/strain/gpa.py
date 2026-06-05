@@ -640,11 +640,26 @@ def _unwrap_phase_for_displacement(
     phase: np.ndarray,
     quality_mask: np.ndarray | None = None,
 ) -> np.ndarray:
+    phase_arr = np.asarray(phase, dtype=np.float64)
     try:
         from skimage.restoration import unwrap_phase
     except Exception:
-        return np.unwrap(np.unwrap(np.asarray(phase, dtype=np.float64), axis=0), axis=1)
-    phase_arr = np.asarray(phase, dtype=np.float64)
+        unwrap_phase = None
+
+    def _unwrap_2d(crop_phase: np.ndarray, crop_mask: np.ndarray | None = None) -> np.ndarray:
+        crop_arr = np.asarray(crop_phase, dtype=np.float64)
+        if unwrap_phase is None:
+            if crop_mask is not None and crop_mask.shape == crop_arr.shape:
+                crop_arr = np.where(crop_mask, crop_arr, 0.0)
+            return np.unwrap(np.unwrap(crop_arr, axis=0), axis=1)
+        if crop_mask is not None and crop_mask.shape == crop_arr.shape and not bool(np.all(crop_mask)):
+            unwrapped = unwrap_phase(np.ma.array(crop_arr, mask=~crop_mask))
+        else:
+            unwrapped = unwrap_phase(crop_arr)
+        if np.ma.isMaskedArray(unwrapped):
+            return np.asarray(unwrapped.filled(0.0), dtype=np.float64)
+        return np.asarray(unwrapped, dtype=np.float64)
+
     if quality_mask is not None and quality_mask.shape == phase_arr.shape and np.any(quality_mask):
         mask = np.asarray(quality_mask, dtype=bool)
         y_idx, x_idx = np.nonzero(mask)
@@ -652,18 +667,10 @@ def _unwrap_phase_for_displacement(
         x0, x1 = int(np.min(x_idx)), int(np.max(x_idx)) + 1
         crop_phase = phase_arr[y0:y1, x0:x1]
         crop_mask = mask[y0:y1, x0:x1]
-        if bool(np.all(crop_mask)):
-            unwrapped = unwrap_phase(crop_phase)
-        else:
-            unwrapped = unwrap_phase(np.ma.array(crop_phase, mask=~crop_mask))
-        if np.ma.isMaskedArray(unwrapped):
-            unwrapped_crop = np.asarray(unwrapped.filled(0.0), dtype=np.float64)
-        else:
-            unwrapped_crop = np.asarray(unwrapped, dtype=np.float64)
         out = np.zeros_like(phase_arr, dtype=np.float64)
-        out[y0:y1, x0:x1] = unwrapped_crop
+        out[y0:y1, x0:x1] = _unwrap_2d(crop_phase, crop_mask)
         return out
-    return np.asarray(unwrap_phase(phase_arr), dtype=np.float64)
+    return _unwrap_2d(phase_arr)
 
 
 def _quality_from_amplitudes(
