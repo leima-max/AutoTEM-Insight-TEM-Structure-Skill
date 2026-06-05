@@ -29,6 +29,73 @@ def _to_float(value: Any) -> float | None:
     return None
 
 
+def _to_bool(value: Any, *, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    if isinstance(value, (int, float)):
+        return bool(int(value))
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in {"1", "true", "yes", "on"}:
+            return True
+        if token in {"0", "false", "no", "off"}:
+            return False
+    return bool(default)
+
+
+def _preprocessing_enabled(params: dict[str, Any]) -> bool:
+    for key in ("enabled", "apply_preprocessing", "denoise_enabled"):
+        if key in params:
+            return _to_bool(params.get(key), default=True)
+    return True
+
+
+def _raw_passthrough_result(
+    dataset: TEMDataset,
+    *,
+    quality_after: QualityAssessment | None,
+    recipe: str,
+    parameters: dict[str, Any],
+) -> PreprocessingResult:
+    image = load_dataset_array(dataset)
+    if image is None:
+        return PreprocessingResult(
+            image=None,
+            operations=[],
+            parameters={**parameters, "recipe": recipe, "enabled": False},
+            quality_after=quality_after,
+            provenance={
+                "method": "preprocess_dataset",
+                "recipe": recipe,
+                "mode": "raw_passthrough",
+            },
+            warnings=["Input image is unavailable; raw passthrough returned empty result."],
+        )
+
+    image_ref = dataset.data.model_copy(deep=True)
+    image_ref.description = "Raw input image array; B2 preprocessing and denoise disabled."
+    return PreprocessingResult(
+        image=image_ref,
+        operations=["raw_passthrough"],
+        parameters={
+            **parameters,
+            "recipe": recipe,
+            "enabled": False,
+            "image_source": "raw_input",
+        },
+        quality_after=quality_after,
+        provenance={
+            "method": "preprocess_dataset",
+            "recipe": recipe,
+            "mode": "raw_passthrough",
+            "source_path": dataset.source_path,
+        },
+        warnings=[],
+    )
+
+
 def assess_quality(
     dataset: TEMDataset,
     *,
@@ -81,6 +148,14 @@ def preprocess_dataset(
     params = dict(parameters or {})
     warnings: list[str] = []
     operations: list[str] = []
+
+    if not _preprocessing_enabled(params):
+        return _raw_passthrough_result(
+            dataset,
+            quality_after=quality_after,
+            recipe=recipe,
+            parameters=params,
+        )
 
     image = load_dataset_array(dataset)
     if image is None:

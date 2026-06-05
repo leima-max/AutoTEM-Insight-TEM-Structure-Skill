@@ -3,9 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
-from autotem.core import ArrayReference, TEMDataset
+from autotem.core import ArrayReference, CalibrationResult, TEMDataset
+from autotem.diffraction.basic import run_diffraction_analysis
 from autotem.diffraction.fft import locate_direct_beam
+from autotem.io import load_tem_dataset
 from autotem.preprocessing.basic import preprocess_dataset
 
 
@@ -65,6 +68,51 @@ def test_b2_preprocess_background_subtraction_rolling_ball(tmp_path: Path) -> No
     )
     assert result.background is not None
     assert any(op.startswith("background:rolling_ball") for op in result.operations)
+
+
+def test_b2_preprocess_can_bypass_to_raw_input(tmp_path: Path) -> None:
+    image = np.linspace(10.0, 200.0, 64, dtype=np.float32).reshape(8, 8)
+    dataset = _dataset_from_array(image, tmp_path / "raw_input.npy")
+
+    result = preprocess_dataset(
+        dataset,
+        parameters={
+            "enabled": False,
+            "denoise_method": "wiener",
+            "background_method": "gaussian",
+        },
+    )
+
+    assert result.image is not None
+    assert result.operations == ["raw_passthrough"]
+    assert result.provenance["mode"] == "raw_passthrough"
+    assert result.parameters["enabled"] is False
+    assert not any(op.startswith("denoise:") for op in result.operations)
+    assert not any(op.startswith("background:") for op in result.operations)
+    assert np.allclose(np.load(result.image.uri, allow_pickle=False), image)
+
+
+def test_b3_diffraction_accepts_tiff_raw_passthrough(tmp_path: Path) -> None:
+    image = np.zeros((32, 32), dtype=np.uint8)
+    image[16, 16] = 255
+    image[10, 16] = 160
+    image[22, 16] = 160
+    image[16, 10] = 140
+    image[16, 22] = 140
+    path = tmp_path / "raw_input.tiff"
+    Image.fromarray(image).save(path, format="TIFF")
+    dataset = load_tem_dataset(path)
+    preprocessing = preprocess_dataset(dataset, parameters={"enabled": False})
+
+    result = run_diffraction_analysis(
+        preprocessing,
+        CalibrationResult(),
+        parameters={"top_k_peaks": 4, "center_exclusion_radius": 2.0},
+    )
+
+    assert preprocessing.operations == ["raw_passthrough"]
+    assert result.provenance["method"] == "run_diffraction_analysis"
+    assert result.provenance.get("reason") != "missing_preprocessed"
 
 
 def test_b2_fft_direct_beam_auto_localization() -> None:

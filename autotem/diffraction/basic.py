@@ -105,6 +105,19 @@ def _array_from_reference(reference: ArrayReference) -> np.ndarray | None:
         if image.ndim == 3:
             image = image.mean(axis=2)
         return np.asarray(image, dtype=np.float64) if image.ndim == 2 else None
+    try:
+        from autotem.io.readers import read_image
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        read_result = read_image(path)
+    except Exception:  # noqa: BLE001
+        return None
+    image = np.asarray(read_result.array, dtype=np.float64)
+    if image.ndim == 3:
+        image = image.mean(axis=2)
+    if image.ndim == 2:
+        return image
     return None
 
 
