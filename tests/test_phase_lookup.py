@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import types
 
+import autotem.diffraction.phase_lookup as phase_lookup
 from autotem.diffraction.phase_lookup import (
     lookup_phase_candidates,
     resolve_materials_project_api_key,
@@ -28,6 +29,129 @@ def test_phase_lookup_resolves_material_name_from_local_builtin_library() -> Non
     assert top["source"] == "local_builtin_crystal_library"
     assert top["a"] == 0.5431
     assert result.provenance["material_names"] == ["Silicon"]
+
+
+def test_phase_lookup_does_not_resolve_cspbbr3_from_local_builtin_library() -> None:
+    result = lookup_phase_candidates(
+        formula=None,
+        elements=None,
+        material_names=["CsPbBr3"],
+        sources=["local_builtin"],
+        limit_per_source=3,
+        timeout_s=1,
+    )
+
+    assert not result.candidates
+    assert any(
+        "Local built-in crystal lookup returned no candidates." in item
+        for item in result.warnings
+    )
+    assert result.provenance["candidate_pool"]["candidate_count"] == 0
+
+
+def test_phase_lookup_normalizes_cod_formula_order(monkeypatch) -> None:
+    def fake_fetch_cod_candidates(*, formula, limit, timeout_s):
+        assert formula == "CsPbBr3"
+        return [
+            {
+                "name": "COD_1533063",
+                "formula": "- Br3 Cs Pb -",
+                "a": 0.5874,
+                "b": 0.5874,
+                "c": 0.5874,
+                "alpha": 90.0,
+                "beta": 90.0,
+                "gamma": 90.0,
+                "space_group": "Pm-3m",
+                "source": "crystallography_open_database",
+                "identifier": "1533063",
+            }
+        ], []
+
+    monkeypatch.setattr(phase_lookup, "_fetch_cod_candidates", fake_fetch_cod_candidates)
+
+    result = lookup_phase_candidates(
+        formula="CsPbBr3",
+        elements=None,
+        sources=["cod"],
+        limit_per_source=3,
+        timeout_s=1,
+    )
+
+    assert not result.warnings
+    assert result.candidates[0]["formula_original"] == "- Br3 Cs Pb -"
+    assert result.candidates[0]["formula_canonical"] == "Br3CsPb"
+    assert result.candidates[0]["formula_key"] == "Br:3|Cs:1|Pb:1"
+    assert result.provenance["formula_canonical"] == "Br3CsPb"
+
+
+def test_phase_lookup_merges_same_materials_project_id_across_sources(monkeypatch) -> None:
+    def fake_fetch_mp_candidates(*, formula, elements, limit, timeout_s):
+        assert formula == "Si"
+        return [
+            {
+                "name": "mp-149",
+                "formula": "Si",
+                "a": 0.5431,
+                "b": 0.5431,
+                "c": 0.5431,
+                "alpha": 90.0,
+                "beta": 90.0,
+                "gamma": 90.0,
+                "space_group": "Fd-3m",
+                "source": "materials_project_optimade",
+                "identifier": "mp-149",
+            }
+        ], []
+
+    def fake_fetch_mp_api_candidates(**kwargs):
+        assert kwargs["formula"] == "Si"
+        return [
+            {
+                "name": "mp-149",
+                "formula": "Si",
+                "a": 0.5431,
+                "b": 0.5431,
+                "c": 0.5431,
+                "alpha": 90.0,
+                "beta": 90.0,
+                "gamma": 90.0,
+                "space_group": "Fd-3m",
+                "source": "materials_project_api",
+                "identifier": "mp-149",
+                "structure_source": "materials_project_structure",
+                "materials_project": {"is_stable": True},
+            }
+        ], [], {"source": "materials_project_api", "candidate_count": 1}
+
+    monkeypatch.setattr(phase_lookup, "_fetch_mp_candidates", fake_fetch_mp_candidates)
+    monkeypatch.setattr(
+        phase_lookup,
+        "_fetch_mp_api_candidates",
+        fake_fetch_mp_api_candidates,
+    )
+
+    result = lookup_phase_candidates(
+        formula="Si",
+        elements=None,
+        sources=["materials_project_optimade", "materials_project_api"],
+        limit_per_source=3,
+        timeout_s=1,
+        materials_project_api_key="secret",
+    )
+
+    assert not result.warnings
+    assert len(result.candidates) == 1
+    top = result.candidates[0]
+    assert top["source"] == "materials_project_api"
+    assert top["identifier"] == "mp-149"
+    assert top["lookup_sources"] == [
+        "materials_project_api",
+        "materials_project_optimade",
+    ]
+    assert top["lookup_source_count"] == 2
+    assert result.provenance["candidate_pool"]["raw_candidate_count"] == 2
+    assert result.provenance["candidate_pool"]["duplicate_candidate_count"] == 1
 
 
 def test_materials_project_api_source_guides_first_use_when_key_missing(

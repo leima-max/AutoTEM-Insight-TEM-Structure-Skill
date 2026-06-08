@@ -84,6 +84,89 @@ def test_b4_mvp_prefers_closest_lattice_candidate() -> None:
     assert bool(result.provenance.get("active"))
 
 
+def test_b4_allowed_phase_filter_does_not_match_single_element_substrings() -> None:
+    peaks, g_vectors, d_by_peak = _build_b4_inputs()
+    initial = [IndexedSpot(peak_index=i, h=0, k=0, l=0, confidence=0.1) for i in range(len(peaks))]
+
+    result = run_b4_indexing(
+        peaks=peaks,
+        g_vectors=g_vectors,
+        d_by_peak=d_by_peak,
+        initial_indexed_spots=initial,
+        candidate_phase_params=[
+            {
+                "name": "Graphite",
+                "formula": "C",
+                "a": 0.246,
+                "b": 0.246,
+                "c": 0.6708,
+                "alpha": 90,
+                "beta": 90,
+                "gamma": 120,
+                "space_group": "P63/mmc",
+            }
+        ],
+        allowed_phase_names={"CsPbBr3"},
+        max_hkl=3,
+        d_tolerance_rel=0.08,
+        angle_tolerance_deg=10.0,
+        strict_mode=False,
+        top_n=1,
+    )
+
+    assert not result.phase_candidates
+    assert result.provenance["reason"] == "no_phase_candidates"
+
+
+def test_b4_allowed_phase_filter_accepts_equivalent_formula_order() -> None:
+    peaks, g_vectors, d_by_peak = _build_b4_inputs()
+    initial = [IndexedSpot(peak_index=i, h=0, k=0, l=0, confidence=0.1) for i in range(len(peaks))]
+
+    result = run_b4_indexing(
+        peaks=peaks,
+        g_vectors=g_vectors,
+        d_by_peak=d_by_peak,
+        initial_indexed_spots=initial,
+        candidate_phase_params=[
+            {
+                "name": "mp-cspbbr3-like",
+                "formula": "Br3CsPb",
+                "a": 0.4,
+                "b": 0.4,
+                "c": 0.4,
+                "alpha": 90,
+                "beta": 90,
+                "gamma": 90,
+                "space_group": "Pm-3m",
+                "source": "materials_project_optimade",
+            },
+            {
+                "name": "cod-cspbbr3-like",
+                "formula": "- Br3 Cs Pb -",
+                "a": 0.4,
+                "b": 0.4,
+                "c": 0.4,
+                "alpha": 90,
+                "beta": 90,
+                "gamma": 90,
+                "space_group": "Pm-3m",
+                "source": "crystallography_open_database",
+            },
+        ],
+        allowed_phase_names={"CsPbBr3"},
+        max_hkl=3,
+        d_tolerance_rel=0.08,
+        angle_tolerance_deg=10.0,
+        strict_mode=False,
+        top_n=2,
+    )
+
+    assert [candidate.source for candidate in result.phase_candidates] == [
+        "materials_project_optimade",
+        "crystallography_open_database",
+    ]
+
+
 def test_b4_strict_reads_cif_candidates_and_reports_checks(tmp_path: Path) -> None:
     peaks, g_vectors, d_by_peak = _build_b4_inputs()
     initial = [IndexedSpot(peak_index=i, h=0, k=0, l=0, confidence=0.1) for i in range(len(peaks))]

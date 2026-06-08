@@ -41,6 +41,7 @@ from autotem.diffraction.peak_detection import (
     SUPPORTED_THRESHOLD_STRATEGIES,
 )
 from autotem.diffraction.phase_lookup import (
+    lookup_phase_candidates,
     materials_project_api_setup_guidance,
     supported_phase_lookup_sources,
 )
@@ -3008,9 +3009,17 @@ def _phase_candidate_to_param(candidate: PhaseCandidate) -> dict[str, Any] | Non
 def _merge_candidate_phase_params(
     base_rows: list[dict[str, Any]],
     phase_candidates: list[PhaseCandidate],
+    extra_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     rows = [dict(row) for row in base_rows if isinstance(row, dict)]
     existing = {_phase_candidate_param_key(row) for row in rows}
+    for row in extra_rows or []:
+        if not isinstance(row, dict):
+            continue
+        key = _phase_candidate_param_key(row)
+        if key not in existing:
+            rows.append(dict(row))
+            existing.add(key)
     for candidate in phase_candidates:
         row = _phase_candidate_to_param(candidate)
         if row is None:
@@ -3020,6 +3029,101 @@ def _merge_candidate_phase_params(
             rows.append(row)
             existing.add(key)
     return rows
+
+
+def _lookup_active_phase_candidate_params(
+    diff_params: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
+    indexing_mode = str(diff_params.get("indexing_mode", "auto")).strip().lower()
+    lookup_sources = _comma_list(diff_params.get("phase_lookup_sources", []))
+    if indexing_mode == "baseline" or not lookup_sources:
+        return [], [], {"enabled": False, "reason": "disabled_or_no_sources"}
+
+    lookup_flag = diff_params.get("phase_lookup_enabled")
+    if lookup_flag is not None and not _bool_value(lookup_flag, False):
+        return [], [], {"enabled": False, "reason": "disabled_by_flag"}
+
+    material_names = _dedupe_strings(
+        [
+            *_comma_list(diff_params.get("phase_candidate_materials", [])),
+            *_comma_list(diff_params.get("candidate_phases", [])),
+            *_comma_list(diff_params.get("phase_lookup_materials", [])),
+        ]
+    )
+    formula = diff_params.get("phase_lookup_formula")
+    formula_text = str(formula).strip() if isinstance(formula, str) and formula.strip() else None
+    if not material_names and not formula_text:
+        return [], [], {"enabled": True, "reason": "missing_material_query"}
+
+    config_path = diff_params.get("materials_project_config_path")
+    config_text = (
+        str(config_path).strip()
+        if isinstance(config_path, str) and str(config_path).strip()
+        else None
+    )
+    try:
+        result = lookup_phase_candidates(
+            formula=formula_text,
+            elements=_comma_list(diff_params.get("phase_lookup_elements", [])),
+            material_names=material_names,
+            sources=lookup_sources,
+            limit_per_source=max(
+                1,
+                int(_num(diff_params.get("phase_lookup_limit_per_source"), 5)),
+            ),
+            timeout_s=max(1, int(_num(diff_params.get("phase_lookup_timeout_s"), 8))),
+            materials_project_api_key=(
+                str(diff_params["materials_project_api_key"]).strip()
+                if str(diff_params.get("materials_project_api_key", "")).strip()
+                else None
+            ),
+            materials_project_config_path=config_text,
+            materials_project_ids=_comma_list(diff_params.get("materials_project_ids", [])),
+            materials_project_sort_by=str(
+                diff_params.get("materials_project_sort_by", "stability")
+            ),
+            materials_project_include_deprecated=_bool_value(
+                diff_params.get("materials_project_include_deprecated"),
+                False,
+            ),
+            materials_project_filter_stable=_bool_value(
+                diff_params.get("materials_project_filter_stable"),
+                False,
+            ),
+            materials_project_max_energy_above_hull=(
+                _num(diff_params.get("materials_project_max_energy_above_hull"), 0.0)
+                if diff_params.get("materials_project_max_energy_above_hull") is not None
+                else None
+            ),
+            materials_project_prefer_experimental=_bool_value(
+                diff_params.get("materials_project_prefer_experimental"),
+                True,
+            ),
+            materials_project_candidate_pool_size=(
+                max(1, int(_num(diff_params.get("materials_project_candidate_pool_size"), 20)))
+                if diff_params.get("materials_project_candidate_pool_size") is not None
+                else None
+            ),
+            materials_project_api_isolate=_bool_value(
+                diff_params.get("materials_project_api_isolate"),
+                False,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return [], [f"Active phase lookup failed: {exc}"], {
+            "enabled": True,
+            "failed": True,
+        }
+
+    warnings = [f"Active phase lookup: {warning}" for warning in result.warnings]
+    provenance = {
+        "enabled": True,
+        "candidate_count": len(result.candidates),
+        **result.provenance,
+    }
+    if not result.candidates:
+        warnings.append("Active phase lookup returned no candidates.")
+    return list(result.candidates), warnings, provenance
 
 
 def _build_peak_rows(
@@ -3108,6 +3212,47 @@ def _build_phase_rows(phase_candidates: list[PhaseCandidate]) -> list[dict[str, 
             }
         )
     return rows
+
+
+def _round_optional_float(value: Any, ndigits: int = 6) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return round(float(value), ndigits)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_phase_lookup_pool_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    table_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        lookup_sources = row.get("lookup_sources")
+        source_text = (
+            ", ".join(str(item) for item in lookup_sources)
+            if isinstance(lookup_sources, list) and lookup_sources
+            else str(row.get("source", ""))
+        )
+        table_rows.append(
+            {
+                "name": row.get("name"),
+                "formula": row.get("formula"),
+                "formula_original": row.get("formula_original"),
+                "formula_canonical": row.get("formula_canonical"),
+                "source": row.get("source"),
+                "lookup_sources": source_text,
+                "identifier": row.get("identifier"),
+                "space_group": row.get("space_group"),
+                "space_group_number": row.get("space_group_number"),
+                "a_nm": _round_optional_float(row.get("a")),
+                "b_nm": _round_optional_float(row.get("b")),
+                "c_nm": _round_optional_float(row.get("c")),
+                "structure_source": row.get("structure_source"),
+                "equivalent_source_count": row.get("lookup_source_count"),
+            }
+        )
+    return table_rows
 
 
 def _diffraction_from_manual_result(manual_result: dict[str, Any]) -> DiffractionResult:
@@ -5407,9 +5552,56 @@ def main() -> None:
     calibration = cache["calibration"]
     preprocessing = cache["preprocessing"]
     diffraction_auto = cache["diffraction_auto"]
+    active_phase_lookup_signature = _json_signature(
+        {
+            key: diffraction_params.get(key)
+            for key in [
+                "indexing_mode",
+                "phase_candidate_materials",
+                "candidate_phases",
+                "phase_lookup_sources",
+                "phase_lookup_elements",
+                "phase_lookup_formula",
+                "phase_lookup_limit_per_source",
+                "phase_lookup_timeout_s",
+                "materials_project_config_path",
+                "materials_project_ids",
+                "materials_project_sort_by",
+                "materials_project_include_deprecated",
+                "materials_project_filter_stable",
+                "materials_project_max_energy_above_hull",
+                "materials_project_prefer_experimental",
+                "materials_project_candidate_pool_size",
+                "materials_project_api_isolate",
+            ]
+        }
+    )
+    active_phase_lookup_cache = st.session_state.get("b1b3_active_phase_lookup_cache")
+    if (
+        isinstance(active_phase_lookup_cache, dict)
+        and active_phase_lookup_cache.get("signature") == active_phase_lookup_signature
+    ):
+        active_phase_lookup_rows = list(active_phase_lookup_cache.get("rows", []))
+        active_phase_lookup_warnings = list(active_phase_lookup_cache.get("warnings", []))
+        active_phase_lookup_provenance = dict(
+            active_phase_lookup_cache.get("provenance", {})
+        )
+    else:
+        (
+            active_phase_lookup_rows,
+            active_phase_lookup_warnings,
+            active_phase_lookup_provenance,
+        ) = _lookup_active_phase_candidate_params(diffraction_params)
+        st.session_state["b1b3_active_phase_lookup_cache"] = {
+            "signature": active_phase_lookup_signature,
+            "rows": list(active_phase_lookup_rows),
+            "warnings": list(active_phase_lookup_warnings),
+            "provenance": dict(active_phase_lookup_provenance),
+        }
     manual_candidate_phase_params = _merge_candidate_phase_params(
         candidate_phase_params,
         list(diffraction_auto.phase_candidates),
+        extra_rows=active_phase_lookup_rows,
     )
     original_image = np.asarray(cache["original_image"], dtype=np.float32)
     processed_image = np.asarray(cache["processed_image"], dtype=np.float32)
@@ -6370,6 +6562,15 @@ def main() -> None:
             auto_remove_peak_ids=auto_remove_peak_ids,
             manual_points_refined_xy=manual_points_refined_xy,
         )
+        manual_result["warnings"] = list(
+            dict.fromkeys(
+                list(manual_result.get("warnings", []))
+                + list(active_phase_lookup_warnings)
+            )
+        )
+        manual_provenance = dict(manual_result.get("provenance", {}))
+        manual_provenance["active_phase_lookup"] = dict(active_phase_lookup_provenance)
+        manual_result["provenance"] = manual_provenance
         st.session_state["b1b3_manual_result_cache"] = {
             "signature": manual_signature,
             "result": manual_result,
@@ -6555,14 +6756,28 @@ def main() -> None:
         else:
             source_caption = "Active vector-mode set synthesized from the two basis spots."
 
-        source_cols = st.columns(3)
+        lookup_pool_meta = _as_mapping(
+            active_phase_lookup_provenance.get("candidate_pool", {})
+        )
+        lookup_pool_count = lookup_pool_meta.get("candidate_count", len(active_phase_lookup_rows))
+        source_cols = st.columns(4)
         source_cols[0].metric("Peak rows", str(len(peak_rows)))
         source_cols[1].metric("Phase candidates", str(len(phase_candidates)))
         source_cols[2].metric("Pipeline original", str(len(auto_rows)))
+        source_cols[3].metric("Lookup pool", str(lookup_pool_count))
         st.caption(f"Source: `{active_peak_source_label}`")
         st.caption(source_caption)
         st.dataframe(peak_rows, use_container_width=True, height=300)
-        st.subheader("Phase Candidates")
+        st.subheader("Phase Lookup Pool")
+        lookup_pool_rows = _build_phase_lookup_pool_rows(active_phase_lookup_rows)
+        if lookup_pool_rows:
+            st.dataframe(
+                lookup_pool_rows,
+                use_container_width=True,
+            )
+        else:
+            st.caption("No phase lookup candidates were returned for the active inputs.")
+        st.subheader("Phase Candidates (B4 ranked)")
         st.dataframe(
             _build_phase_rows(phase_candidates),
             use_container_width=True,
