@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip("streamlit")
+
 from apps.b2_diffraction_ui import (
     _build_phase_lookup_pool_rows,
     _lookup_active_phase_candidate_params,
