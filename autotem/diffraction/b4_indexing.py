@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass, field
 from math import gcd
@@ -115,11 +116,45 @@ def _normalize_label(value: str | None) -> str:
     return "".join(ch.lower() for ch in str(value) if ch.isalnum())
 
 
+_FORMULA_TOKEN_RE = re.compile(r"([A-Z][a-z]?)([0-9]*\.?[0-9]*)")
+
+
+def _formula_counts_key(value: str | None) -> tuple[tuple[str, float], ...] | None:
+    if value is None:
+        return None
+    text = re.sub(r"[^A-Za-z0-9.]+", "", str(value).strip())
+    if not text:
+        return None
+    parts = _FORMULA_TOKEN_RE.findall(text)
+    joined = "".join(f"{symbol}{count}" for symbol, count in parts)
+    if not parts or joined != text:
+        return None
+    counts: dict[str, float] = {}
+    for symbol, count_text in parts:
+        count = 1.0 if count_text == "" else float(count_text)
+        counts[symbol] = counts.get(symbol, 0.0) + count
+    return tuple(sorted(counts.items()))
+
+
 def _phase_allowed(phase: _LatticePhase, allowed_names: set[str] | None) -> bool:
     if allowed_names is None:
         return True
     allowed = {_normalize_label(item) for item in allowed_names if _normalize_label(item)}
     if not allowed:
+        return True
+    allowed_formula_keys = {
+        key for key in (_formula_counts_key(item) for item in allowed_names) if key
+    }
+    phase_formula_keys = {
+        key
+        for key in (
+            _formula_counts_key(phase.formula),
+            _formula_counts_key(phase.name),
+            _formula_counts_key(phase.identifier),
+        )
+        if key
+    }
+    if phase_formula_keys.intersection(allowed_formula_keys):
         return True
     labels = {
         _normalize_label(phase.name),
@@ -131,7 +166,10 @@ def _phase_allowed(phase: _LatticePhase, allowed_names: set[str] | None) -> bool
         return True
     for allowed_label in allowed:
         for label in labels:
-            if allowed_label in label or label in allowed_label:
+            if (
+                min(len(allowed_label), len(label)) >= 4
+                and (allowed_label in label or label in allowed_label)
+            ):
                 return True
     return False
 

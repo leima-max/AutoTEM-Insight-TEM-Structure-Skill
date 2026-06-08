@@ -407,7 +407,7 @@ def _fetch_text(url: str, *, timeout_s: int) -> str:
 
 
 def _parse_formula_counts(formula: str) -> dict[str, float]:
-    text = str(formula).strip().replace(" ", "")
+    text = re.sub(r"[^A-Za-z0-9.]+", "", str(formula).strip())
     if not text:
         return {}
     parts = _FORMULA_RE.findall(text)
@@ -427,6 +427,188 @@ def _normalize_query_text(value: str) -> str:
 
 def _compact_query_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.strip().lower())
+
+
+def _formula_counts_key(value: str | None) -> tuple[tuple[str, float], ...] | None:
+    if value is None:
+        return None
+    counts = _parse_formula_counts(str(value))
+    if not counts:
+        return None
+    return tuple(sorted(counts.items()))
+
+
+def _formula_key_string(value: str | None) -> str | None:
+    key = _formula_counts_key(value)
+    if key is None:
+        return None
+    return "|".join(f"{symbol}:{count:g}" for symbol, count in key)
+
+
+def _canonical_formula_from_key(
+    key: tuple[tuple[str, float], ...] | None,
+) -> str | None:
+    if key is None:
+        return None
+    return "".join(f"{symbol}{_format_count(count)}" for symbol, count in key)
+
+
+def _candidate_formula_value(row: dict[str, Any]) -> str | None:
+    for field in ("formula", "formula_pretty", "chemical_formula_reduced", "name"):
+        value = row.get(field)
+        if isinstance(value, str) and _formula_counts_key(value) is not None:
+            return value
+    return None
+
+
+def _annotate_phase_lookup_row(row: dict[str, Any]) -> dict[str, Any]:
+    annotated = dict(row)
+    formula_original = _candidate_formula_value(annotated)
+    key = _formula_counts_key(formula_original)
+    if formula_original is not None:
+        annotated.setdefault("formula_original", formula_original)
+    if key is not None:
+        annotated.setdefault("formula_canonical", _canonical_formula_from_key(key))
+        annotated.setdefault("formula_key", _formula_key_string(formula_original))
+    annotated.setdefault("lookup_source", str(annotated.get("source", "")).strip())
+    return annotated
+
+
+def _source_quality_rank(row: dict[str, Any]) -> int:
+    source = str(row.get("source", "")).strip().lower()
+    if source == "materials_project_api":
+        return 40
+    if source == "crystallography_open_database":
+        return 30
+    if source == "materials_project_optimade":
+        return 20
+    if source == "local_builtin_crystal_library":
+        return 10
+    return 0
+
+
+def _lookup_source_summary(row: dict[str, Any]) -> dict[str, Any]:
+    fields = [
+        "source",
+        "name",
+        "formula",
+        "formula_original",
+        "formula_canonical",
+        "identifier",
+        "space_group",
+        "space_group_number",
+        "structure_source",
+        "cif_url",
+    ]
+    return {field: row.get(field) for field in fields if row.get(field) is not None}
+
+
+def _merge_phase_lookup_rows(
+    primary: dict[str, Any],
+    duplicate: dict[str, Any],
+) -> dict[str, Any]:
+    rows = [primary, duplicate]
+    best = max(
+        rows,
+        key=lambda row: (
+            _source_quality_rank(row),
+            1 if row.get("atom_sites") else 0,
+            1 if row.get("structure_source") else 0,
+        ),
+    )
+    other = duplicate if best is primary else primary
+    merged = dict(best)
+    for key, value in other.items():
+        if key not in merged or merged[key] in (None, "", [], {}):
+            merged[key] = value
+    equivalent_sources = []
+    for row in rows:
+        equivalent_sources.extend(row.get("lookup_equivalent_sources", []))
+        equivalent_sources.append(_lookup_source_summary(row))
+    deduped_sources: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for item in equivalent_sources:
+        source_key = (
+            item.get("source"),
+            item.get("identifier"),
+            item.get("name"),
+            item.get("formula_original"),
+        )
+        if source_key in seen:
+            continue
+        seen.add(source_key)
+        deduped_sources.append(item)
+    merged["lookup_equivalent_sources"] = deduped_sources
+    merged["lookup_source_count"] = len(deduped_sources)
+    merged["lookup_sources"] = sorted(
+        {
+            str(item.get("source"))
+            for item in deduped_sources
+            if item.get("source") is not None
+        }
+    )
+    return _annotate_phase_lookup_row(merged)
+
+
+def _phase_lookup_dedupe_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    source = str(row.get("source", "")).strip().lower()
+    identifier = str(row.get("identifier", "")).strip().lower()
+    if identifier.startswith("mp-") or source.startswith("materials_project"):
+        if identifier:
+            return ("materials_project", identifier)
+    if source == "crystallography_open_database" and identifier:
+        return ("cod", identifier)
+    formula_key = row.get("formula_key") or _formula_key_string(_candidate_formula_value(row))
+    space_group = str(row.get("space_group", "")).strip().lower()
+    try:
+        cell = (
+            round(float(row.get("a", 0.0)), 4),
+            round(float(row.get("b", 0.0)), 4),
+            round(float(row.get("c", 0.0)), 4),
+            round(float(row.get("alpha", 0.0)), 3),
+            round(float(row.get("beta", 0.0)), 3),
+            round(float(row.get("gamma", 0.0)), 3),
+        )
+    except (TypeError, ValueError):
+        cell = (None, None, None, None, None, None)
+    return ("phase_lattice", formula_key, space_group, *cell)
+
+
+def _dedupe_phase_lookup_rows(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    index_by_key: dict[tuple[Any, ...], int] = {}
+    source_counts_raw: dict[str, int] = {}
+    for raw_row in rows:
+        row = _annotate_phase_lookup_row(raw_row)
+        source = str(row.get("source", "unknown")).strip() or "unknown"
+        source_counts_raw[source] = source_counts_raw.get(source, 0) + 1
+        key = _phase_lookup_dedupe_key(row)
+        existing_idx = index_by_key.get(key)
+        if existing_idx is None:
+            row.setdefault("lookup_equivalent_sources", [_lookup_source_summary(row)])
+            row.setdefault("lookup_source_count", 1)
+            row.setdefault("lookup_sources", [source])
+            index_by_key[key] = len(deduped)
+            deduped.append(row)
+            continue
+        deduped[existing_idx] = _merge_phase_lookup_rows(deduped[existing_idx], row)
+
+    source_counts: dict[str, int] = {}
+    for row in deduped:
+        for source in row.get("lookup_sources", []) or [row.get("source", "unknown")]:
+            source_text = str(source).strip() or "unknown"
+            source_counts[source_text] = source_counts.get(source_text, 0) + 1
+
+    return deduped, {
+        "raw_candidate_count": len(rows),
+        "candidate_count": len(deduped),
+        "deduped_candidate_count": len(deduped),
+        "duplicate_candidate_count": max(0, len(rows) - len(deduped)),
+        "source_counts_raw": source_counts_raw,
+        "source_counts": source_counts,
+    }
 
 
 def _candidate_copy(row: dict[str, Any]) -> dict[str, Any]:
@@ -1499,6 +1681,8 @@ def lookup_phase_candidates(
     resolved_material_queries: list[dict[str, str]] = []
     provenance: dict[str, Any] = {
         "formula": None if formula is None else str(formula).strip(),
+        "formula_canonical": _canonical_formula_from_key(_formula_counts_key(formula)),
+        "formula_key": _formula_key_string(formula),
         "elements": clean_elements,
         "sources": list(active_sources),
         "material_names": clean_materials,
@@ -1541,6 +1725,14 @@ def lookup_phase_candidates(
                 f"Material name '{material}' could not be resolved to a formula for online lookup."
             )
     provenance["resolved_formulas"] = resolved_formulas
+    provenance["resolved_formula_metadata"] = [
+        {
+            "formula": item,
+            "formula_canonical": _canonical_formula_from_key(_formula_counts_key(item)),
+            "formula_key": _formula_key_string(item),
+        }
+        for item in resolved_formulas
+    ]
     provenance["resolved_material_queries"] = resolved_material_queries
     provenance["materials_project_ids"] = clean_mp_ids
     online_query_formulas: list[str | None] = list(query_formulas) or [None]
@@ -1628,22 +1820,8 @@ def lookup_phase_candidates(
             merged.extend(cod_rows)
             warnings.extend(cod_warnings)
 
-    deduped: list[dict[str, Any]] = []
-    seen: set[tuple[Any, ...]] = set()
-    for row in merged:
-        key = (
-            str(row.get("source", "")),
-            round(float(row.get("a", 0.0)), 5),
-            round(float(row.get("b", 0.0)), 5),
-            round(float(row.get("c", 0.0)), 5),
-            round(float(row.get("alpha", 0.0)), 4),
-            round(float(row.get("beta", 0.0)), 4),
-            round(float(row.get("gamma", 0.0)), 4),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(row)
+    deduped, candidate_pool_provenance = _dedupe_phase_lookup_rows(merged)
+    provenance["candidate_pool"] = candidate_pool_provenance
 
     return PhaseLookupResult(
         candidates=deduped,
