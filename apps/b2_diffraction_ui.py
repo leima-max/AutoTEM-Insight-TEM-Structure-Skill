@@ -912,12 +912,48 @@ def _normalize_for_display(image: np.ndarray) -> np.ndarray:
     return np.clip(out, 0.0, 1.0).astype(np.float32)
 
 
+def _normalize_minmax_for_display(image: np.ndarray) -> np.ndarray:
+    arr = np.asarray(image, dtype=np.float32)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return np.zeros_like(arr, dtype=np.float32)
+    if not finite.all():
+        fill = float(np.nanmedian(arr[finite]))
+        arr = np.where(finite, arr, fill)
+    min_value = float(np.min(arr))
+    span = max(float(np.max(arr) - min_value), 1e-12)
+    out = (arr - min_value) / span
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+def _apply_fft_display_controls(
+    image_norm: np.ndarray,
+    *,
+    brightness: float = 0.0,
+    contrast: float = 1.0,
+    gamma: float = 1.0,
+) -> np.ndarray:
+    arr = np.asarray(image_norm, dtype=np.float32)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)
+    arr = np.clip(arr, 0.0, 1.0)
+    contrast_value = max(0.01, float(contrast))
+    brightness_value = float(np.clip(float(brightness), -1.0, 1.0))
+    arr = (arr - 0.5) * contrast_value + 0.5 + brightness_value
+    arr = np.clip(arr, 0.0, 1.0)
+    gamma_value = max(0.05, float(gamma))
+    arr = np.power(arr, 1.0 / gamma_value)
+    return np.clip(arr, 0.0, 1.0).astype(np.float32)
+
+
 def _to_fft_display_image(
     fft_image_norm: np.ndarray,
     *,
     max_side: int = 900,
     zoom: float = 1.0,
     center_xy: tuple[float, float] | None = None,
+    brightness: float = 0.0,
+    contrast: float = 1.0,
+    gamma: float = 1.0,
 ) -> tuple[Image.Image, float, float, float, float]:
     h, w = fft_image_norm.shape
     zoom = max(1.0, float(zoom))
@@ -936,6 +972,12 @@ def _to_fft_display_image(
         y1 = int(y0 + crop_h)
 
     crop = np.asarray(fft_image_norm[y0:y1, x0:x1], dtype=np.float32)
+    crop = _apply_fft_display_controls(
+        crop,
+        brightness=float(brightness),
+        contrast=float(contrast),
+        gamma=float(gamma),
+    )
     crop_h_actual, crop_w_actual = crop.shape
     scale = max(0.05, float(max_side) / max(crop_h_actual, crop_w_actual))
     disp_h = max(1, int(round(crop_h_actual * scale)))
@@ -5760,8 +5802,62 @@ def main() -> None:
                 help="Click within this radius of an existing point in delete mode.",
                 key="b1b3_auto_hit_radius_px",
             )
+            st.markdown("**FFT Display Control**")
+            if st.button("Reset FFT display", key="b1b3_fft_display_reset_btn"):
+                st.session_state["b1b3_fft_display_autosurvey"] = True
+                st.session_state["b1b3_fft_display_brightness"] = 0.0
+                st.session_state["b1b3_fft_display_contrast"] = 1.0
+                st.session_state["b1b3_fft_display_gamma"] = 1.0
+                st.session_state["b1b3_auto_canvas_nonce"] = int(
+                    st.session_state.get("b1b3_auto_canvas_nonce", 0)
+                ) + 1
+                st.rerun()
+            auto_fft_autosurvey = st.checkbox(
+                "FFT AutoSurvey",
+                value=True,
+                help=(
+                    "Use the robust FFT display stretch as the baseline. Turn it off "
+                    "to use min/max scaling before manual display tuning."
+                ),
+                key="b1b3_fft_display_autosurvey",
+            )
+            auto_fft_brightness = st.slider(
+                "FFT brightness",
+                min_value=-0.50,
+                max_value=0.50,
+                value=0.0,
+                step=0.01,
+                help="Display-only offset for the FFT review canvas.",
+                key="b1b3_fft_display_brightness",
+            )
+            auto_fft_contrast = st.slider(
+                "FFT contrast",
+                min_value=0.10,
+                max_value=4.00,
+                value=1.0,
+                step=0.05,
+                help="Display-only contrast multiplier for the FFT review canvas.",
+                key="b1b3_fft_display_contrast",
+            )
+            auto_fft_gamma = st.slider(
+                "FFT gamma",
+                min_value=0.20,
+                max_value=3.00,
+                value=1.0,
+                step=0.05,
+                help="Display-only gamma curve; values above 1 brighten midtones.",
+                key="b1b3_fft_display_gamma",
+            )
 
-        auto_action_signature = f"{auto_canvas_action}|{float(auto_canvas_zoom):.2f}"
+        auto_display_signature = (
+            f"{int(bool(auto_fft_autosurvey))}|"
+            f"{float(auto_fft_brightness):.3f}|"
+            f"{float(auto_fft_contrast):.3f}|"
+            f"{float(auto_fft_gamma):.3f}"
+        )
+        auto_action_signature = (
+            f"{auto_canvas_action}|{float(auto_canvas_zoom):.2f}|{auto_display_signature}"
+        )
         if (
             st.session_state.get("b1b3_auto_canvas_action_signature")
             != auto_action_signature
@@ -5771,11 +5867,19 @@ def main() -> None:
                 st.session_state.get("b1b3_auto_canvas_nonce", 0)
             ) + 1
 
+        auto_canvas_fft_base = (
+            fft_image_norm
+            if bool(auto_fft_autosurvey)
+            else _normalize_minmax_for_display(fft_analysis.log_magnitude)
+        )
         auto_canvas_bg, auto_sx, auto_sy, auto_x_offset, auto_y_offset = _to_fft_display_image(
-            fft_image_norm,
+            auto_canvas_fft_base,
             max_side=900,
             zoom=float(auto_canvas_zoom),
             center_xy=(float(fft_analysis.center[0]), float(fft_analysis.center[1])),
+            brightness=float(auto_fft_brightness),
+            contrast=float(auto_fft_contrast),
+            gamma=float(auto_fft_gamma),
         )
         auto_canvas_bg = _draw_auto_points_on_canvas_image(
             auto_canvas_bg,

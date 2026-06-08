@@ -33,6 +33,7 @@ import apps.b2_diffraction_ui as b2_ui
 
 from apps.b2_diffraction_ui import (
     _FALLBACK_DEFAULTS,
+    _apply_fft_display_controls,
     _build_simulated_spot_rows,
     _c2_gpa_blocking_warnings,
     _c2_gpa_pixel_size_nm_from_calibration,
@@ -49,7 +50,9 @@ from apps.b2_diffraction_ui import (
     _plot_b5_simulated_pattern,
     _plot_b5_simulation_overlay,
     _save_uploaded,
+    _normalize_minmax_for_display,
     SUPPORTED_SIMULATION_ENGINES,
+    _to_fft_display_image,
 )
 from autotem.core import (
     CalibrationResult,
@@ -303,6 +306,76 @@ def test_b5_defaults_lock_to_b4_zone_axis() -> None:
     assert _FALLBACK_DEFAULTS["simulation"]["simulation_engine"] == "diffsims"
     assert _FALLBACK_DEFAULTS["simulation"]["show_match_residual_lines"] is False
     assert SUPPORTED_SIMULATION_ENGINES == ["diffsims"]
+
+
+def test_fft_display_controls_default_is_noop() -> None:
+    image = np.array([[0.0, 0.25], [0.5, 1.0]], dtype=np.float32)
+
+    adjusted = _apply_fft_display_controls(
+        image,
+        brightness=0.0,
+        contrast=1.0,
+        gamma=1.0,
+    )
+
+    assert adjusted.dtype == np.float32
+    assert np.allclose(adjusted, image)
+
+
+def test_fft_display_controls_adjust_brightness_contrast_and_gamma() -> None:
+    image = np.array([[0.0, 0.25, 0.5, 0.75, 1.0]], dtype=np.float32)
+
+    brighter = _apply_fft_display_controls(image, brightness=0.10)
+    higher_contrast = _apply_fft_display_controls(image, contrast=2.0)
+    gamma_lifted = _apply_fft_display_controls(image, gamma=2.0)
+
+    assert brighter[0, 2] > image[0, 2]
+    assert higher_contrast[0, 1] < image[0, 1]
+    assert higher_contrast[0, 3] > image[0, 3]
+    assert gamma_lifted[0, 1] > image[0, 1]
+    assert float(np.min(brighter)) >= 0.0
+    assert float(np.max(higher_contrast)) <= 1.0
+
+
+def test_fft_display_minmax_baseline_handles_non_finite_values() -> None:
+    image = np.array([[1.0, 2.0], [3.0, np.nan]], dtype=np.float32)
+
+    normalized = _normalize_minmax_for_display(image)
+
+    assert normalized.dtype == np.float32
+    assert normalized[0, 0] == pytest.approx(0.0)
+    assert normalized[0, 1] == pytest.approx(0.5)
+    assert normalized[1, 0] == pytest.approx(1.0)
+    assert normalized[1, 1] == pytest.approx(0.5)
+
+
+def test_fft_display_adjustments_do_not_change_canvas_coordinate_mapping() -> None:
+    image = np.linspace(0.0, 1.0, 100, dtype=np.float32).reshape(10, 10)
+
+    normal_img, sx, sy, x_offset, y_offset = _to_fft_display_image(
+        image,
+        max_side=20,
+        zoom=2.0,
+        center_xy=(5.0, 5.0),
+    )
+    tuned_img, tuned_sx, tuned_sy, tuned_x_offset, tuned_y_offset = _to_fft_display_image(
+        image,
+        max_side=20,
+        zoom=2.0,
+        center_xy=(5.0, 5.0),
+        brightness=0.15,
+        contrast=1.5,
+        gamma=1.8,
+    )
+
+    assert tuned_img.size == normal_img.size
+    assert tuned_sx == pytest.approx(sx)
+    assert tuned_sy == pytest.approx(sy)
+    assert tuned_x_offset == pytest.approx(x_offset)
+    assert tuned_y_offset == pytest.approx(y_offset)
+    assert np.asarray(tuned_img, dtype=np.float32).mean() != pytest.approx(
+        np.asarray(normal_img, dtype=np.float32).mean()
+    )
 
 
 def test_c2_gpa_auto_basis_uses_non_collinear_active_b_vectors() -> None:
