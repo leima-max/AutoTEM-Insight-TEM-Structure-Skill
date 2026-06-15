@@ -102,7 +102,31 @@
     "save_intermediates": true,
     "provenance": {}
   },
-  "dataset": null,
+  "dataset": {
+    "schema_version": "0.1.0",
+    "data": {
+      "shape": [
+        80,
+        80
+      ],
+      "dtype": "float32",
+      "uri": "input.npy",
+      "inline": null,
+      "description": "Synthetic public B diffraction benchmark input."
+    },
+    "dataset_id": "b_diffraction_public",
+    "source_path": "public_fixture",
+    "modality": "HRTEM",
+    "pixel_size": null,
+    "pixel_unit": "unknown",
+    "metadata": {
+      "fixture": "public_minimal_b"
+    },
+    "provenance": {
+      "source": "benchmarks/cases/b_diffraction_public"
+    },
+    "warnings": []
+  },
   "quality": null,
   "calibration": null,
   "preprocessing": null,
@@ -423,7 +447,17 @@
   "simulation": null,
   "ai_inference": null,
   "benchmark": null,
-  "figures": [],
+  "figures": [
+    {
+      "label": "FFT peaks overlay",
+      "uri": "figures/fft_peaks_overlay.png",
+      "caption": "Public fixture diffraction peak overlay for A4 interface checks.",
+      "figure_type": "diffraction_overlay",
+      "provenance": {
+        "source": "public_benchmark_fixture"
+      }
+    }
+  ],
   "tables": [],
   "artifacts": [],
   "warnings": [],

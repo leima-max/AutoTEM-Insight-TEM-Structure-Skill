@@ -29,3 +29,6 @@ case:
     - metric: strain_xx_mae
       op: "<="
       threshold: 0.001
+    - metric: c_interface_pass_rate
+      op: ">="
+      threshold: 1

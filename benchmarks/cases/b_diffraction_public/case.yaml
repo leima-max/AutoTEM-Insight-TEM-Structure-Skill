@@ -33,3 +33,6 @@ case:
     - metric: b3_b4_indexed_nonzero_fraction
       op: ">="
       threshold: 1
+    - metric: b_interface_pass_rate
+      op: ">="
+      threshold: 1
