@@ -725,7 +725,7 @@ def run_benchmark_suite(
     suite_root: str | Path,
     output_dir: str | Path | None = None,
     skill: TEMAnalysisSkill | None = None,
-    ) -> dict[str, object]:
+) -> dict[str, object]:
     """Run all enabled cases in a benchmark suite and return aggregate summary."""
     suite_root_path = Path(suite_root)
     suite_output_dir = (

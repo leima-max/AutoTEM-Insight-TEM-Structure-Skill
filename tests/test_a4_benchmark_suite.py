@@ -1,4 +1,7 @@
+import json
 from pathlib import Path
+
+import pytest
 
 from autotem.core import (
     AnalysisReport,
@@ -27,6 +30,8 @@ from autotem.validation import (
     run_benchmark_summary,
     write_benchmark_case_schemas,
 )
+
+pytestmark = pytest.mark.smoke
 
 
 def _build_report(case_id: str, *, modality: str = "unknown") -> AnalysisReport:
@@ -200,6 +205,22 @@ def test_a4_public_minimal_package_suite_runs(tmp_path: Path) -> None:
 
     case_ids = {str(item["case_id"]) for item in summary["cases"]}
     assert case_ids == {"b_diffraction_public", "c_atomic_strain_public"}
+    case_reports = {
+        str(item["case_id"]): json.loads(
+            Path(str(item["benchmark_report_path"])).read_text(encoding="utf-8")
+        )
+        for item in summary["cases"]
+    }
+    b_metric_map = {
+        str(item["name"]): item for item in case_reports["b_diffraction_public"]["metrics"]
+    }
+    c_metric_map = {
+        str(item["name"]): item for item in case_reports["c_atomic_strain_public"]["metrics"]
+    }
+    assert b_metric_map["b_interface_pass_rate"]["value"]["value"] == 1.0
+    assert b_metric_map["b_interface_missing_count"]["value"]["value"] == 0
+    assert c_metric_map["c_interface_pass_rate"]["value"]["value"] == 1.0
+    assert c_metric_map["c_interface_missing_count"]["value"]["value"] == 0
 
 
 def test_a4_extended_bc_reference_metrics_are_reported() -> None:
@@ -248,6 +269,10 @@ def test_a4_extended_bc_reference_metrics_are_reported() -> None:
     assert "d_spacing_uncertainty_plausible_fraction" in metric_map
     assert "b3_b4_indexed_nonzero_fraction" in metric_map
     assert "b3_b4_top_phase_score" in metric_map
+    assert "b_interface_pass_rate" in metric_map
+    assert "b_interface_missing_count" in metric_map
+    assert "c_interface_pass_rate" in metric_map
+    assert "c_interface_missing_count" in metric_map
     assert benchmark.passed is True
 
 

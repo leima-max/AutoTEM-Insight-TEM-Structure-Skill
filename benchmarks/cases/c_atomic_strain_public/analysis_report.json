@@ -212,7 +212,17 @@
   "simulation": null,
   "ai_inference": null,
   "benchmark": null,
-  "figures": [],
+  "figures": [
+    {
+      "label": "Atom overlay",
+      "uri": "figures/atom_overlay.png",
+      "caption": "Public fixture atom-coordinate overlay for A4 interface checks.",
+      "figure_type": "atom_overlay",
+      "provenance": {
+        "source": "public_benchmark_fixture"
+      }
+    }
+  ],
   "tables": [],
   "artifacts": [],
   "warnings": [],

@@ -268,6 +268,13 @@ def collect_validation_metrics(report: AnalysisReport) -> tuple[list[ValidationM
     total_checks = len(checks)
     pass_checks = sum(1 for item in checks if item["status"] == "pass")
     pass_rate = (pass_checks / total_checks) if total_checks > 0 else 0.0
+    owner_totals: dict[str, int] = {}
+    owner_passes: dict[str, int] = {}
+    for check in checks:
+        owner = str(check["owner"]).strip().upper()
+        owner_totals[owner] = owner_totals.get(owner, 0) + 1
+        if check["status"] == "pass":
+            owner_passes[owner] = owner_passes.get(owner, 0) + 1
     metrics.append(
         _metric(
             name="bc_interface_pass_rate",
@@ -278,6 +285,30 @@ def collect_validation_metrics(report: AnalysisReport) -> tuple[list[ValidationM
             details={"pass": pass_checks, "total": total_checks},
         )
     )
+    for owner in ("B", "C"):
+        owner_total = owner_totals.get(owner, 0)
+        owner_pass = owner_passes.get(owner, 0)
+        owner_rate = (owner_pass / owner_total) if owner_total > 0 else 0.0
+        metrics.append(
+            _metric(
+                name=f"{owner.lower()}_interface_pass_rate",
+                value=owner_rate,
+                unit="fraction",
+                method="reporting.interface_contracts.evaluate_bc_interface_completeness",
+                direction="higher_is_better",
+                details={"owner": owner, "pass": owner_pass, "total": owner_total},
+            )
+        )
+        metrics.append(
+            _metric(
+                name=f"{owner.lower()}_interface_missing_count",
+                value=max(owner_total - owner_pass, 0),
+                unit="count",
+                method="reporting.interface_contracts.evaluate_bc_interface_completeness",
+                direction="lower_is_better",
+                details={"owner": owner, "pass": owner_pass, "total": owner_total},
+            )
+        )
 
     if report.dataset is None:
         warnings.append("Validation notice: TEMDataset is missing from AnalysisReport.")

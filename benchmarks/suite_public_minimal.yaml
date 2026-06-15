@@ -47,6 +47,9 @@ cases:
       - metric: b3_b4_indexed_nonzero_fraction
         op: ">="
         threshold: 1
+      - metric: b_interface_pass_rate
+        op: ">="
+        threshold: 1
   - case_id: c_atomic_strain_public
     description: Public C-side fixture for atom-coordinate and strain benchmark metrics.
     modality: HAADF-STEM
@@ -76,3 +79,6 @@ cases:
       - metric: strain_xx_mae
         op: "<="
         threshold: 0.001
+      - metric: c_interface_pass_rate
+        op: ">="
+        threshold: 1

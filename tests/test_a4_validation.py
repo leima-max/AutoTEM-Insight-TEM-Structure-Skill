@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from autotem import TEMAnalysisSkill
 from autotem.core import (
@@ -16,6 +17,8 @@ from autotem.core import (
     read_json,
 )
 from autotem.validation import run_benchmark_summary
+
+pytestmark = pytest.mark.smoke
 
 
 def test_a4_validate_and_benchmark_outputs(tmp_path: Path) -> None:
