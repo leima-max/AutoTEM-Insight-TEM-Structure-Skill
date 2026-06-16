@@ -4,7 +4,6 @@ import pytest
 from autotem.atomic.plane_spacing import (
     compute_atomic_plane_spacing_segments,
     compute_atomic_plane_spacing_segments_by_angle,
-    compute_atomic_plane_spacing_segments_from_angle_constrained_basis,
     compute_atomic_plane_spacing_segments_from_basis,
     compute_atomic_plane_spacing_segments_from_lattice_angle,
     compute_atomic_plane_spacing_segments_from_picked_direction,
@@ -80,26 +79,6 @@ def test_plane_spacing_segments_can_index_directly_from_basis() -> None:
     assert np.sum(out.direction == "b") == 8
     assert np.allclose(out.length_px[out.direction == "a"], 10.0)
     assert np.allclose(out.length_px[out.direction == "b"], 8.0)
-
-
-def test_plane_spacing_segments_can_constrain_ab_lattice_angle() -> None:
-    coords, _ = _lattice(nx=5, ny=4, ax=10.0, by=8.0)
-    # Pick b from a slightly diagonal atom to mimic an imperfect manual b-vector pick.
-    out = compute_atomic_plane_spacing_segments_from_angle_constrained_basis(
-        coords,
-        base_index=0,
-        a_index=1,
-        b_index=6,
-        lattice_angle_deg=90.0,
-        lattice_index_tolerance=0.55,
-    )
-
-    assert out.provenance["method"] == "direct_short_segments_from_angle_constrained_ab_basis"
-    stats = out.provenance["fit_statistics"]
-    assert stats["original_ab_angle_deg"] != pytest.approx(90.0)
-    assert stats["constrained_ab_angle_deg"] == pytest.approx(90.0)
-    assert np.sum(out.direction == "a") > 0
-    assert np.sum(out.direction == "b") > 0
 
 
 def test_plane_spacing_segments_can_infer_directions_from_lattice_angle_only() -> None:

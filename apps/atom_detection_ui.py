@@ -35,7 +35,6 @@ from autotem.atomic.lattice_constraint import apply_lattice_constraint
 from autotem.atomic.plane_spacing import (
     AtomicPlaneSpacingResult,
     compute_atomic_plane_spacing_segments_by_angle,
-    compute_atomic_plane_spacing_segments_from_angle_constrained_basis,
     compute_atomic_plane_spacing_segments_from_basis,
     compute_atomic_plane_spacing_segments_from_lattice_angle,
     compute_atomic_plane_spacing_segments_from_picked_direction,
@@ -2772,7 +2771,6 @@ with st.sidebar:
         "Spacing method",
         [
             "a/b lattice index",
-            "a/b lattice index + fixed angle",
             "lattice angle only (auto directions)",
             "manual angle",
             "picked direction from two atoms",
@@ -2786,10 +2784,8 @@ with st.sidebar:
     )
     plane_spacing_uses_lattice_controls = plane_spacing_method in {
         "a/b lattice index",
-        "a/b lattice index + fixed angle",
     }
     plane_spacing_uses_lattice_angle = plane_spacing_method in {
-        "a/b lattice index + fixed angle",
         "lattice angle only (auto directions)",
     }
     plane_spacing_uses_angle_controls = plane_spacing_method in {
@@ -2817,7 +2813,7 @@ with st.sidebar:
         ),
     )
     plane_spacing_lattice_angle = st.number_input(
-        "Lattice angle a-b (deg)",
+        "Lattice angle between row axes (deg)",
         min_value=5.0,
         max_value=175.0,
         value=90.0,
@@ -4955,9 +4951,7 @@ st.caption(
 spacing_method = params["plane_spacing_method"]
 spacing_uses_lattice = spacing_method in {
     "a/b lattice index",
-    "a/b lattice index + fixed angle",
 }
-spacing_uses_fixed_lattice_angle = spacing_method == "a/b lattice index + fixed angle"
 spacing_uses_angle_only = spacing_method == "lattice angle only (auto directions)"
 spacing_uses_picked_direction = spacing_method == "picked direction from two atoms"
 spacing_pick_valid = (
@@ -4984,11 +4978,15 @@ spacing_direction_display = (
 current_spacing_settings = {
     "method": spacing_method,
     "atom_count": int(len(coords)),
-    "basis_indices": {
-        "base_idx": int(custom_basis["base_idx"]) if custom_basis is not None else None,
-        "a_idx": int(custom_basis["a_idx"]) if custom_basis is not None else None,
-        "b_idx": int(custom_basis["b_idx"]) if custom_basis is not None else None,
-    },
+    "basis_indices": (
+        {
+            "base_idx": int(custom_basis["base_idx"]) if custom_basis is not None else None,
+            "a_idx": int(custom_basis["a_idx"]) if custom_basis is not None else None,
+            "b_idx": int(custom_basis["b_idx"]) if custom_basis is not None else None,
+        }
+        if spacing_uses_lattice
+        else None
+    ),
     "lattice_index_tolerance": params["plane_spacing_lattice_tolerance"],
     "lattice_angle_deg": params["plane_spacing_lattice_angle"],
     "angle_deg": params["plane_spacing_angle_deg"],
@@ -5015,20 +5013,12 @@ run_plane_spacing = spacing_button_col.button(
 )
 if spacing_ready:
     if spacing_uses_lattice:
-        if spacing_uses_fixed_lattice_angle:
-            spacing_info_col.caption(
-                "Source: custom base/a/b with fixed lattice angle | "
-                f"a-b angle={params['plane_spacing_lattice_angle']:.2f} deg | "
-                f"index tolerance={params['plane_spacing_lattice_tolerance']:.2f} | "
-                f"display={params['plane_spacing_direction']} | unit={displacement_unit}"
-            )
-        else:
-            spacing_info_col.caption(
-                "Source: current custom base/a/b lattice index | "
-                f"index tolerance={params['plane_spacing_lattice_tolerance']:.2f} | "
-                f"display={params['plane_spacing_direction']} | "
-                f"unit={displacement_unit}"
-            )
+        spacing_info_col.caption(
+            "Source: current custom base/a/b lattice index | "
+            f"index tolerance={params['plane_spacing_lattice_tolerance']:.2f} | "
+            f"display={params['plane_spacing_direction']} | "
+            f"unit={displacement_unit}"
+        )
     elif spacing_uses_angle_only:
         spacing_info_col.caption(
             "Source: lattice angle only, auto-inferred row directions | "
@@ -5103,17 +5093,7 @@ if spacing_uses_picked_direction and len(coords) > 0:
 
 if run_plane_spacing and spacing_ready:
     try:
-        if spacing_uses_fixed_lattice_angle and custom_basis is not None:
-            measured_spacing = compute_atomic_plane_spacing_segments_from_angle_constrained_basis(
-                coords,
-                base_index=int(custom_basis["base_idx"]),
-                a_index=int(custom_basis["a_idx"]),
-                b_index=int(custom_basis["b_idx"]),
-                lattice_angle_deg=params["plane_spacing_lattice_angle"],
-                lattice_index_tolerance=params["plane_spacing_lattice_tolerance"],
-                directions=("a", "b"),
-            )
-        elif spacing_uses_lattice and custom_basis is not None:
+        if spacing_uses_lattice and custom_basis is not None:
             measured_spacing = compute_atomic_plane_spacing_segments_from_basis(
                 coords,
                 base_index=int(custom_basis["base_idx"]),
@@ -5256,21 +5236,24 @@ if plane_spacing_result is not None:
         )
         spacing_fit_stats = plane_spacing_result.provenance.get("fit_statistics", {})
         if spacing_fit_stats:
+            spacing_fit_display = {
+                key: spacing_fit_stats.get(key)
+                for key in (
+                    "valid_atom_count",
+                    "invalid_atom_count",
+                    "assignment_residual_median",
+                    "inferred_axis_1_deg",
+                    "inferred_axis_2_deg",
+                    "axis_separation_deg",
+                    "direction_score_axis_1",
+                    "direction_score_axis_2",
+                    "candidate_pair_count",
+                )
+                if key in spacing_fit_stats
+            }
             st.write(
                 "Spacing fit statistics:",
-                {
-                    "original_ab_angle_deg": spacing_fit_stats.get(
-                        "original_ab_angle_deg"
-                    ),
-                    "constrained_ab_angle_deg": spacing_fit_stats.get(
-                        "constrained_ab_angle_deg"
-                    ),
-                    "valid_atom_count": spacing_fit_stats.get("valid_atom_count"),
-                    "invalid_atom_count": spacing_fit_stats.get("invalid_atom_count"),
-                    "assignment_residual_median": spacing_fit_stats.get(
-                        "assignment_residual_median"
-                    ),
-                },
+                spacing_fit_display,
             )
         if summary_rows:
             st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
