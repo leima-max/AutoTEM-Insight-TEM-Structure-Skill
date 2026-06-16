@@ -11,7 +11,11 @@ from autotem.core import (
     DiffractionResult,
     IndexedSpot,
     Measurement,
+    OutputArtifact,
     PhaseCandidate,
+    SimulatedPattern,
+    SimulatedSpot,
+    SimulationResult,
     StrainResult,
     TEMDataset,
     WorkflowConfig,
@@ -69,6 +73,67 @@ def _build_report(case_id: str, *, modality: str = "unknown") -> AnalysisReport:
                 AtomSite(x=2.0, y=2.0),
                 AtomSite(x=4.0, y=0.0),
             ]
+        ),
+        simulation=SimulationResult(
+            patterns=[
+                SimulatedPattern(
+                    kind="diffraction",
+                    structure_id="Gold",
+                    zone_axis=(0, 0, 1),
+                    simulation_parameters={
+                        "engine": "diffsims",
+                        "simulated_spot_count": 4,
+                        "phase_match": {
+                            "matched_spot_count": 3,
+                            "rotation_deg": 0.0,
+                        },
+                    },
+                    spots=[
+                        SimulatedSpot(
+                            gx=Measurement(value=2.5, unit="1/nm"),
+                            gy=Measurement(value=0.0, unit="1/nm"),
+                        ),
+                        SimulatedSpot(
+                            gx=Measurement(value=0.0, unit="1/nm"),
+                            gy=Measurement(value=2.5, unit="1/nm"),
+                        ),
+                    ],
+                )
+            ],
+            matched_phase_candidates=[
+                PhaseCandidate(
+                    name="Gold",
+                    score=0.96,
+                    matched_spot_count=3,
+                    mean_d_error=Measurement(
+                        value=0.005,
+                        unit="relative",
+                        method="diffsims_phase_match",
+                    ),
+                    mean_angle_error=Measurement(
+                        value=0.3,
+                        unit="deg",
+                        method="diffsims_phase_match",
+                    ),
+                )
+            ],
+            overlays=[
+                OutputArtifact(
+                    kind="image",
+                    uri="figures/simulation_diffraction_overlay.png",
+                    label="Simulation diffraction overlay",
+                )
+            ],
+            provenance={
+                "method": "diffsims",
+                "phase_matching": {
+                    "active": True,
+                    "method": "diffsims_template_spot_match",
+                    "selected_phase": "Gold",
+                    "measured_spot_count": 3,
+                    "simulated_pattern_count": 1,
+                },
+            },
         ),
         strain=StrainResult(
             strain_xx=ArrayReference(
@@ -198,13 +263,17 @@ def test_a4_public_minimal_package_suite_runs(tmp_path: Path) -> None:
         output_dir=tmp_path / "public_suite_out",
     )
     assert summary["suite_id"] == "public_minimal_suite"
-    assert summary["cases_executed"] == 2
+    assert summary["cases_executed"] == 3
     assert summary["cases_failed"] == 0
     assert (tmp_path / "public_suite_out" / "benchmark_suite_report.json").exists()
     assert (tmp_path / "public_suite_out" / "benchmark_suite_trend.json").exists()
 
     case_ids = {str(item["case_id"]) for item in summary["cases"]}
-    assert case_ids == {"b_diffraction_public", "c_atomic_strain_public"}
+    assert case_ids == {
+        "b_diffraction_public",
+        "b5_diffsims_phase_matching_public",
+        "c_atomic_strain_public",
+    }
     case_reports = {
         str(item["case_id"]): json.loads(
             Path(str(item["benchmark_report_path"])).read_text(encoding="utf-8")
@@ -217,8 +286,16 @@ def test_a4_public_minimal_package_suite_runs(tmp_path: Path) -> None:
     c_metric_map = {
         str(item["name"]): item for item in case_reports["c_atomic_strain_public"]["metrics"]
     }
+    b5_metric_map = {
+        str(item["name"]): item
+        for item in case_reports["b5_diffsims_phase_matching_public"]["metrics"]
+    }
     assert b_metric_map["b_interface_pass_rate"]["value"]["value"] == 1.0
     assert b_metric_map["b_interface_missing_count"]["value"]["value"] == 0
+    assert b5_metric_map["b5_phase_matching_active_flag"]["value"]["value"] == 1
+    assert b5_metric_map["b5_simulated_spot_count"]["value"]["value"] >= 4
+    assert b5_metric_map["b5_best_matched_spot_count"]["value"]["value"] >= 3
+    assert b5_metric_map["b5_phase_topk_accuracy"]["value"]["value"] == 1.0
     assert c_metric_map["c_interface_pass_rate"]["value"]["value"] == 1.0
     assert c_metric_map["c_interface_missing_count"]["value"]["value"] == 0
 
@@ -269,10 +346,47 @@ def test_a4_extended_bc_reference_metrics_are_reported() -> None:
     assert "d_spacing_uncertainty_plausible_fraction" in metric_map
     assert "b3_b4_indexed_nonzero_fraction" in metric_map
     assert "b3_b4_top_phase_score" in metric_map
+    assert "b5_simulation_pattern_count" in metric_map
+    assert "b5_simulated_spot_count" in metric_map
+    assert "b5_matched_phase_candidate_count" in metric_map
+    assert "b5_phase_matching_active_flag" in metric_map
+    assert "b5_simulation_overlay_count" in metric_map
+    assert "b5_best_phase_match_score" in metric_map
+    assert "b5_best_matched_spot_count" in metric_map
+    assert "b5_best_mean_d_error" in metric_map
+    assert "b5_best_mean_angle_error_deg" in metric_map
     assert "b_interface_pass_rate" in metric_map
     assert "b_interface_missing_count" in metric_map
     assert "c_interface_pass_rate" in metric_map
     assert "c_interface_missing_count" in metric_map
+    assert benchmark.passed is True
+
+
+def test_a4_benchmark_reference_hook_reports_b5_phase_accuracy() -> None:
+    report = _build_report("b5_metrics", modality="HRTEM")
+
+    benchmark, _, warnings = run_benchmark_summary(
+        report,
+        benchmark_parameters={
+            "case_id": "b5_metrics",
+            "reference": {
+                "b5_phase_truth": ["Gold"],
+                "b5_phase_top_k": 1,
+            },
+            "acceptance_criteria": [
+                {"metric": "b5_phase_topk_accuracy", "op": ">=", "threshold": 1.0},
+                {"metric": "b5_phase_matching_active_flag", "op": ">=", "threshold": 1},
+                {"metric": "b5_best_matched_spot_count", "op": ">=", "threshold": 3},
+                {"metric": "b5_best_mean_d_error", "op": "<=", "threshold": 0.01},
+                {"metric": "b5_best_mean_angle_error_deg", "op": "<=", "threshold": 1.0},
+            ],
+        },
+    )
+
+    assert not warnings
+    metric_map = {item.name: item for item in benchmark.metrics}
+    assert metric_map["b5_phase_topk_accuracy"].value.value == 1.0
+    assert metric_map["b5_best_phase_match_score"].value.value == 0.96
     assert benchmark.passed is True
 
 

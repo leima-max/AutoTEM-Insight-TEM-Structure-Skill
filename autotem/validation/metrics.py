@@ -25,6 +25,17 @@ def _metric(
     )
 
 
+def _numeric_measurement_value(measurement: Measurement | None) -> float | None:
+    if measurement is None:
+        return None
+    value = measurement.value
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
 def collect_validation_metrics(report: AnalysisReport) -> tuple[list[ValidationMetric], list[str]]:
     """Build baseline A4 validation metrics from a finished analysis report."""
     warnings: list[str] = []
@@ -252,6 +263,116 @@ def collect_validation_metrics(report: AnalysisReport) -> tuple[list[ValidationM
                     direction="higher_is_better",
                 )
             )
+
+    simulation = report.simulation
+    if simulation is not None:
+        pattern_count = len(simulation.patterns)
+        simulated_spot_count = sum(len(pattern.spots) for pattern in simulation.patterns)
+        matched_phase_count = len(simulation.matched_phase_candidates)
+        phase_matching_payload = simulation.provenance.get("phase_matching", {})
+        phase_matching_active = (
+            bool(phase_matching_payload.get("active"))
+            if isinstance(phase_matching_payload, dict)
+            else False
+        )
+        metrics.append(
+            _metric(
+                name="b5_simulation_pattern_count",
+                value=pattern_count,
+                unit="count",
+                method="simulation.patterns",
+                direction="higher_is_better",
+            )
+        )
+        metrics.append(
+            _metric(
+                name="b5_simulated_spot_count",
+                value=simulated_spot_count,
+                unit="count",
+                method="simulation.patterns.spots",
+                direction="higher_is_better",
+            )
+        )
+        metrics.append(
+            _metric(
+                name="b5_matched_phase_candidate_count",
+                value=matched_phase_count,
+                unit="count",
+                method="simulation.matched_phase_candidates",
+                direction="higher_is_better",
+            )
+        )
+        metrics.append(
+            _metric(
+                name="b5_phase_matching_active_flag",
+                value=1 if phase_matching_active else 0,
+                unit="flag",
+                method="simulation.provenance.phase_matching.active",
+                direction="higher_is_better",
+                passed=phase_matching_active,
+            )
+        )
+        metrics.append(
+            _metric(
+                name="b5_simulation_overlay_count",
+                value=len(simulation.overlays),
+                unit="count",
+                method="simulation.overlays",
+                direction="higher_is_better",
+            )
+        )
+        if simulation.matched_phase_candidates:
+            best_candidate = simulation.matched_phase_candidates[0]
+            if isinstance(best_candidate.score, (int, float)):
+                metrics.append(
+                    _metric(
+                        name="b5_best_phase_match_score",
+                        value=float(best_candidate.score),
+                        unit="score",
+                        method="simulation.matched_phase_candidates[0].score",
+                        direction="higher_is_better",
+                    )
+                )
+            if isinstance(best_candidate.matched_spot_count, int):
+                metrics.append(
+                    _metric(
+                        name="b5_best_matched_spot_count",
+                        value=int(best_candidate.matched_spot_count),
+                        unit="count",
+                        method="simulation.matched_phase_candidates[0].matched_spot_count",
+                        direction="higher_is_better",
+                    )
+                )
+            mean_d_error = _numeric_measurement_value(best_candidate.mean_d_error)
+            if mean_d_error is not None:
+                metrics.append(
+                    _metric(
+                        name="b5_best_mean_d_error",
+                        value=mean_d_error,
+                        unit=best_candidate.mean_d_error.unit
+                        if best_candidate.mean_d_error is not None
+                        else "",
+                        method=best_candidate.mean_d_error.method
+                        if best_candidate.mean_d_error is not None
+                        else "simulation.matched_phase_candidates[0].mean_d_error",
+                        direction="lower_is_better",
+                    )
+                )
+            mean_angle_error = _numeric_measurement_value(best_candidate.mean_angle_error)
+            if mean_angle_error is not None:
+                metrics.append(
+                    _metric(
+                        name="b5_best_mean_angle_error_deg",
+                        value=mean_angle_error,
+                        unit=best_candidate.mean_angle_error.unit
+                        if best_candidate.mean_angle_error is not None
+                        else "deg",
+                        method=best_candidate.mean_angle_error.method
+                        if best_candidate.mean_angle_error is not None
+                        else "simulation.matched_phase_candidates[0].mean_angle_error",
+                        direction="lower_is_better",
+                    )
+                )
 
     atom_count = len(report.atom_lattice.atoms) if report.atom_lattice is not None else 0
     metrics.append(

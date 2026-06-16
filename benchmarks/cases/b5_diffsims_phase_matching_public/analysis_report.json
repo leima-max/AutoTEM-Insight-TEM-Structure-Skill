@@ -1,0 +1,491 @@
+{
+  "schema_version": "0.1.0",
+  "summary": "Public minimal B5 fixture (diffsims simulated diffraction and phase matching metrics).",
+  "workflow": {
+    "schema_version": "0.1.0",
+    "name": "benchmark_public_minimal_b5",
+    "steps": [
+      {
+        "name": "load",
+        "status": "done"
+      },
+      {
+        "name": "fft",
+        "status": "done"
+      },
+      {
+        "name": "diffraction_peaks",
+        "status": "done"
+      },
+      {
+        "name": "index_diffraction",
+        "status": "done"
+      },
+      {
+        "name": "simulate",
+        "status": "done"
+      },
+      {
+        "name": "phase_match",
+        "status": "done"
+      },
+      {
+        "name": "benchmark",
+        "status": "done"
+      }
+    ],
+    "parameters": {
+      "simulation": {
+        "engine": "diffsims",
+        "zone_axis": [
+          0,
+          0,
+          1
+        ],
+        "phase_match_min_spots": 3
+      }
+    }
+  },
+  "dataset": {
+    "schema_version": "0.1.0",
+    "data": {
+      "shape": [
+        96,
+        96
+      ],
+      "dtype": "float32",
+      "uri": "synthetic_b5_public.npy"
+    },
+    "dataset_id": "b5_diffsims_phase_matching_public",
+    "modality": "HRTEM",
+    "pixel_unit": "nm",
+    "metadata": {
+      "description": "Synthetic public B5 phase-matching benchmark input."
+    }
+  },
+  "diffraction": {
+    "schema_version": "0.1.0",
+    "peaks": [
+      {
+        "x": 42.0,
+        "y": 48.0,
+        "intensity": 10.0,
+        "confidence": 0.95
+      },
+      {
+        "x": 54.0,
+        "y": 48.0,
+        "intensity": 10.0,
+        "confidence": 0.95
+      },
+      {
+        "x": 48.0,
+        "y": 42.0,
+        "intensity": 9.0,
+        "confidence": 0.92
+      },
+      {
+        "x": 48.0,
+        "y": 54.0,
+        "intensity": 9.0,
+        "confidence": 0.92
+      }
+    ],
+    "center": [
+      48.0,
+      48.0
+    ],
+    "g_vectors": [
+      {
+        "gx": {
+          "value": -2.5,
+          "unit": "1/nm",
+          "method": "fixture"
+        },
+        "gy": {
+          "value": 0.0,
+          "unit": "1/nm",
+          "method": "fixture"
+        },
+        "magnitude": {
+          "value": 2.5,
+          "unit": "1/nm",
+          "method": "fixture"
+        },
+        "source_peak_index": 0
+      },
+      {
+        "gx": {
+          "value": 2.5,
+          "unit": "1/nm",
+          "method": "fixture"
+        },
+        "gy": {
+          "value": 0.0,
+          "unit": "1/nm",
+          "method": "fixture"
+        },
+        "magnitude": {
+          "value": 2.5,
+          "unit": "1/nm",
+          "method": "fixture"
+        },
+        "source_peak_index": 1
+      },
+      {
+        "gx": {
+          "value": 0.0,
+          "unit": "1/nm",
+          "method": "fixture"
+        },
+        "gy": {
+          "value": -2.5,
+          "unit": "1/nm",
+          "method": "fixture"
+        },
+        "magnitude": {
+          "value": 2.5,
+          "unit": "1/nm",
+          "method": "fixture"
+        },
+        "source_peak_index": 2
+      },
+      {
+        "gx": {
+          "value": 0.0,
+          "unit": "1/nm",
+          "method": "fixture"
+        },
+        "gy": {
+          "value": 2.5,
+          "unit": "1/nm",
+          "method": "fixture"
+        },
+        "magnitude": {
+          "value": 2.5,
+          "unit": "1/nm",
+          "method": "fixture"
+        },
+        "source_peak_index": 3
+      }
+    ],
+    "d_spacings": [
+      {
+        "value": 0.4,
+        "unit": "nm",
+        "uncertainty": 0.001,
+        "method": "fixture",
+        "confidence": 0.95
+      },
+      {
+        "value": 0.4,
+        "unit": "nm",
+        "uncertainty": 0.001,
+        "method": "fixture",
+        "confidence": 0.95
+      }
+    ],
+    "indexed_spots": [
+      {
+        "peak_index": 0,
+        "h": -1,
+        "k": 0,
+        "l": 0,
+        "confidence": 0.9
+      },
+      {
+        "peak_index": 1,
+        "h": 1,
+        "k": 0,
+        "l": 0,
+        "confidence": 0.9
+      },
+      {
+        "peak_index": 2,
+        "h": 0,
+        "k": -1,
+        "l": 0,
+        "confidence": 0.9
+      },
+      {
+        "peak_index": 3,
+        "h": 0,
+        "k": 1,
+        "l": 0,
+        "confidence": 0.9
+      }
+    ],
+    "phase_candidates": [
+      {
+        "name": "cubic_probe",
+        "formula": "X",
+        "source": "public_benchmark_fixture",
+        "identifier": "b5_fixture_cubic_probe",
+        "score": 0.92,
+        "matched_spot_count": 4,
+        "zone_axis": [
+          0,
+          0,
+          1
+        ]
+      }
+    ],
+    "provenance": {
+      "b4_indexing": {
+        "active": true,
+        "selected_phase": "cubic_probe"
+      }
+    }
+  },
+  "simulation": {
+    "schema_version": "0.1.0",
+    "patterns": [
+      {
+        "kind": "diffraction",
+        "structure_id": "b5_fixture_cubic_probe",
+        "zone_axis": [
+          0,
+          0,
+          1
+        ],
+        "microscope_parameters": {
+          "voltage_kv": 200
+        },
+        "simulation_parameters": {
+          "engine": "diffsims",
+          "simulated_spot_count": 4,
+          "phase_match": {
+            "matched_spot_count": 4,
+            "rotation_deg": 0.0,
+            "matched_pairs": [
+              {
+                "measured_g_index": 0,
+                "simulated_spot_index": 0
+              },
+              {
+                "measured_g_index": 1,
+                "simulated_spot_index": 1
+              },
+              {
+                "measured_g_index": 2,
+                "simulated_spot_index": 2
+              },
+              {
+                "measured_g_index": 3,
+                "simulated_spot_index": 3
+              }
+            ]
+          }
+        },
+        "spots": [
+          {
+            "gx": {
+              "value": -2.5,
+              "unit": "1/nm",
+              "method": "diffsims_fixture"
+            },
+            "gy": {
+              "value": 0.0,
+              "unit": "1/nm",
+              "method": "diffsims_fixture"
+            },
+            "magnitude": {
+              "value": 2.5,
+              "unit": "1/nm",
+              "method": "diffsims_fixture"
+            },
+            "d_spacing": {
+              "value": 0.4,
+              "unit": "nm",
+              "method": "diffsims_fixture"
+            },
+            "h": -1,
+            "k": 0,
+            "l": 0,
+            "intensity": 1.0
+          },
+          {
+            "gx": {
+              "value": 2.5,
+              "unit": "1/nm",
+              "method": "diffsims_fixture"
+            },
+            "gy": {
+              "value": 0.0,
+              "unit": "1/nm",
+              "method": "diffsims_fixture"
+            },
+            "magnitude": {
+              "value": 2.5,
+              "unit": "1/nm",
+              "method": "diffsims_fixture"
+            },
+            "d_spacing": {
+              "value": 0.4,
+              "unit": "nm",
+              "method": "diffsims_fixture"
+            },
+            "h": 1,
+            "k": 0,
+            "l": 0,
+            "intensity": 1.0
+          },
+          {
+            "gx": {
+              "value": 0.0,
+              "unit": "1/nm",
+              "method": "diffsims_fixture"
+            },
+            "gy": {
+              "value": -2.5,
+              "unit": "1/nm",
+              "method": "diffsims_fixture"
+            },
+            "magnitude": {
+              "value": 2.5,
+              "unit": "1/nm",
+              "method": "diffsims_fixture"
+            },
+            "d_spacing": {
+              "value": 0.4,
+              "unit": "nm",
+              "method": "diffsims_fixture"
+            },
+            "h": 0,
+            "k": -1,
+            "l": 0,
+            "intensity": 0.9
+          },
+          {
+            "gx": {
+              "value": 0.0,
+              "unit": "1/nm",
+              "method": "diffsims_fixture"
+            },
+            "gy": {
+              "value": 2.5,
+              "unit": "1/nm",
+              "method": "diffsims_fixture"
+            },
+            "magnitude": {
+              "value": 2.5,
+              "unit": "1/nm",
+              "method": "diffsims_fixture"
+            },
+            "d_spacing": {
+              "value": 0.4,
+              "unit": "nm",
+              "method": "diffsims_fixture"
+            },
+            "h": 0,
+            "k": 1,
+            "l": 0,
+            "intensity": 0.9
+          }
+        ]
+      }
+    ],
+    "matched_phase_candidates": [
+      {
+        "name": "cubic_probe",
+        "formula": "X",
+        "source": "public_benchmark_fixture",
+        "identifier": "b5_fixture_cubic_probe",
+        "score": 0.96,
+        "matched_spot_count": 4,
+        "mean_d_error": {
+          "value": 0.005,
+          "unit": "relative",
+          "method": "diffsims_phase_match",
+          "confidence": 0.96
+        },
+        "mean_angle_error": {
+          "value": 0.3,
+          "unit": "deg",
+          "method": "diffsims_phase_match",
+          "confidence": 0.96
+        },
+        "zone_axis": [
+          0,
+          0,
+          1
+        ]
+      }
+    ],
+    "comparison_metrics": [
+      {
+        "value": 0.96,
+        "unit": "score",
+        "method": "diffsims_phase_match_score"
+      }
+    ],
+    "overlays": [
+      {
+        "kind": "image",
+        "uri": "figures/simulation_diffraction_overlay.png",
+        "label": "Simulation diffraction overlay",
+        "mime_type": "image/png"
+      }
+    ],
+    "confidence": 0.96,
+    "provenance": {
+      "method": "diffsims",
+      "adapter": {
+        "active": true,
+        "engine": "diffsims"
+      },
+      "phase_matching": {
+        "active": true,
+        "method": "diffsims_template_spot_match",
+        "selected_phase": "cubic_probe",
+        "selected_zone_axis": [
+          0,
+          0,
+          1
+        ],
+        "measured_spot_count": 4,
+        "simulated_pattern_count": 1,
+        "d_tolerance_rel": 0.03,
+        "angle_tolerance_deg": 3.0,
+        "per_phase": [
+          {
+            "phase_name": "cubic_probe",
+            "best_pattern_index": 0,
+            "simulated_spot_count": 4,
+            "matched_spot_count": 4,
+            "rotation_deg": 0.0,
+            "mean_d_error": 0.005,
+            "mean_angle_error_deg": 0.3
+          }
+        ]
+      }
+    }
+  },
+  "figures": [
+    {
+      "label": "FFT peaks overlay",
+      "uri": "figures/fft_peaks_overlay.png",
+      "caption": "Public fixture diffraction peak overlay for A4 interface checks.",
+      "figure_type": "diffraction_overlay",
+      "provenance": {
+        "source": "public_benchmark_fixture"
+      }
+    },
+    {
+      "label": "Simulation diffraction overlay",
+      "uri": "figures/simulation_diffraction_overlay.png",
+      "caption": "Public fixture simulated-vs-measured diffraction overlay.",
+      "figure_type": "simulation_diffraction_overlay",
+      "provenance": {
+        "source": "public_benchmark_fixture"
+      }
+    }
+  ],
+  "warnings": [],
+  "provenance": {
+    "quality_gates": {
+      "passed": true,
+      "blocking_warning_count": 0
+    }
+  }
+}
