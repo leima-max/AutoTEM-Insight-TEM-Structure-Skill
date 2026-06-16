@@ -1,0 +1,47 @@
+case:
+  schema_version: 2026-05-13.a4.case-schema.v1
+  case_id: b5_diffsims_phase_matching_public
+  description: Public B5 fixture for simulated diffraction and phase matching metrics.
+  modality: HRTEM
+  report_path: analysis_report.json
+  tags: [public, minimal, b, b5, diffsims, phase_matching, simulation]
+  reference:
+    b5_phase_truth: [cubic_probe]
+    b5_phase_top_k: 1
+  acceptance_criteria:
+    - metric: workflow_no_failed_steps
+      op: ">="
+      threshold: 1
+    - metric: b_interface_pass_rate
+      op: ">="
+      threshold: 1
+    - metric: b5_phase_matching_active_flag
+      op: ">="
+      threshold: 1
+    - metric: b5_simulation_pattern_count
+      op: ">="
+      threshold: 1
+    - metric: b5_simulated_spot_count
+      op: ">="
+      threshold: 4
+    - metric: b5_matched_phase_candidate_count
+      op: ">="
+      threshold: 1
+    - metric: b5_best_matched_spot_count
+      op: ">="
+      threshold: 3
+    - metric: b5_best_phase_match_score
+      op: ">="
+      threshold: 0.9
+    - metric: b5_best_mean_d_error
+      op: "<="
+      threshold: 0.01
+    - metric: b5_best_mean_angle_error_deg
+      op: "<="
+      threshold: 1.0
+    - metric: b5_phase_topk_accuracy
+      op: ">="
+      threshold: 1
+    - metric: b5_simulation_overlay_count
+      op: ">="
+      threshold: 1

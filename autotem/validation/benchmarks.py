@@ -159,6 +159,29 @@ def _default_acceptance_criteria(report: AnalysisReport) -> list[dict[str, objec
         criteria.append(
             {"metric": "atom_coordinate_count", "op": ">=", "threshold": 1.0, "unit": "count"}
         )
+    if report.simulation is not None:
+        criteria.extend(
+            [
+                {
+                    "metric": "b5_simulation_pattern_count",
+                    "op": ">=",
+                    "threshold": 1.0,
+                    "unit": "count",
+                },
+                {
+                    "metric": "b5_simulated_spot_count",
+                    "op": ">=",
+                    "threshold": 1.0,
+                    "unit": "count",
+                },
+                {
+                    "metric": "b5_matched_phase_candidate_count",
+                    "op": ">=",
+                    "threshold": 1.0,
+                    "unit": "count",
+                },
+            ]
+        )
     return criteria
 
 
@@ -310,6 +333,44 @@ def _append_reference_metrics(
         else:
             warnings.append(
                 "Benchmark reference hook skipped phase metric: no valid `phase_truth`."
+            )
+
+    b5_phase_truth_raw = reference.get("b5_phase_truth")
+    if isinstance(b5_phase_truth_raw, list):
+        truth_phase = {
+            str(item).strip().lower() for item in b5_phase_truth_raw if str(item).strip()
+        }
+        phase_top_k = _as_int(reference.get("b5_phase_top_k"), default=3)
+        predicted_phase = (
+            _phase_names_topk(
+                report.simulation.matched_phase_candidates,
+                top_k=phase_top_k,
+            )
+            if report.simulation is not None
+            else set()
+        )
+        if truth_phase:
+            matched_phase = len(truth_phase.intersection(predicted_phase))
+            phase_accuracy = matched_phase / len(truth_phase)
+            metrics.append(
+                ValidationMetric(
+                    name="b5_phase_topk_accuracy",
+                    value=Measurement(
+                        value=phase_accuracy,
+                        unit="fraction",
+                        method="reference_compare",
+                    ),
+                    direction="higher_is_better",
+                    details={
+                        "truth_count": len(truth_phase),
+                        "matched_count": matched_phase,
+                        "top_k": phase_top_k,
+                    },
+                )
+            )
+        else:
+            warnings.append(
+                "Benchmark reference hook skipped B5 phase metric: no valid `b5_phase_truth`."
             )
 
     atom_ref = reference.get("atom_coordinates")

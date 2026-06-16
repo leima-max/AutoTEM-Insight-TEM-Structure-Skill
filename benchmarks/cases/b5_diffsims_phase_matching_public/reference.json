@@ -1,0 +1,7 @@
+{
+  "b5_phase_truth": [
+    "cubic_probe"
+  ],
+  "b5_phase_top_k": 1,
+  "description": "Public B5 phase-matching reference for A4 benchmark ingestion."
+}
