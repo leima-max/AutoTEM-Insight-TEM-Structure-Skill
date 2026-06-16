@@ -25,7 +25,18 @@ from autotem.atomic.lattice_constraint import (
 from autotem.atomic.plane_spacing import (
     AtomicPlaneSpacingResult,
     compute_atomic_plane_spacing_segments,
+    compute_atomic_plane_spacing_segments_by_angle,
+    compute_atomic_plane_spacing_segments_from_angle_constrained_basis,
     compute_atomic_plane_spacing_segments_from_basis,
+    compute_atomic_plane_spacing_segments_from_lattice_angle,
+    compute_atomic_plane_spacing_segments_from_picked_direction,
+)
+from autotem.atomic.sublattice import (
+    SublatticeClassificationResult,
+    apply_manual_sublattice_labels,
+    classify_sublattices_auto,
+    classify_sublattices_from_model,
+    parse_projected_model_csv,
 )
 
 __all__ = [
@@ -37,6 +48,7 @@ __all__ = [
     "AtomicColumnIntensityResult",
     "AtomicIntensityGroupResult",
     "AtomicPlaneSpacingResult",
+    "SublatticeClassificationResult",
     "detect_atoms",
     "compute_atomic_displacement_from_basis",
     "compute_distance_statistics",
@@ -47,5 +59,13 @@ __all__ = [
     "cluster_atomic_column_intensities",
     "group_atomic_column_intensities_by_lattice",
     "compute_atomic_plane_spacing_segments",
+    "compute_atomic_plane_spacing_segments_from_angle_constrained_basis",
     "compute_atomic_plane_spacing_segments_from_basis",
+    "compute_atomic_plane_spacing_segments_from_lattice_angle",
+    "compute_atomic_plane_spacing_segments_by_angle",
+    "compute_atomic_plane_spacing_segments_from_picked_direction",
+    "classify_sublattices_auto",
+    "classify_sublattices_from_model",
+    "apply_manual_sublattice_labels",
+    "parse_projected_model_csv",
 ]

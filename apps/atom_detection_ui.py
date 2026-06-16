@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,18 @@ from autotem.atomic.intensity_quantification import (
 from autotem.atomic.lattice_constraint import apply_lattice_constraint
 from autotem.atomic.plane_spacing import (
     AtomicPlaneSpacingResult,
+    compute_atomic_plane_spacing_segments_by_angle,
+    compute_atomic_plane_spacing_segments_from_angle_constrained_basis,
     compute_atomic_plane_spacing_segments_from_basis,
+    compute_atomic_plane_spacing_segments_from_lattice_angle,
+    compute_atomic_plane_spacing_segments_from_picked_direction,
+)
+from autotem.atomic.sublattice import (
+    SublatticeClassificationResult,
+    apply_manual_sublattice_labels,
+    classify_sublattices_auto,
+    classify_sublattices_from_model,
+    parse_projected_model_csv,
 )
 from autotem.io import load_tem_dataset
 from autotem.io.metadata import normalize_metadata
@@ -383,7 +395,9 @@ def _atomic_intensity_csv(coords: np.ndarray, result: AtomicColumnIntensityResul
     return buffer.getvalue()
 
 
-def _csv_float(value: float) -> str:
+def _csv_float(value: float | None) -> str:
+    if value is None:
+        return ""
     value = float(value)
     if not np.isfinite(value):
         return ""
@@ -572,6 +586,394 @@ def _atomic_intensity_group_csv(group_result: AtomicIntensityGroupResult) -> str
     return buffer.getvalue()
 
 
+def _sublattice_palette(labels: np.ndarray) -> dict[str, str]:
+    unique_labels = sorted(str(v) for v in np.unique(labels))
+    colors = [
+        "#ff5252",
+        "#26c6da",
+        "#ffd54f",
+        "#66bb6a",
+        "#ab47bc",
+        "#ff8a65",
+        "#5c6bc0",
+        "#8d6e63",
+        "#ec407a",
+        "#78909c",
+    ]
+    palette: dict[str, str] = {}
+    for idx, label in enumerate(unique_labels):
+        palette[label] = "#9e9e9e" if label == "unknown" else colors[idx % len(colors)]
+    return palette
+
+
+def _sublattice_csv(
+    coords: np.ndarray,
+    result: SublatticeClassificationResult,
+) -> str:
+    buffer = io.StringIO()
+    buffer.write("coordinate_order,y,x\n")
+    buffer.write(
+        "atom_index,y,x,label,label_id,lattice_i,lattice_j,frac_u,frac_v,"
+        "cell_u,cell_v,intensity,valid_sublattice,manual_override\n"
+    )
+    for idx in range(len(coords)):
+        y, x = coords[idx]
+        frac_u, frac_v = result.fractional_uv[idx]
+        cell_u, cell_v = result.unit_cell_uv[idx]
+        lattice_i, lattice_j = result.lattice_indices_ij[idx]
+        row = [
+            str(idx),
+            f"{float(y):.6f}",
+            f"{float(x):.6f}",
+            str(result.labels[idx]),
+            str(int(result.label_ids[idx])),
+            str(int(lattice_i)),
+            str(int(lattice_j)),
+            f"{float(frac_u):.6f}",
+            f"{float(frac_v):.6f}",
+            f"{float(cell_u):.6f}",
+            f"{float(cell_v):.6f}",
+            _csv_float(result.intensities[idx]),
+            str(int(bool(result.valid_atom_mask[idx]))),
+            str(int(bool(result.manual_override_mask[idx]))),
+        ]
+        buffer.write(",".join(row) + "\n")
+    return buffer.getvalue()
+
+
+def _sublattice_summary_csv(result: SublatticeClassificationResult) -> str:
+    buffer = io.StringIO()
+    buffer.write(
+        "label,count,valid_count,manual_count,mean_u,mean_v,"
+        "mean_intensity,std_intensity\n"
+    )
+    for row in result.label_summaries:
+        buffer.write(
+            ",".join(
+                [
+                    str(row["label"]),
+                    str(int(row["count"])),
+                    str(int(row["valid_count"])),
+                    str(int(row["manual_count"])),
+                    _csv_float(row["mean_u"]),
+                    _csv_float(row["mean_v"]),
+                    _csv_float(row["mean_intensity"]),
+                    _csv_float(row["std_intensity"]),
+                ]
+            )
+            + "\n"
+        )
+    return buffer.getvalue()
+
+
+def _render_sublattice_overlay(
+    image_norm: np.ndarray,
+    coords: np.ndarray,
+    result: SublatticeClassificationResult,
+    *,
+    marker_size: float,
+    show_label_text: bool,
+    show_atom_index: bool,
+) -> plt.Figure:
+    labels = np.asarray(result.labels, dtype=object)
+    palette = _sublattice_palette(labels)
+    manual = np.asarray(result.manual_override_mask, dtype=bool)
+    valid = np.asarray(result.valid_atom_mask, dtype=bool)
+
+    fig, ax = plt.subplots(figsize=(7.2, 6.8), dpi=170)
+    ax.imshow(image_norm, cmap="gray")
+    for label in sorted(palette):
+        mask = labels == label
+        if not np.any(mask):
+            continue
+        alpha = 0.52 if label == "unknown" else 0.9
+        marker = "x" if label == "unknown" else "o"
+        ax.scatter(
+            coords[mask, 1],
+            coords[mask, 0],
+            s=float(marker_size),
+            c=palette[label],
+            marker=marker,
+            edgecolors="white",
+            linewidths=0.35,
+            alpha=alpha,
+            label=f"{label} (n={int(np.sum(mask))})",
+        )
+    if np.any(manual):
+        ax.scatter(
+            coords[manual, 1],
+            coords[manual, 0],
+            s=max(float(marker_size) * 1.7, 18.0),
+            facecolors="none",
+            edgecolors="#fff176",
+            linewidths=1.05,
+            label="manual override",
+        )
+    invalid = ~valid
+    if np.any(invalid) and "unknown" not in palette:
+        ax.scatter(
+            coords[invalid, 1],
+            coords[invalid, 0],
+            s=max(float(marker_size) * 0.72, 10.0),
+            c="#9e9e9e",
+            marker="x",
+            linewidths=0.75,
+            label="invalid/unmatched",
+        )
+
+    if show_label_text or show_atom_index:
+        max_text = 800
+        for idx in range(min(len(coords), max_text)):
+            pieces: list[str] = []
+            if show_atom_index:
+                pieces.append(str(idx))
+            if show_label_text:
+                pieces.append(str(labels[idx]))
+            ax.text(
+                float(coords[idx, 1]) + 2.0,
+                float(coords[idx, 0]) - 2.0,
+                "/".join(pieces),
+                color="#ffffff",
+                fontsize=5.7,
+                alpha=0.86,
+            )
+    ax.set_title("Sublattice classification overlay")
+    ax.axis("off")
+    handles, _ = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(loc="upper right", fontsize=7, framealpha=0.82)
+    fig.tight_layout()
+    return fig
+
+
+def _render_sublattice_unit_cell(result: SublatticeClassificationResult) -> plt.Figure:
+    labels = np.asarray(result.labels, dtype=object)
+    unit_uv = np.asarray(result.unit_cell_uv, dtype=np.float64)
+    valid = np.asarray(result.valid_atom_mask, dtype=bool)
+    palette = _sublattice_palette(labels)
+
+    fig, ax = plt.subplots(figsize=(5.2, 5.2), dpi=170)
+    for label in sorted(palette):
+        mask = valid & (labels == label)
+        if not np.any(mask):
+            continue
+        ax.scatter(
+            unit_uv[mask, 0],
+            unit_uv[mask, 1],
+            s=28,
+            c=palette[label],
+            edgecolors="white",
+            linewidths=0.35,
+            alpha=0.86,
+            label=label,
+        )
+    for row in result.projected_structure.get("basis_sites", []):
+        ax.scatter(
+            float(row["u"]),
+            float(row["v"]),
+            s=130,
+            marker="*",
+            c=palette.get(str(row["label"]), "#ffffff"),
+            edgecolors="#263238",
+            linewidths=0.8,
+        )
+        ax.text(
+            float(row["u"]) + 0.025,
+            float(row["v"]) + 0.025,
+            str(row["label"]),
+            fontsize=10,
+            weight="bold",
+        )
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_xlabel("u along custom a")
+    ax.set_ylabel("v along custom b")
+    ax.set_title("Projected unit-cell label positions")
+    ax.set_aspect("equal")
+    ax.grid(alpha=0.22)
+    handles, _ = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(loc="upper right", fontsize=8, framealpha=0.82)
+    fig.tight_layout()
+    return fig
+
+
+def _render_sublattice_picker_chart(
+    image_norm: np.ndarray,
+    coords: np.ndarray,
+    result: SublatticeClassificationResult,
+    *,
+    chart_max_side: int = 700,
+):
+    image_only, sx, sy = _to_display_image(
+        image_norm,
+        coords=np.empty((0, 2), dtype=np.float64),
+        roi_mask=None,
+        basis_markers=None,
+        max_side=900,
+    )
+    disp_w, disp_h = image_only.size
+    chart_scale = min(1.0, float(chart_max_side) / max(disp_w, disp_h))
+    chart_w = max(320, int(round(disp_w * chart_scale)))
+    chart_h = max(320, int(round(disp_h * chart_scale)))
+    labels = np.asarray(result.labels, dtype=object)
+    palette = _sublattice_palette(labels)
+    manual = np.asarray(result.manual_override_mask, dtype=bool)
+    point_df = pd.DataFrame(
+        {
+            "atom_index": np.arange(len(coords), dtype=int),
+            "x": np.asarray(coords[:, 1] / sx, dtype=np.float64),
+            "y": np.asarray(coords[:, 0] / sy, dtype=np.float64),
+            "label": [str(v) for v in labels],
+            "manual": manual.astype(np.int32),
+        }
+    )
+    point_df["color"] = point_df["label"].map(palette).fillna("#9e9e9e")
+    point_df["size"] = np.where(manual, 120, 70)
+    picker = alt.selection_point(
+        name="sublattice_pick",
+        fields=["atom_index"],
+        nearest=True,
+        on="click",
+        clear=False,
+    )
+    return (
+        alt.Chart(point_df)
+        .mark_circle(stroke="#263238", strokeWidth=0.45, opacity=0.9)
+        .encode(
+            x=alt.X("x:Q", axis=None, scale=alt.Scale(domain=[0, disp_w])),
+            y=alt.Y("y:Q", axis=None, scale=alt.Scale(domain=[disp_h, 0])),
+            color=alt.Color("color:N", scale=None, legend=None),
+            size=alt.Size("size:Q", legend=None),
+            tooltip=[
+                alt.Tooltip("atom_index:Q", title="atom index"),
+                alt.Tooltip("label:N", title="label"),
+                alt.Tooltip("manual:Q", title="manual override"),
+            ],
+            fillOpacity=alt.condition(picker, alt.value(1.0), alt.value(0.84)),
+        )
+        .add_params(picker)
+        .properties(width=chart_w, height=chart_h)
+        .configure_view(stroke=None)
+    )
+
+
+def _parse_atom_index_text(text: str, atom_count: int) -> list[int]:
+    normalized = (
+        str(text)
+        .replace("\uff0c", ",")
+        .replace(";", ",")
+        .replace("\n", ",")
+        .replace(" ", ",")
+    )
+    out: list[int] = []
+    seen: set[int] = set()
+    for raw_token in normalized.split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_text, end_text = token.split("-", maxsplit=1)
+            start = int(start_text.strip())
+            end = int(end_text.strip())
+            if end < start:
+                start, end = end, start
+            candidates = range(start, end + 1)
+        else:
+            candidates = [int(token)]
+        for idx in candidates:
+            if idx < 0 or idx >= atom_count:
+                raise ValueError(f"Atom index {idx} is outside [0, {atom_count - 1}].")
+            if idx not in seen:
+                seen.add(idx)
+                out.append(idx)
+    return out
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    text = str(hex_color).lstrip("#")
+    if len(text) != 6:
+        return (158, 158, 158)
+    return tuple(int(text[i : i + 2], 16) for i in (0, 2, 4))
+
+
+def _render_sublattice_index_reference_image(
+    image_norm: np.ndarray,
+    coords: np.ndarray,
+    result: SublatticeClassificationResult,
+    *,
+    max_side: int = 1400,
+) -> Image.Image:
+    img, sx, sy = _to_display_image(
+        image_norm,
+        coords=np.empty((0, 2), dtype=np.float64),
+        roi_mask=None,
+        basis_markers=None,
+        max_side=max_side,
+    )
+    draw = ImageDraw.Draw(img)
+    labels = np.asarray(result.labels, dtype=object)
+    palette = _sublattice_palette(labels)
+    manual = np.asarray(result.manual_override_mask, dtype=bool)
+    radius = 5 if max(img.size) >= 1000 else 4
+    for idx, (y, x) in enumerate(np.asarray(coords, dtype=np.float64)):
+        cx = float(x / sx)
+        cy = float(y / sy)
+        color = _hex_to_rgb(palette.get(str(labels[idx]), "#9e9e9e"))
+        draw.ellipse(
+            (cx - radius, cy - radius, cx + radius, cy + radius),
+            fill=color,
+            outline=(255, 255, 255),
+            width=1,
+        )
+        if bool(manual[idx]):
+            rr = radius + 3
+            draw.ellipse((cx - rr, cy - rr, cx + rr, cy + rr), outline=(255, 241, 118), width=2)
+        text = str(idx)
+        tx = cx + radius + 2
+        ty = cy - radius - 2
+        draw.text((tx + 1, ty + 1), text, fill=(0, 0, 0))
+        draw.text((tx, ty), text, fill=(255, 255, 255))
+    return img
+
+
+def _render_atom_index_reference_image(
+    image_norm: np.ndarray,
+    coords: np.ndarray,
+    *,
+    highlighted_indices: set[int] | None = None,
+    max_side: int = 1200,
+) -> Image.Image:
+    img, sx, sy = _to_display_image(
+        image_norm,
+        coords=np.empty((0, 2), dtype=np.float64),
+        roi_mask=None,
+        basis_markers=None,
+        max_side=max_side,
+    )
+    draw = ImageDraw.Draw(img)
+    highlighted = highlighted_indices or set()
+    radius = 5 if max(img.size) >= 900 else 4
+    for idx, (y, x) in enumerate(np.asarray(coords, dtype=np.float64)):
+        cx = float(x / sx)
+        cy = float(y / sy)
+        is_highlighted = idx in highlighted
+        fill = (255, 213, 79) if is_highlighted else (255, 82, 82)
+        outline = (0, 255, 255) if is_highlighted else (255, 255, 255)
+        draw.ellipse(
+            (cx - radius, cy - radius, cx + radius, cy + radius),
+            fill=fill,
+            outline=outline,
+            width=2 if is_highlighted else 1,
+        )
+        text = str(idx)
+        tx = cx + radius + 2
+        ty = cy - radius - 2
+        draw.text((tx + 1, ty + 1), text, fill=(0, 0, 0))
+        draw.text((tx, ty), text, fill=(255, 255, 255))
+    return img
+
+
 def _plane_spacing_csv(
     result: AtomicPlaneSpacingResult,
     *,
@@ -613,7 +1015,7 @@ def _plane_spacing_direction_mask(
     direction_mode: str,
 ) -> np.ndarray:
     directions = np.asarray(result.direction, dtype=object)
-    if direction_mode == "a + b":
+    if direction_mode in {"a + b", "selected direction"}:
         return np.ones(len(directions), dtype=bool)
     if direction_mode == "a only":
         return directions == "a"
@@ -698,7 +1100,10 @@ def _render_plane_spacing_histogram(
     valid = mask & np.isfinite(lengths)
     fig, ax = plt.subplots(figsize=(6.8, 3.8), dpi=160)
     if np.any(valid):
-        for direction, color in [("a", "#1f77b4"), ("b", "#ff7f0e")]:
+        directions = np.asarray(result.direction, dtype=object)
+        unique_directions = [str(v) for v in np.unique(directions[valid])]
+        color_cycle = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+        for direction, color in zip(unique_directions, color_cycle, strict=False):
             direction_mask = valid & (np.asarray(result.direction, dtype=object) == direction)
             if np.any(direction_mask):
                 ax.hist(
@@ -1225,9 +1630,28 @@ def _figure_png_bytes(fig: plt.Figure) -> bytes:
     return buffer.getvalue()
 
 
+def _pil_png_bytes(img: Image.Image) -> bytes:
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _invalidate_sublattice_state(*, clear_manual_labels: bool = True) -> None:
+    st.session_state.sublattice_result = None
+    st.session_state.sublattice_meta = None
+    st.session_state.sublattice_selected_atom = None
+    st.session_state.sublattice_picker_nonce = int(
+        st.session_state.get("sublattice_picker_nonce", 0)
+    ) + 1
+    if clear_manual_labels:
+        st.session_state.sublattice_manual_labels = {}
+
+
 def _invalidate_atomic_intensity_state() -> None:
     st.session_state.atomic_intensity_result = None
     st.session_state.atomic_intensity_meta = None
+    _invalidate_sublattice_state(clear_manual_labels=False)
 
 
 def _invalidate_plane_spacing_state() -> None:
@@ -1253,6 +1677,7 @@ def _invalidate_custom_basis_state() -> None:
     st.session_state.atomic_displacement_manual_pairs = {}
     st.session_state.atomic_displacement_manual_atom = None
     st.session_state.atomic_displacement_manual_site = None
+    _invalidate_sublattice_state(clear_manual_labels=True)
     _invalidate_atomic_displacement_state()
 
 
@@ -1847,6 +2272,7 @@ def _to_display_image(
     roi_mask: np.ndarray | None = None,
     basis_markers: dict[str, tuple[float, float]] | None = None,
     max_side: int = 900,
+    max_draw_atoms: int | None = None,
 ) -> tuple[Image.Image, float, float]:
     h, w = image_norm.shape
     scale = min(max_side / max(h, w), 1.0)
@@ -1869,9 +2295,14 @@ def _to_display_image(
         img = Image.fromarray(blend, mode="RGB")
         draw = ImageDraw.Draw(img)
 
-    if len(coords) > 0:
+    draw_coords = np.asarray(coords, dtype=np.float64)
+    if max_draw_atoms is not None and len(draw_coords) > int(max_draw_atoms):
+        stride = max(int(np.ceil(len(draw_coords) / int(max_draw_atoms))), 1)
+        draw_coords = draw_coords[::stride]
+
+    if len(draw_coords) > 0:
         px_r = max(2, int(round(2.6 * scale)))
-        for y, x in coords:
+        for y, x in draw_coords:
             cx = float(x / (w / disp_w))
             cy = float(y / (h / disp_h))
             draw.ellipse(
@@ -1916,6 +2347,40 @@ def _map_display_to_raw(points_yx: np.ndarray, sx: float, sy: float) -> np.ndarr
     mapped[:, 0] *= sy
     mapped[:, 1] *= sx
     return mapped
+
+
+def _nearest_atom_index(coords: np.ndarray, y: float, x: float) -> int | None:
+    if len(coords) == 0:
+        return None
+    d2 = (coords[:, 0] - float(y)) ** 2 + (coords[:, 1] - float(x)) ** 2
+    return int(np.argmin(d2))
+
+
+def _canvas_object_points(canvas_result) -> np.ndarray:
+    json_data = getattr(canvas_result, "json_data", None)
+    if not isinstance(json_data, dict):
+        return np.empty((0, 2), dtype=np.float64)
+    rows: list[tuple[float, float]] = []
+    for obj in json_data.get("objects", []):
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") != "circle":
+            continue
+        left = obj.get("left")
+        top = obj.get("top")
+        radius = float(obj.get("radius", 0.0) or 0.0)
+        if left is None or top is None:
+            continue
+        x = float(left)
+        y = float(top)
+        if obj.get("originX") != "center":
+            x += radius * float(obj.get("scaleX", 1.0) or 1.0)
+        if obj.get("originY") != "center":
+            y += radius * float(obj.get("scaleY", 1.0) or 1.0)
+        rows.append((y, x))
+    if not rows:
+        return np.empty((0, 2), dtype=np.float64)
+    return np.asarray(rows, dtype=np.float64)
 
 
 def _canvas_draw_mask(canvas_result) -> np.ndarray | None:
@@ -1987,6 +2452,11 @@ for key, default in [
     ("plane_spacing_meta", None),
     ("atomic_intensity_result", None),
     ("atomic_intensity_meta", None),
+    ("sublattice_result", None),
+    ("sublattice_meta", None),
+    ("sublattice_manual_labels", {}),
+    ("sublattice_selected_atom", None),
+    ("sublattice_picker_nonce", 0),
     ("distance_pixel_size", 0.02),
     ("distance_unit", "nm"),
     ("pixel_size_auto_nm", None),
@@ -2298,10 +2768,40 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Atomic Spacing Segments")
+    plane_spacing_method = st.selectbox(
+        "Spacing method",
+        [
+            "a/b lattice index",
+            "a/b lattice index + fixed angle",
+            "lattice angle only (auto directions)",
+            "manual angle",
+            "picked direction from two atoms",
+        ],
+        index=0,
+        help=(
+            "a/b lattice index uses integer custom-basis indexing. "
+            "lattice angle only skips base/a/b picking and infers two row directions "
+            "from atom-pair statistics."
+        ),
+    )
+    plane_spacing_uses_lattice_controls = plane_spacing_method in {
+        "a/b lattice index",
+        "a/b lattice index + fixed angle",
+    }
+    plane_spacing_uses_lattice_angle = plane_spacing_method in {
+        "a/b lattice index + fixed angle",
+        "lattice angle only (auto directions)",
+    }
+    plane_spacing_uses_angle_controls = plane_spacing_method in {
+        "lattice angle only (auto directions)",
+        "manual angle",
+        "picked direction from two atoms",
+    }
     plane_spacing_direction = st.selectbox(
         "Spacing segment direction",
         ["a + b", "a only", "b only"],
         index=0,
+        disabled=not plane_spacing_uses_lattice_controls,
         help="Connect adjacent atoms according to the current custom a/b lattice indices.",
     )
     plane_spacing_lattice_tolerance = st.slider(
@@ -2310,10 +2810,75 @@ with st.sidebar:
         max_value=0.80,
         value=0.40,
         step=0.01,
+        disabled=not plane_spacing_uses_lattice_controls,
         help=(
             "Used only inside spacing quantification to decide whether an atom belongs "
             "to the custom a/b lattice."
         ),
+    )
+    plane_spacing_lattice_angle = st.number_input(
+        "Lattice angle a-b (deg)",
+        min_value=5.0,
+        max_value=175.0,
+        value=90.0,
+        step=1.0,
+        format="%.2f",
+        disabled=not plane_spacing_uses_lattice_angle,
+        help=(
+            "Angle between two lattice row axes. In angle-only mode, the absolute "
+            "orientation is inferred automatically from atom positions."
+        ),
+    )
+    plane_spacing_angle_deg = st.number_input(
+        "Spacing row direction angle (deg)",
+        min_value=0.0,
+        max_value=360.0,
+        value=0.0,
+        step=1.0,
+        format="%.2f",
+        disabled=plane_spacing_method != "manual angle",
+        help=(
+            "Image-coordinate axis angle: 0 deg is horizontal, 90 deg is vertical. "
+            "Angle + 180 deg is treated as the same atom-row direction."
+        ),
+    )
+    plane_spacing_angle_tolerance = st.slider(
+        "Spacing angle tolerance (deg)",
+        min_value=1.0,
+        max_value=45.0,
+        value=10.0,
+        step=1.0,
+        disabled=not plane_spacing_uses_angle_controls,
+    )
+    plane_spacing_min_px = st.number_input(
+        "Spacing min distance (px)",
+        min_value=0.1,
+        value=3.0,
+        step=0.5,
+        format="%.2f",
+        disabled=not plane_spacing_uses_angle_controls,
+    )
+    plane_spacing_max_px = st.number_input(
+        "Spacing max distance (px)",
+        min_value=0.2,
+        value=80.0,
+        step=0.5,
+        format="%.2f",
+        disabled=not plane_spacing_uses_angle_controls,
+    )
+    plane_spacing_pick_start = st.number_input(
+        "Picked direction atom 1 index",
+        min_value=0,
+        value=0,
+        step=1,
+        disabled=plane_spacing_method != "picked direction from two atoms",
+    )
+    plane_spacing_pick_end = st.number_input(
+        "Picked direction atom 2 index",
+        min_value=0,
+        value=1,
+        step=1,
+        disabled=plane_spacing_method != "picked direction from two atoms",
     )
     plane_spacing_show_image = st.checkbox(
         "Spacing map overlay original image",
@@ -2478,6 +3043,73 @@ with st.sidebar:
                 ),
             )
 
+    st.divider()
+    st.subheader("Sublattice Classification")
+    sublattice_method = st.selectbox(
+        "Sublattice method",
+        ["Auto exploration", "User 2D projected model"],
+        index=0,
+        help=(
+            "Auto exploration clusters atoms by projected unit-cell position and optional "
+            "intensity. User model assigns labels from label,u,v sites."
+        ),
+    )
+    sublattice_n_labels = st.slider(
+        "Auto sublattice count",
+        min_value=1,
+        max_value=8,
+        value=2,
+        step=1,
+        disabled=sublattice_method != "Auto exploration",
+    )
+    sublattice_use_intensity = st.checkbox(
+        "Use intensity feature",
+        value=True,
+        help=(
+            "Use current atom intensity or quantified normalized intensity as a "
+            "clustering feature."
+        ),
+    )
+    sublattice_intensity_source = st.selectbox(
+        "Sublattice intensity source",
+        ["Current atom peak intensity", "Atomic-column normalized intensity"],
+        index=0,
+        disabled=not sublattice_use_intensity,
+    )
+    sublattice_intensity_weight = st.slider(
+        "Sublattice intensity weight",
+        min_value=0.0,
+        max_value=2.0,
+        value=0.6,
+        step=0.05,
+        disabled=not sublattice_use_intensity
+        or sublattice_method != "Auto exploration",
+    )
+    sublattice_model_tolerance = st.slider(
+        "Model match tolerance",
+        min_value=0.01,
+        max_value=0.75,
+        value=0.20,
+        step=0.01,
+        disabled=sublattice_method != "User 2D projected model",
+        help="Distance tolerance inside the fractional a/b unit cell.",
+    )
+    sublattice_marker_size = st.slider(
+        "Sublattice marker size",
+        min_value=8.0,
+        max_value=90.0,
+        value=34.0,
+        step=2.0,
+    )
+    sublattice_show_label_text = st.checkbox(
+        "Show sublattice label text",
+        value=False,
+    )
+    sublattice_show_atom_index = st.checkbox(
+        "Show atom index text",
+        value=False,
+    )
+
 params = {
     "mode": mode,
     "gaussian_sigma": None if gaussian_sigma == 0 else float(gaussian_sigma),
@@ -2523,8 +3155,16 @@ params = {
     "atomic_displacement_arrow_scale": float(atomic_displacement_arrow_scale),
     "atomic_displacement_marker_size": float(atomic_displacement_marker_size),
     "atomic_displacement_max_arrows": int(atomic_displacement_max_arrows),
+    "plane_spacing_method": str(plane_spacing_method),
     "plane_spacing_direction": str(plane_spacing_direction),
     "plane_spacing_lattice_tolerance": float(plane_spacing_lattice_tolerance),
+    "plane_spacing_lattice_angle": float(plane_spacing_lattice_angle),
+    "plane_spacing_angle_deg": float(plane_spacing_angle_deg),
+    "plane_spacing_angle_tolerance": float(plane_spacing_angle_tolerance),
+    "plane_spacing_min_px": float(plane_spacing_min_px),
+    "plane_spacing_max_px": float(plane_spacing_max_px),
+    "plane_spacing_pick_start": int(plane_spacing_pick_start),
+    "plane_spacing_pick_end": int(plane_spacing_pick_end),
     "plane_spacing_show_image": bool(plane_spacing_show_image),
     "plane_spacing_show_atoms": bool(plane_spacing_show_atoms),
     "plane_spacing_auto_color_range": bool(plane_spacing_auto_color_range),
@@ -2547,6 +3187,15 @@ params = {
     "intensity_group_metric": str(intensity_group_metric),
     "intensity_cluster_count": int(intensity_cluster_count),
     "intensity_lattice_group_mode": str(intensity_lattice_group_mode),
+    "sublattice_method": str(sublattice_method),
+    "sublattice_n_labels": int(sublattice_n_labels),
+    "sublattice_use_intensity": bool(sublattice_use_intensity),
+    "sublattice_intensity_source": str(sublattice_intensity_source),
+    "sublattice_intensity_weight": float(sublattice_intensity_weight),
+    "sublattice_model_tolerance": float(sublattice_model_tolerance),
+    "sublattice_marker_size": float(sublattice_marker_size),
+    "sublattice_show_label_text": bool(sublattice_show_label_text),
+    "sublattice_show_atom_index": bool(sublattice_show_atom_index),
 }
 
 sig = _signature(current_file_sig, params)
@@ -3052,6 +3701,8 @@ atomic_intensity_result: AtomicColumnIntensityResult | None = (
     st.session_state.atomic_intensity_result
 )
 atomic_intensity_meta = st.session_state.atomic_intensity_meta
+sublattice_result: SublatticeClassificationResult | None = st.session_state.sublattice_result
+sublattice_meta = st.session_state.sublattice_meta
 displacement_scale = params["pixel_size"] if params["use_physical_unit"] else 1.0
 displacement_unit = params["distance_unit"] if params["use_physical_unit"] else "px"
 strain_scale = 100.0 if params["atom_strain_display_unit"] == "%" else 1.0
@@ -3238,33 +3889,114 @@ else:
             st.info(st.session_state.custom_basis_message)
         else:
             st.caption(stage_prompts.get(basis_stage, ""))
-        basis_picker_chart = _render_custom_basis_picker_chart(
-            norm,
-            coords,
-            dict(st.session_state.custom_basis_indices),
-            max_side=900,
-        )
-        st.caption(
-            "Atom-point picker only. Click one point here to choose base, then a, then b."
-        )
-        st.caption(
-            "No Apply button is needed here. One single click on the right-side point "
-            "is enough."
-        )
-        basis_event = st.altair_chart(
-            basis_picker_chart,
-            key=f"custom-basis-picker-{st.session_state.custom_basis_picker_nonce}",
-            on_select="rerun",
-            selection_mode="basis_pick",
-            use_container_width=False,
-        )
-        picked_atom = _extract_altair_atom_pick(basis_event, selection_name="basis_pick")
-        if picked_atom is not None and 0 <= int(picked_atom) < len(coords):
-            st.session_state.custom_basis_last_picked_atom = int(picked_atom)
-            raw_point = np.asarray([coords[int(picked_atom)]], dtype=np.float64)
-            _, message = _apply_custom_basis_clicks(coords, raw_point)
-            if message is not None:
-                st.session_state.custom_basis_message = message
+        if basis_stage >= 3:
+            st.success(
+                "Custom a-b basis is ready. The interactive picker is unloaded "
+                "to keep downstream Run buttons responsive."
+            )
+        else:
+            basis_picker_mode = st.radio(
+                "a/b picker mode",
+                ["Fast image click (snap nearest atom)", "Atom-point picker (slower)"],
+                index=0 if len(coords) > 2500 else 1,
+                horizontal=True,
+            )
+            if basis_picker_mode == "Fast image click (snap nearest atom)":
+                st.caption(
+                    "Click the image; the click is snapped to the nearest detected atom. "
+                    "No Apply button is needed."
+                )
+                if len(coords) > 6000:
+                    st.caption(
+                        "For speed, only a subset of red atom rings is drawn, but snapping "
+                        "still uses all detected atoms."
+                    )
+                basis_canvas_img, basis_sx, basis_sy = _to_display_image(
+                    norm,
+                    coords,
+                    roi_mask=None,
+                    basis_markers=_current_basis_markers(coords),
+                    max_side=760,
+                    max_draw_atoms=6000,
+                )
+                basis_canvas_result = st_canvas(
+                    fill_color="rgba(255, 255, 0, 0.55)",
+                    stroke_width=1,
+                    stroke_color="#ffff00",
+                    background_image=basis_canvas_img,
+                    drawing_mode="point",
+                    point_display_radius=4,
+                    display_toolbar=False,
+                    update_streamlit=True,
+                    height=basis_canvas_img.height,
+                    width=basis_canvas_img.width,
+                    key=f"custom-basis-canvas-{st.session_state.custom_basis_picker_nonce}",
+                )
+                basis_click_disp = _canvas_object_points(basis_canvas_result)
+                if len(basis_click_disp) > 0:
+                    raw_points = _map_display_to_raw(
+                        basis_click_disp[-1:],
+                        sx=basis_sx,
+                        sy=basis_sy,
+                    )
+                    nearest_idx = _nearest_atom_index(
+                        coords,
+                        float(raw_points[-1, 0]),
+                        float(raw_points[-1, 1]),
+                    )
+                    if nearest_idx is not None:
+                        st.session_state.custom_basis_last_picked_atom = int(nearest_idx)
+                    changed, message = _apply_custom_basis_clicks(coords, raw_points)
+                    if message is not None:
+                        st.session_state.custom_basis_message = message
+                    if changed:
+                        st.session_state.custom_basis_picker_nonce = int(
+                            st.session_state.custom_basis_picker_nonce
+                        ) + 1
+                        st.rerun()
+            else:
+                render_dense_picker = True
+                if len(coords) > 5000:
+                    st.warning(
+                        "Atom-point picker renders every atom as an interactive point and "
+                        "can freeze the browser for large maps. Fast image click is safer."
+                    )
+                    render_dense_picker = st.checkbox(
+                        "Render dense atom-point picker anyway",
+                        value=False,
+                    )
+                if render_dense_picker:
+                    basis_picker_chart = _render_custom_basis_picker_chart(
+                        norm,
+                        coords,
+                        dict(st.session_state.custom_basis_indices),
+                        max_side=900,
+                    )
+                    st.caption(
+                        "Atom-point picker only. Click one point here to choose base, "
+                        "then a, then b."
+                    )
+                    st.caption(
+                        "No Apply button is needed here. One single click on the "
+                        "right-side point is enough."
+                    )
+                    basis_event = st.altair_chart(
+                        basis_picker_chart,
+                        key=f"custom-basis-picker-{st.session_state.custom_basis_picker_nonce}",
+                        on_select="rerun",
+                        selection_mode="basis_pick",
+                        use_container_width=False,
+                    )
+                    picked_atom = _extract_altair_atom_pick(
+                        basis_event,
+                        selection_name="basis_pick",
+                    )
+                    if picked_atom is not None and 0 <= int(picked_atom) < len(coords):
+                        st.session_state.custom_basis_last_picked_atom = int(picked_atom)
+                        raw_point = np.asarray([coords[int(picked_atom)]], dtype=np.float64)
+                        _, message = _apply_custom_basis_clicks(coords, raw_point)
+                        if message is not None:
+                            st.session_state.custom_basis_message = message
         picks = dict(st.session_state.custom_basis_indices)
         st.write(
             "Current picks:",
@@ -3284,6 +4016,7 @@ else:
         roi_mask=None,
         basis_markers=_current_basis_markers(coords),
         max_side=900,
+        max_draw_atoms=6000,
     )
     with basis_preview_col:
         st.caption("Original image with detected atoms and current base / a / b markers.")
@@ -3346,6 +4079,390 @@ if custom_basis is not None:
                 "If you later run atom-position strain, this same basis will also support "
                 "eaa / ebb / eab."
             )
+
+st.subheader("Sublattice Classification / Projected Structure")
+st.caption(
+    "First C4 module. It classifies edited atom columns into sublattice labels using "
+    "the current custom a/b unit cell, then lets you manually correct wrong labels."
+)
+projected_model_text = ""
+if params["sublattice_method"] == "User 2D projected model":
+    projected_model_text = st.text_area(
+        "Projected 2D model sites (`label,u,v` in the custom a/b unit cell)",
+        value="label,u,v\nA,0,0\nB,0.5,0.5",
+        height=120,
+        help=(
+            "u and v are fractional positions inside the custom a/b unit cell. "
+            "Example labels can be A/B/O or material-specific names."
+        ),
+    )
+
+manual_sublattice_labels = {
+    int(atom_idx): str(label)
+    for atom_idx, label in dict(st.session_state.sublattice_manual_labels).items()
+    if 0 <= int(atom_idx) < len(coords)
+}
+if len(manual_sublattice_labels) != len(st.session_state.sublattice_manual_labels):
+    st.session_state.sublattice_manual_labels = manual_sublattice_labels
+
+sublattice_intensity_values = np.asarray(intensities, dtype=np.float64)
+sublattice_intensity_note = "current atom peak intensity"
+if (
+    params["sublattice_use_intensity"]
+    and params["sublattice_intensity_source"] == "Atomic-column normalized intensity"
+):
+    intensity_result_matches = (
+        atomic_intensity_result is not None
+        and len(atomic_intensity_result.normalized_intensity) == len(coords)
+    )
+    if intensity_result_matches:
+        sublattice_intensity_values = np.asarray(
+            atomic_intensity_result.normalized_intensity,
+            dtype=np.float64,
+        )
+        sublattice_intensity_note = "atomic-column normalized intensity"
+    else:
+        st.warning(
+            "Atomic-column normalized intensity is not available for the current atoms. "
+            "Sublattice classification will fall back to current atom peak intensity."
+        )
+
+sublattice_ready = custom_basis_ready and custom_basis is not None and len(coords) >= 3
+sublattice_settings = {
+    "method": params["sublattice_method"],
+    "atom_count": int(len(coords)),
+    "basis_indices": {
+        "base_idx": int(custom_basis["base_idx"]) if custom_basis is not None else None,
+        "a_idx": int(custom_basis["a_idx"]) if custom_basis is not None else None,
+        "b_idx": int(custom_basis["b_idx"]) if custom_basis is not None else None,
+    },
+    "n_labels": int(params["sublattice_n_labels"]),
+    "use_intensity": bool(params["sublattice_use_intensity"]),
+    "intensity_source": sublattice_intensity_note,
+    "intensity_weight": float(params["sublattice_intensity_weight"]),
+    "model_tolerance": float(params["sublattice_model_tolerance"]),
+    "projected_model_text": projected_model_text.strip()
+    if params["sublattice_method"] == "User 2D projected model"
+    else "",
+}
+if (
+    sublattice_meta is not None
+    and sublattice_meta.get("settings") != sublattice_settings
+):
+    _invalidate_sublattice_state(clear_manual_labels=False)
+    sublattice_result = None
+    sublattice_meta = None
+
+sublattice_button_col, sublattice_info_col = st.columns([0.34, 0.66])
+run_sublattice = sublattice_button_col.button(
+    "Run Sublattice Classification",
+    type="primary",
+    use_container_width=False,
+    disabled=not sublattice_ready,
+)
+sublattice_info_col.caption(
+    f"method={params['sublattice_method']} | "
+    f"basis ready={bool(custom_basis_ready)} | "
+    f"intensity={sublattice_intensity_note} | "
+    f"manual labels={len(manual_sublattice_labels)}"
+)
+if not custom_basis_ready:
+    st.info("Define the custom base/a/b basis first, then run sublattice classification.")
+elif len(coords) < 3:
+    st.warning("Need at least 3 atom coordinates before classifying sublattices.")
+
+if run_sublattice and sublattice_ready and custom_basis is not None:
+    with st.spinner("Running sublattice classification..."):
+        try:
+            if params["sublattice_method"] == "Auto exploration":
+                computed_sublattice = classify_sublattices_auto(
+                    coords,
+                    base_index=int(custom_basis["base_idx"]),
+                    a_index=int(custom_basis["a_idx"]),
+                    b_index=int(custom_basis["b_idx"]),
+                    intensities=sublattice_intensity_values,
+                    n_sublattices=int(params["sublattice_n_labels"]),
+                    use_intensity=bool(params["sublattice_use_intensity"]),
+                    intensity_weight=float(params["sublattice_intensity_weight"]),
+                    manual_labels=manual_sublattice_labels,
+                )
+            else:
+                model_sites = parse_projected_model_csv(projected_model_text)
+                computed_sublattice = classify_sublattices_from_model(
+                    coords,
+                    base_index=int(custom_basis["base_idx"]),
+                    a_index=int(custom_basis["a_idx"]),
+                    b_index=int(custom_basis["b_idx"]),
+                    basis_sites=model_sites,
+                    intensities=sublattice_intensity_values,
+                    match_tolerance=float(params["sublattice_model_tolerance"]),
+                    manual_labels=manual_sublattice_labels,
+                )
+        except Exception as exc:
+            _invalidate_sublattice_state(clear_manual_labels=False)
+            st.error(f"Sublattice classification failed: {exc}")
+            sublattice_result = None
+            sublattice_meta = None
+        else:
+            st.session_state.sublattice_result = computed_sublattice
+            st.session_state.sublattice_meta = {
+                "settings": sublattice_settings,
+                "method": computed_sublattice.provenance.get("method"),
+                "manual_label_count": len(manual_sublattice_labels),
+            }
+            sublattice_result = computed_sublattice
+            sublattice_meta = st.session_state.sublattice_meta
+            st.success("Sublattice classification finished.")
+
+if sublattice_meta is not None:
+    st.write("Sublattice settings:", sublattice_meta)
+
+if sublattice_result is not None:
+    if len(sublattice_result.labels) != len(coords):
+        st.warning(
+            "Current sublattice result does not match the edited atom table. "
+            "Run sublattice classification again."
+        )
+    else:
+        sublattice_view = st.radio(
+            "Sublattice view",
+            ["Overlay", "Unit-cell model", "Manual correction", "Summary / Table"],
+            horizontal=True,
+            key="sublattice_view",
+        )
+        st.caption(
+            "Only the selected sublattice view is rendered for speed. "
+            "This avoids loading the large manual-correction point picker unless needed."
+        )
+        if sublattice_view == "Overlay":
+            sub_overlay_fig = _render_sublattice_overlay(
+                norm,
+                coords,
+                sublattice_result,
+                marker_size=params["sublattice_marker_size"],
+                show_label_text=params["sublattice_show_label_text"],
+                show_atom_index=params["sublattice_show_atom_index"],
+            )
+            st.pyplot(sub_overlay_fig)
+            sub_overlay_png = _figure_png_bytes(sub_overlay_fig)
+            st.download_button(
+                label="Download sublattice overlay PNG",
+                data=sub_overlay_png,
+                file_name=f"{Path(uploaded.name).stem}_sublattice_overlay.png",
+                mime="image/png",
+            )
+            plt.close(sub_overlay_fig)
+
+        elif sublattice_view == "Unit-cell model":
+            sub_cell_fig = _render_sublattice_unit_cell(sublattice_result)
+            st.pyplot(sub_cell_fig)
+            sub_cell_png = _figure_png_bytes(sub_cell_fig)
+            st.download_button(
+                label="Download projected unit-cell PNG",
+                data=sub_cell_png,
+                file_name=f"{Path(uploaded.name).stem}_sublattice_unit_cell.png",
+                mime="image/png",
+            )
+            plt.close(sub_cell_fig)
+            st.json(sublattice_result.projected_structure)
+
+        elif sublattice_view == "Manual correction":
+            st.caption(
+                "Static index map only. Read atom indices from the image, type index "
+                "values below, then assign them to A/B/C or another label."
+            )
+            index_map_img = _render_sublattice_index_reference_image(
+                norm,
+                coords,
+                sublattice_result,
+                max_side=1400,
+            )
+            st.image(
+                index_map_img,
+                caption=(
+                    "Atom index reference map. Color = current sublattice label; "
+                    "yellow ring = manual override."
+                ),
+                use_container_width=False,
+            )
+            st.download_button(
+                label="Download atom-index reference PNG",
+                data=_pil_png_bytes(index_map_img),
+                file_name=f"{Path(uploaded.name).stem}_sublattice_atom_indices.png",
+                mime="image/png",
+            )
+
+            index_text = st.text_input(
+                "Atom index / indices to correct",
+                value="",
+                placeholder="Example: 12 or 12,18,20-25",
+                help="Use comma/space separated indices. Ranges like 20-25 are supported.",
+            )
+            selected_indices: list[int] = []
+            index_parse_error = ""
+            if index_text.strip():
+                try:
+                    selected_indices = _parse_atom_index_text(index_text, len(coords))
+                except Exception as exc:
+                    index_parse_error = str(exc)
+                    st.warning(f"Invalid atom index input: {index_parse_error}")
+            label_options = sorted(
+                str(v)
+                for v in set(np.asarray(sublattice_result.labels, dtype=object).tolist())
+                | set(manual_sublattice_labels.values())
+            )
+            if "unknown" not in label_options:
+                label_options.append("unknown")
+            label_options.append("custom label")
+            selected_target_label = st.selectbox(
+                "Correct selected atom to label",
+                label_options,
+                index=0,
+            )
+            custom_target_label = ""
+            if selected_target_label == "custom label":
+                custom_target_label = st.text_input(
+                    "Custom label",
+                    value="",
+                )
+            final_target_label = (
+                custom_target_label.strip()
+                if selected_target_label == "custom label"
+                else selected_target_label
+            )
+            selected_preview = []
+            if selected_indices:
+                selected_preview = [
+                    {
+                        "atom_index": idx,
+                        "current_label": str(sublattice_result.labels[idx]),
+                        "target_label": final_target_label,
+                    }
+                    for idx in selected_indices[:50]
+                ]
+            st.write(
+                "Current manual correction:",
+                {
+                    "selected_atoms": selected_indices[:20],
+                    "selected_count": len(selected_indices),
+                    "target_label": final_target_label,
+                    "manual_override_count": len(manual_sublattice_labels),
+                },
+            )
+            if selected_preview:
+                st.dataframe(pd.DataFrame(selected_preview), use_container_width=True)
+                if len(selected_indices) > len(selected_preview):
+                    st.caption(
+                        f"Showing first {len(selected_preview)} of "
+                        f"{len(selected_indices)} selected atoms."
+                    )
+            sub_manual_col1, sub_manual_col2 = st.columns([1, 1])
+            apply_sub_label = sub_manual_col1.button(
+                "Apply manual label",
+                type="primary",
+                disabled=not selected_indices
+                or not str(final_target_label).strip(),
+            )
+            clear_sub_labels = sub_manual_col2.button(
+                "Clear manual labels",
+                disabled=len(manual_sublattice_labels) == 0,
+            )
+            if apply_sub_label and selected_indices:
+                for atom_idx in selected_indices:
+                    manual_sublattice_labels[int(atom_idx)] = str(final_target_label).strip()
+                st.session_state.sublattice_manual_labels = manual_sublattice_labels
+                corrected_sublattice = apply_manual_sublattice_labels(
+                    sublattice_result,
+                    manual_sublattice_labels,
+                )
+                st.session_state.sublattice_result = corrected_sublattice
+                if st.session_state.sublattice_meta is not None:
+                    st.session_state.sublattice_meta["manual_label_count"] = len(
+                        manual_sublattice_labels
+                    )
+                st.success(
+                    f"Relabeled {len(selected_indices)} atom(s) to "
+                    f"{str(final_target_label).strip()}."
+                )
+                st.rerun()
+            if clear_sub_labels:
+                _invalidate_sublattice_state(clear_manual_labels=True)
+                st.success("Manual sublattice labels cleared. Run classification again.")
+                st.rerun()
+            if manual_sublattice_labels:
+                manual_preview = pd.DataFrame(
+                    [
+                        {"atom_index": atom_idx, "manual_label": label}
+                        for atom_idx, label in sorted(manual_sublattice_labels.items())
+                    ]
+                )
+                st.dataframe(manual_preview, use_container_width=True)
+
+        else:
+            st.metric("Sublattice confidence", f"{sublattice_result.confidence:.3f}")
+            summary_df = pd.DataFrame(sublattice_result.label_summaries)
+            st.dataframe(summary_df, use_container_width=True)
+            if sublattice_result.warnings:
+                summary = _warning_summary_lines(sublattice_result.warnings)
+                st.warning("\n".join(summary))
+                with st.expander("Show full sublattice warnings"):
+                    st.code("\n".join(sublattice_result.warnings), language="text")
+            else:
+                st.success("No sublattice warnings.")
+
+            sub_preview_count = min(len(coords), 500)
+            if sub_preview_count > 0:
+                sub_preview = pd.DataFrame(
+                    {
+                        "atom_index": np.arange(sub_preview_count, dtype=int),
+                        "y": coords[:sub_preview_count, 0],
+                        "x": coords[:sub_preview_count, 1],
+                        "label": sublattice_result.labels[:sub_preview_count],
+                        "lattice_i": sublattice_result.lattice_indices_ij[
+                            :sub_preview_count,
+                            0,
+                        ],
+                        "lattice_j": sublattice_result.lattice_indices_ij[
+                            :sub_preview_count,
+                            1,
+                        ],
+                        "cell_u": sublattice_result.unit_cell_uv[:sub_preview_count, 0],
+                        "cell_v": sublattice_result.unit_cell_uv[:sub_preview_count, 1],
+                        "intensity": sublattice_result.intensities[:sub_preview_count],
+                        "manual_override": sublattice_result.manual_override_mask[
+                            :sub_preview_count
+                        ].astype(np.int32),
+                    }
+                )
+                st.dataframe(sub_preview, use_container_width=True)
+            st.download_button(
+                label="Download sublattice atom table CSV",
+                data=_sublattice_csv(coords, sublattice_result).encode("utf-8"),
+                file_name=f"{Path(uploaded.name).stem}_sublattice_atoms.csv",
+                mime="text/csv",
+            )
+            st.download_button(
+                label="Download sublattice summary CSV",
+                data=_sublattice_summary_csv(sublattice_result).encode("utf-8"),
+                file_name=f"{Path(uploaded.name).stem}_sublattice_summary.csv",
+                mime="text/csv",
+            )
+            structure_json = json.dumps(
+                sublattice_result.projected_structure,
+                ensure_ascii=False,
+                indent=2,
+            )
+            st.download_button(
+                label="Download projected structure JSON",
+                data=structure_json.encode("utf-8"),
+                file_name=f"{Path(uploaded.name).stem}_projected_structure.json",
+                mime="application/json",
+            )
+elif sublattice_ready:
+    st.info(
+        "Sublattice inputs are ready. Click `Run Sublattice Classification` to "
+        "color atoms by sublattice and start manual correction."
+    )
 
 st.subheader("Atomic Displacement")
 st.caption(
@@ -3831,12 +4948,41 @@ else:
 
 st.subheader("Atomic Spacing Segments")
 st.caption(
-    "Connect adjacent atoms along the current custom a/b lattice. Line color represents "
-    "local atom-to-atom spacing, with manual color range controls in the sidebar."
+    "Connect adjacent atoms by custom a/b lattice indexing, lattice-angle-only "
+    "auto direction inference, manual row direction, or a direction inferred from "
+    "two atom indices. Line color represents local atom-to-atom spacing."
 )
-spacing_ready = custom_basis_ready and custom_basis is not None
+spacing_method = params["plane_spacing_method"]
+spacing_uses_lattice = spacing_method in {
+    "a/b lattice index",
+    "a/b lattice index + fixed angle",
+}
+spacing_uses_fixed_lattice_angle = spacing_method == "a/b lattice index + fixed angle"
+spacing_uses_angle_only = spacing_method == "lattice angle only (auto directions)"
+spacing_uses_picked_direction = spacing_method == "picked direction from two atoms"
+spacing_pick_valid = (
+    0 <= int(params["plane_spacing_pick_start"]) < len(coords)
+    and 0 <= int(params["plane_spacing_pick_end"]) < len(coords)
+    and int(params["plane_spacing_pick_start"]) != int(params["plane_spacing_pick_end"])
+)
+spacing_ready = len(coords) >= 2 and (
+    (spacing_uses_lattice and custom_basis_ready and custom_basis is not None)
+    or (spacing_uses_angle_only and len(coords) >= 3)
+    or spacing_method == "manual angle"
+    or (spacing_uses_picked_direction and spacing_pick_valid)
+)
+picked_spacing_angle = None
+if spacing_uses_picked_direction and spacing_pick_valid:
+    picked_vec = (
+        coords[int(params["plane_spacing_pick_end"])]
+        - coords[int(params["plane_spacing_pick_start"])]
+    )
+    picked_spacing_angle = float(np.degrees(np.arctan2(picked_vec[0], picked_vec[1])) % 360.0)
+spacing_direction_display = (
+    params["plane_spacing_direction"] if spacing_uses_lattice else "selected direction"
+)
 current_spacing_settings = {
-    "source": "custom_ab_basis_direct_indexing",
+    "method": spacing_method,
     "atom_count": int(len(coords)),
     "basis_indices": {
         "base_idx": int(custom_basis["base_idx"]) if custom_basis is not None else None,
@@ -3844,6 +4990,13 @@ current_spacing_settings = {
         "b_idx": int(custom_basis["b_idx"]) if custom_basis is not None else None,
     },
     "lattice_index_tolerance": params["plane_spacing_lattice_tolerance"],
+    "lattice_angle_deg": params["plane_spacing_lattice_angle"],
+    "angle_deg": params["plane_spacing_angle_deg"],
+    "angle_tolerance_deg": params["plane_spacing_angle_tolerance"],
+    "min_spacing_px": params["plane_spacing_min_px"],
+    "max_spacing_px": params["plane_spacing_max_px"],
+    "pick_start": params["plane_spacing_pick_start"],
+    "pick_end": params["plane_spacing_pick_end"],
 }
 if (
     plane_spacing_meta is not None
@@ -3861,28 +5014,139 @@ run_plane_spacing = spacing_button_col.button(
     disabled=not spacing_ready,
 )
 if spacing_ready:
-    spacing_info_col.caption(
-        "Source: current custom base/a/b direction | "
-        f"index tolerance={params['plane_spacing_lattice_tolerance']:.2f} | "
-        f"display={params['plane_spacing_direction']} | "
-        f"unit={displacement_unit}"
-    )
-else:
-    spacing_info_col.caption(
-        "Define the custom base/a/b basis first. This module directly measures atom-to-atom "
-        "distances and does not require running atomic displacement."
-    )
-
-if run_plane_spacing and spacing_ready and custom_basis is not None:
-    try:
-        measured_spacing = compute_atomic_plane_spacing_segments_from_basis(
-            coords,
-            base_index=int(custom_basis["base_idx"]),
-            a_index=int(custom_basis["a_idx"]),
-            b_index=int(custom_basis["b_idx"]),
-            lattice_index_tolerance=params["plane_spacing_lattice_tolerance"],
-            directions=("a", "b"),
+    if spacing_uses_lattice:
+        if spacing_uses_fixed_lattice_angle:
+            spacing_info_col.caption(
+                "Source: custom base/a/b with fixed lattice angle | "
+                f"a-b angle={params['plane_spacing_lattice_angle']:.2f} deg | "
+                f"index tolerance={params['plane_spacing_lattice_tolerance']:.2f} | "
+                f"display={params['plane_spacing_direction']} | unit={displacement_unit}"
+            )
+        else:
+            spacing_info_col.caption(
+                "Source: current custom base/a/b lattice index | "
+                f"index tolerance={params['plane_spacing_lattice_tolerance']:.2f} | "
+                f"display={params['plane_spacing_direction']} | "
+                f"unit={displacement_unit}"
+            )
+    elif spacing_uses_angle_only:
+        spacing_info_col.caption(
+            "Source: lattice angle only, auto-inferred row directions | "
+            f"lattice angle={params['plane_spacing_lattice_angle']:.2f} deg | "
+            f"direction tolerance={params['plane_spacing_angle_tolerance']:.1f} deg | "
+            f"range={params['plane_spacing_min_px']:.1f}-"
+            f"{params['plane_spacing_max_px']:.1f} px | unit={displacement_unit}"
         )
+    elif spacing_method == "manual angle":
+        spacing_info_col.caption(
+            f"Source: manual angle {params['plane_spacing_angle_deg']:.2f} deg | "
+            f"tolerance={params['plane_spacing_angle_tolerance']:.1f} deg | "
+            f"range={params['plane_spacing_min_px']:.1f}-"
+            f"{params['plane_spacing_max_px']:.1f} px | unit={displacement_unit}"
+        )
+    else:
+        spacing_info_col.caption(
+            "Source: picked atom direction | "
+            f"atoms={params['plane_spacing_pick_start']} -> "
+            f"{params['plane_spacing_pick_end']} | "
+            f"angle={picked_spacing_angle:.2f} deg | "
+            f"tolerance={params['plane_spacing_angle_tolerance']:.1f} deg | "
+            f"range={params['plane_spacing_min_px']:.1f}-"
+            f"{params['plane_spacing_max_px']:.1f} px | unit={displacement_unit}"
+        )
+else:
+    if spacing_uses_lattice:
+        spacing_info_col.caption(
+            "Define the custom base/a/b basis first. This module directly measures "
+            "atom-to-atom distances and does not require running atomic displacement."
+        )
+    elif spacing_uses_angle_only:
+        spacing_info_col.caption(
+            "Need at least 3 atom points. This mode skips custom base/a/b selection "
+            "and infers two row directions from the requested lattice angle."
+        )
+    elif spacing_uses_picked_direction and not spacing_pick_valid:
+        spacing_info_col.caption(
+            "Pick two different valid atom indices for the direction. Use the atom-index "
+            "reference maps or coordinate table if needed."
+        )
+    else:
+        spacing_info_col.caption("Need at least 2 atom points before measuring spacing.")
+
+if spacing_uses_picked_direction and len(coords) > 0:
+    highlighted_spacing_indices = {
+        idx
+        for idx in (
+            int(params["plane_spacing_pick_start"]),
+            int(params["plane_spacing_pick_end"]),
+        )
+        if 0 <= idx < len(coords)
+    }
+    with st.expander("Show atom-index reference map for picked direction", expanded=False):
+        spacing_index_img = _render_atom_index_reference_image(
+            norm,
+            coords,
+            highlighted_indices=highlighted_spacing_indices,
+            max_side=1200,
+        )
+        st.image(
+            spacing_index_img,
+            caption="Use these atom indices for `Picked direction atom 1/2 index`.",
+            use_container_width=False,
+        )
+        st.download_button(
+            label="Download spacing atom-index reference PNG",
+            data=_pil_png_bytes(spacing_index_img),
+            file_name=f"{Path(uploaded.name).stem}_spacing_atom_indices.png",
+            mime="image/png",
+        )
+
+if run_plane_spacing and spacing_ready:
+    try:
+        if spacing_uses_fixed_lattice_angle and custom_basis is not None:
+            measured_spacing = compute_atomic_plane_spacing_segments_from_angle_constrained_basis(
+                coords,
+                base_index=int(custom_basis["base_idx"]),
+                a_index=int(custom_basis["a_idx"]),
+                b_index=int(custom_basis["b_idx"]),
+                lattice_angle_deg=params["plane_spacing_lattice_angle"],
+                lattice_index_tolerance=params["plane_spacing_lattice_tolerance"],
+                directions=("a", "b"),
+            )
+        elif spacing_uses_lattice and custom_basis is not None:
+            measured_spacing = compute_atomic_plane_spacing_segments_from_basis(
+                coords,
+                base_index=int(custom_basis["base_idx"]),
+                a_index=int(custom_basis["a_idx"]),
+                b_index=int(custom_basis["b_idx"]),
+                lattice_index_tolerance=params["plane_spacing_lattice_tolerance"],
+                directions=("a", "b"),
+            )
+        elif spacing_uses_angle_only:
+            measured_spacing = compute_atomic_plane_spacing_segments_from_lattice_angle(
+                coords,
+                lattice_angle_deg=params["plane_spacing_lattice_angle"],
+                angle_tolerance_deg=params["plane_spacing_angle_tolerance"],
+                min_spacing_px=params["plane_spacing_min_px"],
+                max_spacing_px=params["plane_spacing_max_px"],
+            )
+        elif spacing_method == "manual angle":
+            measured_spacing = compute_atomic_plane_spacing_segments_by_angle(
+                coords,
+                angle_deg=params["plane_spacing_angle_deg"],
+                angle_tolerance_deg=params["plane_spacing_angle_tolerance"],
+                min_spacing_px=params["plane_spacing_min_px"],
+                max_spacing_px=params["plane_spacing_max_px"],
+            )
+        else:
+            measured_spacing = compute_atomic_plane_spacing_segments_from_picked_direction(
+                coords,
+                start_index=params["plane_spacing_pick_start"],
+                end_index=params["plane_spacing_pick_end"],
+                angle_tolerance_deg=params["plane_spacing_angle_tolerance"],
+                min_spacing_px=params["plane_spacing_min_px"],
+                max_spacing_px=params["plane_spacing_max_px"],
+            )
     except Exception as exc:
         _invalidate_plane_spacing_state()
         st.error(f"Atomic spacing segment quantification failed: {exc}")
@@ -3892,7 +5156,7 @@ if run_plane_spacing and spacing_ready and custom_basis is not None:
         st.session_state.plane_spacing_result = measured_spacing
         st.session_state.plane_spacing_meta = {
             "settings": current_spacing_settings,
-            "method": "direct_short_segments_from_custom_ab_basis",
+            "method": measured_spacing.provenance.get("method", spacing_method),
             "segment_count": int(len(measured_spacing.length_px)),
         }
         plane_spacing_result = measured_spacing
@@ -3911,7 +5175,7 @@ if plane_spacing_result is not None:
             norm,
             coords,
             plane_spacing_result,
-            direction_mode=params["plane_spacing_direction"],
+            direction_mode=spacing_direction_display,
             spacing_scale=displacement_scale,
             spacing_unit=displacement_unit,
             show_image=params["plane_spacing_show_image"],
@@ -3933,7 +5197,7 @@ if plane_spacing_result is not None:
     with spacing_hist_tab:
         spacing_hist_fig = _render_plane_spacing_histogram(
             plane_spacing_result,
-            direction_mode=params["plane_spacing_direction"],
+            direction_mode=spacing_direction_display,
             spacing_scale=displacement_scale,
             spacing_unit=displacement_unit,
         )
@@ -3949,13 +5213,19 @@ if plane_spacing_result is not None:
     with spacing_table_tab:
         direction_mask = _plane_spacing_direction_mask(
             plane_spacing_result,
-            params["plane_spacing_direction"],
+            spacing_direction_display,
         )
         spacing_lengths = (
             np.asarray(plane_spacing_result.length_px, dtype=np.float64) * displacement_scale
         )
         summary_rows = []
-        for direction in ("a", "b"):
+        unique_spacing_directions = sorted(
+            str(v)
+            for v in np.unique(
+                np.asarray(plane_spacing_result.direction, dtype=object)[direction_mask]
+            )
+        )
+        for direction in unique_spacing_directions:
             mask = (
                 direction_mask
                 & (np.asarray(plane_spacing_result.direction, dtype=object) == direction)
@@ -3978,11 +5248,30 @@ if plane_spacing_result is not None:
             "Atomic spacing summary:",
             {
                 "confidence": round(float(plane_spacing_result.confidence), 3),
-                "display_direction": params["plane_spacing_direction"],
+                "method": plane_spacing_result.provenance.get("method"),
+                "display_direction": spacing_direction_display,
                 "unit": displacement_unit,
                 "segment_count": int(np.sum(direction_mask)),
             },
         )
+        spacing_fit_stats = plane_spacing_result.provenance.get("fit_statistics", {})
+        if spacing_fit_stats:
+            st.write(
+                "Spacing fit statistics:",
+                {
+                    "original_ab_angle_deg": spacing_fit_stats.get(
+                        "original_ab_angle_deg"
+                    ),
+                    "constrained_ab_angle_deg": spacing_fit_stats.get(
+                        "constrained_ab_angle_deg"
+                    ),
+                    "valid_atom_count": spacing_fit_stats.get("valid_atom_count"),
+                    "invalid_atom_count": spacing_fit_stats.get("invalid_atom_count"),
+                    "assignment_residual_median": spacing_fit_stats.get(
+                        "assignment_residual_median"
+                    ),
+                },
+            )
         if summary_rows:
             st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
         st.info(
@@ -4022,8 +5311,9 @@ if plane_spacing_result is not None:
         )
 else:
     st.info(
-        "Click `Run Atomic Spacing Segments` after selecting custom base/a/b to draw "
-        "short a/b neighbor lines colored by local spacing."
+        "Click `Run Atomic Spacing Segments` after choosing a spacing method. "
+        "For angle modes, tune angle tolerance and distance range if lines connect "
+        "the wrong neighbors."
     )
 
 st.subheader("Atomic Column Intensity Quantification")
