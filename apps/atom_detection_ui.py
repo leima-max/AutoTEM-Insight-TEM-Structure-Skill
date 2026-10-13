@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 import json
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +16,7 @@ from PIL import Image, ImageDraw
 from scipy import ndimage as ndi
 from streamlit_drawable_canvas import st_canvas
 
+from apps.upload_lifecycle import TemporaryUpload, upload_signature
 from autotem.atomic.atom_detection import _load_image, _normalize_image, detect_atoms
 from autotem.atomic.displacement import (
     AtomicDisplacementResult,
@@ -84,21 +84,15 @@ DISPLACEMENT_METHOD_OPTIONS = [
 ]
 
 
-@st.cache_data(show_spinner=False, max_entries=32)
-def _cached_load_image(
-    path: str, slice_index: int, file_size: int
+def _load_uploaded_image(
+    path: str, slice_index: int
 ) -> tuple[np.ndarray, dict[str, Any], list[str]]:
-    # `file_size` is included so cache invalidates on changed uploads.
-    _ = file_size
     warnings: list[str] = []
     arr, source_info = _load_image(path, warnings=warnings, slice_index=slice_index)
     return arr, source_info, warnings
 
 
-@st.cache_data(show_spinner=False, max_entries=32)
-def _cached_infer_pixel_size_nm(path: str, file_size: int) -> tuple[float | None, str, list[str]]:
-    # `file_size` is included so cache invalidates on changed uploads.
-    _ = file_size
+def _infer_pixel_size_nm(path: str) -> tuple[float | None, str, list[str]]:
     suffix = Path(path).suffix.lower()
     messages: list[str] = []
 
@@ -144,13 +138,6 @@ def _cached_infer_pixel_size_nm(path: str, file_size: int) -> tuple[float | None
         messages.append(f"Generic metadata read failed: {exc}")
 
     return None, "unavailable", messages
-
-
-def _save_upload_to_temp(uploaded_file) -> str:
-    suffix = Path(uploaded_file.name).suffix or ".dat"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(uploaded_file.getbuffer())
-        return tmp.name
 
 
 def _signature(file_sig: str, params: dict[str, Any]) -> tuple[Any, ...]:
@@ -1691,6 +1678,26 @@ def _invalidate_atomic_displacement_state() -> None:
     _invalidate_plane_spacing_state()
 
 
+def _clear_uploaded_image_state() -> None:
+    for key in (
+        "last_detection_signature",
+        "last_run_summary",
+        "base_result",
+        "base_image_raw",
+        "base_image_norm",
+        "edited_coords",
+        "edited_intensities",
+        "auto_coords",
+        "auto_intensities",
+        "roi_mask",
+        "refinement_info",
+        "lattice_info",
+    ):
+        st.session_state[key] = None
+    st.session_state.canvas_nonce = 0
+    _invalidate_atom_strain_state()
+
+
 def _coords_inside_roi_mask(coords: np.ndarray, roi_mask: np.ndarray | None) -> np.ndarray | None:
     if roi_mask is None or len(coords) == 0:
         return None
@@ -2418,7 +2425,7 @@ def _resize_mask_to_raw(mask_disp: np.ndarray, raw_shape: tuple[int, int]) -> np
 
 for key, default in [
     ("uploaded_sig", None),
-    ("uploaded_temp_path", None),
+    ("uploaded_temp", None),
     ("last_detection_signature", None),
     ("base_result", None),
     ("base_image_raw", None),
@@ -2469,29 +2476,29 @@ uploaded = st.file_uploader("Upload TEM image", type=["dm", "dm3", "dm4", "tif",
 manual_run = st.button("Run Detection", type="primary", disabled=uploaded is None)
 
 if uploaded is None:
+    if st.session_state.uploaded_temp is not None:
+        st.session_state.uploaded_temp.close()
+        st.session_state.uploaded_temp = None
+        st.session_state.uploaded_sig = None
+        _clear_uploaded_image_state()
     st.info("Upload a TEM image to begin.")
     st.stop()
 
-current_file_sig = f"{uploaded.name}:{uploaded.size}"
+current_file_sig = upload_signature(uploaded.name, uploaded.getbuffer())
 if st.session_state.uploaded_sig != current_file_sig:
+    try:
+        new_upload = TemporaryUpload(uploaded.name, uploaded.getbuffer())
+    except (OSError, ValueError) as exc:
+        st.error(f"Upload failed: {exc}")
+        st.stop()
+    previous_upload = st.session_state.uploaded_temp
+    st.session_state.uploaded_temp = new_upload
     st.session_state.uploaded_sig = current_file_sig
-    st.session_state.uploaded_temp_path = _save_upload_to_temp(uploaded)
-    st.session_state.last_detection_signature = None
-    st.session_state.base_result = None
-    st.session_state.base_image_raw = None
-    st.session_state.base_image_norm = None
-    st.session_state.edited_coords = None
-    st.session_state.edited_intensities = None
-    st.session_state.auto_coords = None
-    st.session_state.auto_intensities = None
-    st.session_state.roi_mask = None
-    st.session_state.canvas_nonce = 0
-    st.session_state.refinement_info = None
-    st.session_state.lattice_info = None
-    _invalidate_atom_strain_state()
-    auto_nm, auto_source, auto_messages = _cached_infer_pixel_size_nm(
-        st.session_state.uploaded_temp_path,
-        file_size=uploaded.size,
+    if previous_upload is not None:
+        previous_upload.close()
+    _clear_uploaded_image_state()
+    auto_nm, auto_source, auto_messages = _infer_pixel_size_nm(
+        str(st.session_state.uploaded_temp.path),
     )
     st.session_state.pixel_size_auto_nm = auto_nm
     st.session_state.pixel_size_auto_source = auto_source
@@ -3199,15 +3206,13 @@ need_rerun = st.session_state.last_detection_signature != sig
 should_run = manual_run or (auto_run and need_rerun)
 
 if should_run:
-    overlay_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    overlay_temp.close()
     with st.spinner("Running detection + refinement..."):
         try:
-            base_raw, source_info, load_warnings = _cached_load_image(
-                st.session_state.uploaded_temp_path,
+            base_raw, source_info, load_warnings = _load_uploaded_image(
+                str(st.session_state.uploaded_temp.path),
                 slice_index=params["slice_index"],
-                file_size=uploaded.size,
             )
+            source_info = {**source_info, "path": Path(uploaded.name).name}
             result = detect_atoms(
                 image=base_raw,
                 mode=params["mode"],
@@ -3216,7 +3221,7 @@ if should_run:
                 threshold_rel=params["threshold_rel"],
                 max_atoms=params["max_atoms"],
                 slice_index=params["slice_index"],
-                overlay_path=overlay_temp.name,
+                overlay_path=None,
             )
             # Restore file provenance when detect_atoms is fed with ndarray.
             result.provenance["source"] = source_info
