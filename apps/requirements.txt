@@ -1,0 +1,6 @@
+# Streamlit Community Cloud runs from the repository root.
+-e .[ui]
+streamlit==1.57.0
+streamlit-drawable-canvas==0.9.3
+altair
+pandas
