@@ -82,3 +82,54 @@ jobs:
 
       - name: Run IO tests
         run: python -m pytest -o addopts="-q" tests/test_io.py
+
+  test-streamlit-deployment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MPLBACKEND: Agg
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up deployment Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            apps/requirements.txt
+
+      - name: Install the deployment requirements
+        run: |
+          python -m pip install -r apps/requirements.txt pytest wheel
+          python -m pip check
+          python - <<'PY'
+          import sys
+          from importlib.metadata import version
+
+          assert sys.version_info[:2] == (3, 12), sys.version
+          assert version("streamlit") == "1.57.0"
+          assert version("streamlit-drawable-canvas") == "0.9.3"
+          PY
+
+      - name: Run upload and app integration tests without the default smoke filter
+        run: >-
+          python -m pytest -o addopts="-q"
+          tests/test_upload_lifecycle.py tests/test_atom_detection.py tests/test_streamlit_deployment.py
+          -k "not installed_wheel"
+
+      - name: Replace the editable package with its deployment wheel
+        run: |
+          python -m pip wheel --no-deps --wheel-dir "$RUNNER_TEMP/autotem-wheel" .
+          python -m pip uninstall -y autotem-insight
+          python -m pip install --no-deps "$RUNNER_TEMP"/autotem-wheel/autotem_insight-*.whl
+          python -m pip check
+
+      - name: Start the original entrypoint outside the repository using the installed wheel
+        env:
+          AUTOTEM_DEPLOYMENT_WHEEL: "1"
+        run: >-
+          python -m pytest -o addopts="-q"
+          tests/test_streamlit_deployment.py -k installed_wheel

@@ -16,7 +16,6 @@ from PIL import Image, ImageDraw
 from scipy import ndimage as ndi
 from streamlit_drawable_canvas import st_canvas
 
-from apps.upload_lifecycle import TemporaryUpload, upload_signature
 from autotem.atomic.atom_detection import _load_image, _normalize_image, detect_atoms
 from autotem.atomic.displacement import (
     AtomicDisplacementResult,
@@ -48,6 +47,7 @@ from autotem.atomic.sublattice import (
 )
 from autotem.io import load_tem_dataset
 from autotem.io.metadata import normalize_metadata
+from autotem.io.upload_lifecycle import TemporaryUpload, upload_signature
 from autotem.strain.atom_strain import AtomStrainFieldResult, compute_atom_strain_fields
 
 # Compatibility patch:

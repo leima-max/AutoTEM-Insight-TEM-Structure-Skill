@@ -2,7 +2,9 @@ from pathlib import Path
 
 import pytest
 
-from apps.upload_lifecycle import TemporaryUpload, upload_signature
+from autotem.io.upload_lifecycle import TemporaryUpload, upload_signature
+
+pytestmark = pytest.mark.smoke
 
 
 def test_upload_signature_distinguishes_same_name_and_size() -> None:
