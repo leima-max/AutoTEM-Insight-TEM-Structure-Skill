@@ -59,6 +59,7 @@ def compute_gvectors_and_dspacing(
     diffraction_scale_uncertainty: float | None,
     diffraction_scale_source: str,
     center_uncertainty_px: float | None = None,
+    include_d_spacings: bool = True,
 ) -> ReciprocalMetricsResult:
     """Compute reciprocal vectors and d-spacing values for detected peaks."""
     warnings: list[str] = []
@@ -189,7 +190,7 @@ def compute_gvectors_and_dspacing(
             )
         )
 
-        if g_mag <= 1e-12:
+        if not include_d_spacings or g_mag <= 1e-12:
             d_by_peak.append(None)
             continue
         d_value = 1.0 / g_mag

@@ -1,0 +1,22 @@
+schema_version: '1.0.0'
+profile_id: atomic-strain
+version: '1.0.0'
+software_role: Raw-refined atomic measurements and reference-dependent strain diagnostics
+supported_modalities: [HRTEM, HAADF-STEM, ABF-STEM, STEM]
+execution_mode: sequential
+native_installation_verified: false
+inputs: [dataset, raw, calibration, diffraction, atom_candidates, reference_inputs]
+outputs: [atoms, refined_atoms, atom_distances, atomic_intensity, gpa, atom_strain, warnings, human_input_request]
+allowed_operations: [atomic.detect, atomic.refine, atomic.distances, atomic.regularize, atomic.displacement, atomic.spacing.indexed, atomic.spacing.basis, atomic.spacing.lattice_angle, atomic.spacing.angle, atomic.spacing.picked, atomic.sublattice.auto, atomic.sublattice.model, atomic.sublattice.manual, atomic.intensity, atomic.intensity_groups, strain.gpa, strain.gpa_compare, strain.atom]
+budgets: {max_steps: 24, max_retries: 1, operation_seconds: 120, run_seconds: 900}
+workflow:
+  - Check modality/contrast and sampling; detect candidates with traditional LoG/DoG.
+  - Refine on raw, preserving candidate versus refined coordinates and fitting limitations.
+  - Calculate requested distances/relative intensity/sublattice or displacement using explicit units and priors.
+  - Run GPA/atom strain only with reliable g pair/reference; preserve valid masks and diagnostic limits.
+human_input_conditions: [missing_pixel_scale, unreliable_g_pair, missing_reference_roi, missing_basis_or_model, unresolved_contrast_semantics]
+failure_policy:
+  missing_reference: Return needs_input and the missing raw-coordinate reference fields.
+  low_quality: Return candidate/diagnostic status and warnings rather than claiming quantitative readiness.
+prohibited: [denoised_coordinates_as_raw_measurement, hidden_invalid_mask, unsupported_dl_success, relative_intensity_as_composition, inferred_gt_accuracy]
+return_contract: references/tool-contracts.md

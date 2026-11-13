@@ -1,0 +1,1383 @@
+"""Verify private host captures against the installed release and actual Harness evidence."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import re
+import sqlite3
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+MATRIX = json.loads(Path(__file__).with_name("matrix.json").read_text("utf-8"))
+HOSTS = tuple(MATRIX["hosts"])
+VARIANTS = MATRIX["cases"]
+CASES = tuple(VARIANTS)
+TOOLS = {
+    "list_capabilities",
+    "inspect_input",
+    "validate_plan",
+    "submit_analysis",
+    "get_run_status",
+    "cancel_run",
+    "list_artifacts",
+    "read_artifact",
+    "export_report",
+}
+DOMAINS = {"data-quality", "diffraction", "atomic-strain"}
+OPERATIONS = {
+    "J01": {
+        "input.load",
+        "calibration.resolve",
+        "diffraction.fft",
+        "diffraction.metrics",
+        "diffraction.index",
+    },
+    "J02": {"atomic.detect", "atomic.refine", "atomic.distances", "atomic.intensity"},
+    "J03": {"strain.gpa"},
+    "J04": {"atomic.refine", "strain.atom"},
+    "J05": {"diffraction.pattern", "diffraction.metrics"},
+    "J06": {"calibration.resolve"},
+    "J07": {"input.load"},
+    "J15": {"simulation.diffraction"},
+}
+ROLES = {
+    "J01": {"diffraction"},
+    "J02": {"refined_atoms", "atom_distances", "atomic_intensity"},
+    "J03": {
+        "gpa",
+        "gpa.quality_mask",
+        "gpa.strain_xx",
+        "gpa.strain_yy",
+        "gpa.strain_xy",
+        "gpa.displacement_x",
+        "gpa.displacement_y",
+        "gpa.rotation_xy",
+        "gpa.uncertainty",
+    },
+    "J04": {
+        "atom_strain",
+        "atom_strain.valid_atom_mask",
+        "atom_strain.atom_strain_xx",
+        "atom_strain.atom_strain_yy",
+        "atom_strain.atom_strain_xy",
+    },
+    "J05": {"diffraction", "reciprocal_image", "raw"},
+    "J06": {"calibration"},
+    "J07": {"raw"},
+    "J15": {"simulation"},
+}
+
+
+class EvidenceError(ValueError):
+    """An explicit contradiction or integrity failure."""
+
+
+class NotEvaluated(EvidenceError):
+    """A required observation has not been captured."""
+
+
+def require(condition, message):
+    if not condition:
+        raise EvidenceError(message)
+
+
+def observed(condition, message):
+    if not condition:
+        raise NotEvaluated(message)
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def text_digest(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def unique_json(value):
+    def obj(pairs):
+        result = {}
+        for key, item in pairs:
+            require(key not in result, "duplicate_json_key")
+            result[key] = item
+        return result
+
+    def nonfinite(_):
+        raise EvidenceError("nonfinite_json_number")
+
+    return json.loads(value, object_pairs_hook=obj, parse_constant=nonfinite)
+
+
+def stamp(value):
+    # PowerShell DateTimeOffset "o" contains seven fractional digits. CPython
+    # 3.10 accepts only three/six here; use microseconds for the DB time window.
+    value = re.sub(
+        r"(?<=\d)\.(\d{1,9})(?=Z$|[+-]\d\d:\d\d$)", lambda m: "." + m[1].ljust(6, "0")[:6], value
+    )
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    require(parsed.tzinfo is not None, "capture_time_requires_offset")
+    return parsed.timestamp()
+
+
+def capture_file(base, name):
+    observed(isinstance(name, str) and name, "missing_capture_reference")
+    path = (base / name).resolve()
+    require(
+        not Path(name).is_absolute() and path.is_relative_to(base), "capture_path_outside_directory"
+    )
+    observed(path.is_file() and path.stat().st_size > 0, "capture_file_missing_or_empty")
+    return path
+
+
+def envelope(tool, payload):
+    if isinstance(payload, dict) and payload.get("tool") == tool:
+        result = payload
+    else:
+        payload = payload or {}
+        result = payload.get("structuredContent") or payload.get("structured_content")
+        if result is None:
+            contents = [c for c in payload.get("content", []) if c.get("type") == "text"]
+            observed(len(contents) == 1, "actual_harness_response_not_visible")
+            result = unique_json(contents[0]["text"])
+    require(
+        isinstance(result, dict)
+        and result.get("tool") == tool
+        and result.get("schema_version") == "1.0.0"
+        and type(result.get("ok")) is bool,
+        "tool_envelope_mismatch",
+    )
+    require(
+        (result["ok"] and result.get("error") is None and result.get("result") is not None)
+        or (not result["ok"] and isinstance(result.get("error"), dict)),
+        "tool_envelope_inconsistent",
+    )
+    return result
+
+
+def read_turn(base, turn, host, capture_format, server):
+    prompt_file = capture_file(base, turn.get("prompt"))
+    trace_file = capture_file(base, turn.get("trace"))
+    prompt = prompt_file.read_text("utf-8-sig").strip()
+    observed(prompt, "missing_user_input")
+    calls, messages, attachments, sessions, delegation_events = [], [], [], [], []
+    skill_opened = False
+    if capture_format == "codex-exec-jsonl":
+        require(host == "codex", "capture_format_host_mismatch")
+        started = ended = 0
+        with trace_file.open(encoding="utf-8-sig") as stream:
+            for line_no, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                event = unique_json(line)
+                kind = event.get("type")
+                if kind == "thread.started":
+                    sessions.append(event["thread_id"])
+                elif kind == "turn.started":
+                    started += 1
+                elif kind == "turn.completed":
+                    ended += 1
+                elif kind == "turn.failed":
+                    raise NotEvaluated("host_turn_failed")
+                elif kind == "item.completed":
+                    item = event["item"]
+                    if item["type"] == "agent_message":
+                        messages.append((line_no, item["text"]))
+                    if item["type"] == "command_execution" and item.get("exit_code") == 0:
+                        command = item.get("command", "").replace("\\", "/").lower()
+                        output = item.get("aggregated_output", "")
+                        if (
+                            re.search(r"\b(get-content|cat|type|more)\s", command)
+                            and "autotem/skill.md" in command
+                        ) and re.search(r"(?im)^name:\s*autotem\s*$", output):
+                            skill_opened = True
+                    if item["type"] in {"collab_tool_call", "collab_agent_tool_call"}:
+                        delegation_events.append(json.dumps(item, ensure_ascii=False))
+                    if item["type"] == "mcp_tool_call" and item.get("server") == server:
+                        tool = item["tool"]
+                        require(tool in TOOLS, "unexpected_tool_in_autotem_namespace")
+                        observed(
+                            item.get("status") == "completed" and item.get("result"),
+                            "host_did_not_receive_tool_result",
+                        )
+                        calls.append(
+                            {
+                                "tool": tool,
+                                "arguments": item["arguments"],
+                                "response": envelope(tool, item["result"]),
+                                "line": line_no,
+                            }
+                        )
+        observed(started == ended == 1 and len(sessions) == 1, "incomplete_host_turn")
+    else:
+        require(capture_format == "observed-host-export", "unsupported_capture_format")
+        raw = unique_json(trace_file.read_text("utf-8-sig"))
+        require(raw["host"] == host, "manual_observation_host_mismatch")
+        sessions.append(raw["session_id"])
+        for delegation in raw.get("delegation_events", []):
+            attachments.append(digest(capture_file(base, delegation["original_evidence"])))
+            delegation_events.append(json.dumps(delegation, ensure_ascii=False))
+        for i, item in enumerate(raw["calls"]):
+            if item["server"] != server:
+                continue
+            tool = item["tool"]
+            require(tool in TOOLS, "unexpected_tool_in_autotem_namespace")
+            attachments.append(digest(capture_file(base, item["original_evidence"])))
+            calls.append(
+                {
+                    "tool": tool,
+                    "arguments": item["arguments"],
+                    "response": envelope(tool, item["response"]),
+                    "line": i + 1,
+                }
+            )
+        attachments.append(digest(capture_file(base, raw["answer_evidence"])))
+        messages.append((len(calls) + 1, raw["answer"]))
+    require(all(isinstance(x, str) and x for x in sessions), "invalid_host_session")
+    observed(messages and messages[-1][1].strip(), "missing_host_answer")
+    observed(not calls or messages[-1][0] > calls[-1]["line"], "missing_answer_after_tool_return")
+    return {
+        "session": sessions[0],
+        "calls": calls,
+        "answer": messages[-1][1],
+        "prompt": prompt,
+        "prompt_sha256": digest(prompt_file),
+        "trace_sha256": digest(trace_file),
+        "attachments": attachments,
+        "delegation_events": delegation_events,
+        "skill_opened": skill_opened,
+    }
+
+
+def run_evidence(root, run_id, window, runtime):
+    require(isinstance(run_id, str) and re.fullmatch(r"[0-9a-f]{32}", run_id), "invalid_run_id")
+    dbpath = root / "harness.sqlite3"
+    observed(dbpath.is_file(), "harness_database_missing")
+    db = sqlite3.connect(dbpath.as_uri() + "?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        db.execute("PRAGMA query_only=ON")
+        db.execute("BEGIN")
+        run = db.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        require(
+            run and window[0] - 1 <= run["created"] <= window[1] + 1, "run_outside_host_capture"
+        )
+        rows = db.execute(
+            "SELECT * FROM artifacts WHERE run_id=? AND committed=1", (run_id,)
+        ).fetchall()
+        steps = db.execute(
+            "SELECT step_id,operation_id,status,result,error FROM steps "
+            "WHERE run_id=? ORDER BY rowid",
+            (run_id,),
+        ).fetchall()
+        bindings = [
+            unique_json(r[0])
+            for r in db.execute(
+                "SELECT payload FROM events WHERE run_id=? AND kind='runtime_bound' "
+                "ORDER BY event_id",
+                (run_id,),
+            )
+        ]
+        jobs = [
+            dict(r) for r in db.execute("SELECT job_id,status FROM jobs WHERE run_id=?", (run_id,))
+        ]
+        replies = [
+            dict(r)
+            for r in db.execute(
+                "SELECT parent_run_id,child_run_id,request_id,response,validation "
+                "FROM input_responses WHERE child_run_id=?",
+                (run_id,),
+            )
+        ]
+        questions = {
+            r[0]: [f["name"] for f in unique_json(r[1])]
+            for r in db.execute(
+                "SELECT request_id,fields FROM input_requests WHERE run_id=?", (run_id,)
+            )
+        }
+        question_evidence = {
+            r[0]: unique_json(r[1])
+            for r in db.execute(
+                "SELECT request_id,evidence_artifact_ids FROM input_requests WHERE run_id=?",
+                (run_id,),
+            )
+        }
+        all_children = [
+            r[0] for r in db.execute("SELECT run_id FROM runs WHERE parent_run_id=?", (run_id,))
+        ]
+    finally:
+        db.close()
+    request = unique_json(run["request"])
+    directory = (root / "runs" / run_id).resolve()
+    require(directory.is_relative_to(root), "invalid_run_directory")
+    if request["input_mode"] == "snapshot":
+        raw = Path(run["input_path"]).resolve()
+        require(raw.is_relative_to(directory / "raw"), "snapshot_outside_run")
+    else:
+        raw = Path(request["input_path"]).resolve()
+        require(raw == Path(run["input_path"]).resolve(), "reference_source_mismatch")
+    require(raw.is_file() and digest(raw) == run["source_hash"], "raw_hash_mismatch")
+    artifacts = {}
+    scientific_files = {}
+    package_hashes = None
+    environment = None
+    physical_measurements = []
+    modality = request.get("modality", "unknown")
+    successful = {s["step_id"]: s["operation_id"] for s in steps if s["status"] == "completed"}
+    for row in rows:
+        path = Path(row["path"]).resolve()
+        require(
+            path.is_relative_to(directory / "artifacts") and path.is_file(),
+            "invalid_registered_path",
+        )
+        require(
+            path.stat().st_size == row["size"] and digest(path) == row["sha256"],
+            "artifact_hash_mismatch",
+        )
+        meta = unique_json(row["metadata"])
+        if row["kind"] == "array":
+            import numpy as np
+
+            array = np.load(path, mmap_mode="r", allow_pickle=False)
+            require(
+                list(array.shape) == meta["shape"] and str(array.dtype) == meta["dtype"],
+                "registered_array_shape_or_dtype_changed",
+            )
+            del array
+        if row["step_id"] in successful:
+            scientific_files[(row["step_id"], row["role"])] = path
+        artifacts[row["artifact_id"]] = {
+            "role": row["role"],
+            "step_id": row["step_id"],
+            "kind": row["kind"],
+            "file": path.relative_to(directory).as_posix(),
+            "sha256": row["sha256"],
+            "size": row["size"],
+            "execution_usable": row["step_id"] in successful,
+            **{
+                k: meta[k]
+                for k in (
+                    "shape",
+                    "dtype",
+                    "unit",
+                    "distance_unit",
+                    "coordinate_unit",
+                    "coordinate_convention",
+                    "coordinates_sha256",
+                    "array_sha256",
+                    "image_role",
+                    "validity_sha256",
+                    "scientific_level",
+                )
+                if k in meta
+            },
+        }
+        if row["role"] == "implementation_fingerprints":
+            package_hashes = unique_json(path.read_text("utf-8"))
+        if row["role"] == "environment":
+            environment = unique_json(path.read_text("utf-8"))
+        if row["role"] == "dataset" and row["step_id"] in successful:
+            modality = unique_json(path.read_text("utf-8"))["modality"]
+        if successful.get(row["step_id"]) in {"diffraction.metrics", "atomic.distances"}:
+            if row["role"] in {"diffraction", "atom_distances"}:
+                measurement = unique_json(path.read_text("utf-8"))
+                units = positive_distance_units(row["role"], measurement)
+                if units:
+                    physical_measurements.append(
+                        {"artifact_id": row["artifact_id"], "units": units}
+                    )
+    if runtime is not None:
+        observed(bindings, "missing_managed_job_runtime_binding")
+        require(
+            {b["job_id"] for b in bindings} == {j["job_id"] for j in jobs}
+            and all(
+                b["runtime_id"] == Path(sys.prefix).name
+                and b["package_version"] == runtime["autotem_version"]
+                for b in bindings
+            ),
+            "job_runtime_mismatch",
+        )
+        require(isinstance(package_hashes, dict) and environment, "missing_runtime_provenance")
+        import autotem
+
+        package = Path(autotem.__file__).resolve().parent
+        expected = {f.relative_to(package).as_posix(): digest(f) for f in package.rglob("*.py")}
+        require(expected == package_hashes, "run_source_differs_from_release")
+        require(environment["python"].split()[0] == runtime["python"], "run_python_mismatch")
+        require(
+            all(
+                Path(op["source"]).resolve().is_relative_to(package)
+                and digest(Path(op["source"])) == op["source_sha256"]
+                for op in environment["operations"]
+            ),
+            "handler_origin_mismatch",
+        )
+    science = []
+    for step_id, op in successful.items():
+        if op in {"strain.gpa", "strain.atom"}:
+            science.append(check_strain_fields(scientific_files, step_id, op))
+        if op == "simulation.diffraction":
+            simulation = unique_json(scientific_files[(step_id, "simulation")].read_text("utf-8"))
+            require(
+                simulation["patterns"] and all(p["spots"] for p in simulation["patterns"]),
+                "empty_simulated_patterns",
+            )
+    return {
+        "run_id": run_id,
+        "parent_run_id": run["parent_run_id"],
+        "status": run["status"],
+        "error_code": unique_json(run["error"] or "{}").get("code"),
+        "job_id": run["job_id"],
+        "jobs": jobs,
+        "source_sha256": run["source_hash"],
+        "steps": [
+            {
+                **{key: s[key] for key in ("step_id", "operation_id", "status")},
+                "warnings_sha256": [
+                    text_digest(w) for w in unique_json(s["result"] or "{}").get("warnings", [])
+                ],
+                "consumed_artifacts": unique_json(s["result"] or "{}").get(
+                    "consumed_artifacts", {}
+                ),
+                "error_code": unique_json(s["error"] or "{}").get("code"),
+            }
+            for s in steps
+        ],
+        "operations": {s["id"]: s["operation_version"] for s in request["steps"]},
+        "budgets": request["budgets"],
+        "parameter_diff_present": bool(run["parameter_diff"]),
+        "artifacts": artifacts,
+        "bindings": bindings,
+        "modality": modality,
+        "physical_measurements": physical_measurements,
+        "strain_validity": science,
+        "_replies": replies,
+        "requested_fields": questions,
+        "question_evidence": question_evidence,
+        "_children": all_children,
+        "_request": request,
+    }
+
+
+def check_strain_fields(files, step_id, operation):
+    import numpy as np
+
+    prefix = "gpa" if operation == "strain.gpa" else "atom_strain"
+    source = unique_json(files[(step_id, prefix)].read_text("utf-8"))
+
+    def array(field):
+        return np.load(files[(step_id, f"{prefix}.{field}")], mmap_mode="r", allow_pickle=False)
+
+    if prefix == "gpa":
+        mask = array("quality_mask")
+        fields = (
+            "displacement_x",
+            "displacement_y",
+            "strain_xx",
+            "strain_yy",
+            "strain_xy",
+            "rotation_xy",
+            "uncertainty",
+        )
+        require(
+            source["provenance"].get("complete_arrays") is True,
+            "strain_fields_not_declared_complete",
+        )
+        references = source["provenance"].get("reference_regions", {})
+        regions = list(references.values()) if references else [source.get("reference_region")]
+        if not source["provenance"].get("absolute_reference_accepted"):
+            require(
+                regions
+                and all(
+                    r and len(r) == 4 and mask[r[0] : r[1], r[2] : r[3]].sum() >= 9 for r in regions
+                ),
+                "gpa_reference_without_valid_pixels",
+            )
+    else:
+        mask = array("valid_atom_mask")
+        fields = ("atom_strain_xx", "atom_strain_yy", "atom_strain_xy")
+        require(
+            source["provenance"].get("map_semantics", "").startswith("display_interpolation")
+            and source["provenance"].get("reference_atom_count", 0) >= 3,
+            "missing_atomic_strain_reference_or_display_limits",
+        )
+    require(mask.dtype == np.bool_ and mask.any(), "strain_validity_mask_empty")
+    for name in fields:
+        values = array(name)
+        require(
+            values.shape == mask.shape and np.isfinite(values[mask]).all(),
+            "invalid_strain_field_in_valid_region",
+        )
+    return {
+        "step_id": step_id,
+        "valid_count": int(mask.sum()),
+        "total_count": mask.size,
+        "scientific_level": "diagnostic",
+    }
+
+
+def positive_distance_units(role, result):
+    """Check real physical units and values inside the registered result itself."""
+    physical_units = {"nm", "pm", "Å", "angstrom", "um", "µm"}
+    if role == "diffraction":
+        values = [(m["value"], m["unit"]) for m in result["d_spacings"]]
+        if result.get("provenance", {}).get("physical") is not True:
+            return []
+    else:
+        values = [(v, result["unit"]) for v in result["nearest_distances"]]
+    return sorted(
+        {
+            unit
+            for value, unit in values
+            if unit in physical_units
+            and type(value) in {int, float}
+            and math.isfinite(value)
+            and value > 0
+        }
+    )
+
+
+def check_case(case, calls, runs, turns, excerpts, variant=None):
+    completed = [r for r in runs.values() if r["status"] == "completed"]
+    if variant is not None:
+        require(variant in VARIANTS.get(case, set()), "unknown_case_variant")
+    if case in OPERATIONS and not (case == "J15" and variant not in {None, "executed"}):
+        candidates = [
+            r
+            for r in completed
+            if OPERATIONS[case]
+            <= {s["operation_id"] for s in r["steps"] if s["status"] == "completed"}
+            and ROLES[case] <= {a["role"] for a in r["artifacts"].values() if a["execution_usable"]}
+        ]
+        require(candidates, "requested_operations_or_results_missing")
+        modalities = {"J01": {"HRTEM"}, "J02": {"HAADF-STEM"}, "J05": {"SAED", "NBED"}}
+        if case in modalities:
+            require(
+                any(r["modality"] in modalities[case] for r in candidates),
+                "requested_modality_not_observed",
+            )
+        if case in {"J01", "J05"}:
+            require(any(r["physical_measurements"] for r in candidates), "physical_spacing_missing")
+        if case == "J05":
+            if variant:
+                require(
+                    any(r["modality"].lower() == variant for r in candidates),
+                    "direct_pattern_modality_mismatch",
+                )
+            require(
+                all(
+                    "diffraction.fft" not in {s["operation_id"] for s in r["steps"]}
+                    for r in candidates
+                ),
+                "direct_pattern_was_transformed",
+            )
+    codes = {c["response"]["error"]["code"] for c in calls if not c["response"]["ok"]}
+    failed_codes = codes | {r["error_code"] for r in runs.values() if r["error_code"]}
+    if case == "J08":
+        field_names = {"g_vectors", "reference_region", "reference_atom_indices", "base_index"}
+        parents = [
+            r
+            for r in runs.values()
+            if r["status"] == "needs_input"
+            and any(set(names) & field_names for names in r["requested_fields"].values())
+        ]
+        require(parents, "missing_reference_request")
+        shown = {
+            a["artifact_id"]
+            for c in calls
+            if c["response"]["ok"]
+            for a in (
+                c["response"]["result"]
+                if c["tool"] == "list_artifacts"
+                else [c["response"]["result"]["artifact"]]
+                if c["tool"] == "read_artifact"
+                else c["response"]["result"]["artifacts"]
+                if c["tool"] == "inspect_input"
+                else []
+            )
+        }
+        # Asking from a numbered graphic, peak/coordinate table or original-frame preview
+        # must leave an artifact the host actually received from the parent.
+        require(
+            any(
+                i in shown and r["artifacts"][i]["kind"] in {"image", "table"}
+                for r in parents
+                for ids in r["question_evidence"].values()
+                for i in ids
+            ),
+            "reference_evidence_not_returned_to_host",
+        )
+        if variant in {"unanswered", "invalid_reply"}:
+            require(all(not r["_children"] for r in parents), "reply_started_unexpected_child")
+            if variant == "unanswered":
+                require(
+                    len(turns) == 1
+                    and sum(
+                        c["tool"] in {"inspect_input", "submit_analysis"} and c["response"]["ok"]
+                        for c in calls
+                    )
+                    <= 2,
+                    "repeated_unanswered_submission",
+                )
+            else:
+                observed(len(turns) >= 2, "missing_actual_followup_user_turn")
+                require(
+                    any(
+                        c["tool"] in {"validate_plan", "submit_analysis"}
+                        and not c["response"]["ok"]
+                        and c["response"]["error"]["code"]
+                        in {
+                            "INVALID_INPUT_RESPONSE",
+                            "CROSS_RUN_ARTIFACT",
+                            "INPUT_REQUEST_PARENT_MISMATCH",
+                            "INVALID_PARAMETERS",
+                            "CREDENTIAL_PARAMETER_FORBIDDEN",
+                        }
+                        for t in turns[1:]
+                        for c in t["calls"]
+                    ),
+                    "missing_rejected_reply",
+                )
+            return
+    if case in {"J11", "J15"} and variant in {
+        "invalid_file",
+        "missing_dependency",
+        "broken_dependency",
+        "numerical_failure",
+        "timeout",
+    }:
+        expected = {
+            "invalid_file": {"INVALID_INPUT", "INPUT_NOT_FOUND", "UNSUPPORTED_INPUT"},
+            "missing_dependency": {
+                "BACKEND_UNAVAILABLE",
+                "MISSING_DEPENDENCY",
+                "DEPENDENCY_UNAVAILABLE",
+            },
+            "broken_dependency": {
+                "BACKEND_IMPORT_FAILED",
+                "DEPENDENCY_BROKEN",
+                "BROKEN_DEPENDENCY",
+            },
+            "numerical_failure": {"NUMERICAL_FAILURE", "INVALID_METRICS"},
+            "timeout": {"TIMEOUT", "SIMULATION_TIMEOUT"},
+        }[variant]
+        require(failed_codes & expected, "fault_variant_not_observed")
+        return
+    if case in {"J06", "J07", "J08", "J09"}:
+        observed(len(turns) >= 2, "missing_actual_followup_user_turn")
+        parents = {
+            c["response"]["result"]["run_id"]
+            for c in turns[0]["calls"]
+            if c["response"]["ok"]
+            and isinstance(c["response"]["result"], dict)
+            and c["response"]["result"].get("status")
+            == ("completed" if case == "J09" else "needs_input")
+        }
+        children = [r for r in completed if r["parent_run_id"] in parents]
+        require(children, "missing_completed_child_of_observed_parent")
+        for child in children:
+            require(
+                child["source_sha256"] == runs[child["parent_run_id"]]["source_sha256"]
+                and child["parameter_diff_present"],
+                "child_source_or_diff_mismatch",
+            )
+            if case == "J09":
+                parent = runs[child["parent_run_id"]]
+                first = turns[0]["calls"]
+                before = [
+                    a
+                    for c in first
+                    if c["tool"] == "list_artifacts"
+                    and c["response"]["ok"]
+                    and c["arguments"]["run_id"] == parent["run_id"]
+                    for a in c["response"]["result"]
+                ]
+                before_hashes = [
+                    e["payload"]["source_hash"]
+                    for c in first
+                    if c["response"]["ok"]
+                    and isinstance(c["response"]["result"], dict)
+                    and c["response"]["result"].get("run_id") == parent["run_id"]
+                    for e in c["response"]["result"].get("events", [])
+                    if e["kind"] == "submitted"
+                ]
+                observed(before and before_hashes, "parent_pre_revision_evidence_missing")
+                require(
+                    set(before_hashes) == {parent["source_sha256"]}
+                    and all(
+                        a["artifact_id"] in parent["artifacts"]
+                        and a["sha256"] == parent["artifacts"][a["artifact_id"]]["sha256"]
+                        for a in before
+                    ),
+                    "pre_revision_artifact_changed",
+                )
+            if case == "J09" and variant:
+                require(
+                    child["_request"]["input_mode"] == variant
+                    and runs[child["parent_run_id"]]["_request"]["input_mode"] == variant,
+                    "revision_input_mode_mismatch",
+                )
+        if case != "J09":
+            later = [
+                c
+                for t in turns[1:]
+                for c in t["calls"]
+                if c["tool"] == "submit_analysis" and c["response"]["ok"]
+            ]
+            matched = False
+            for child in children:
+                for row in child["_replies"]:
+                    reply = unique_json(row["response"])
+                    asked = set(
+                        runs[child["parent_run_id"]]["requested_fields"].get(row["request_id"], [])
+                    )
+                    expected = {
+                        "J06": {
+                            "pixel_size_nm",
+                            "diffraction_scale_inv_nm_per_px",
+                            "physical_calibration",
+                        },
+                        "J07": {
+                            "frame",
+                            "selection_indices",
+                            "dataset_path",
+                            "dataset_index",
+                            "channel",
+                        },
+                        "J08": {
+                            "g_vectors",
+                            "reference_region",
+                            "reference_atom_indices",
+                            "base_index",
+                        },
+                    }[case]
+                    if not asked & expected:
+                        continue
+                    if (
+                        case == "J07"
+                        and variant
+                        and not asked
+                        & {
+                            "dataset": {"dataset_index", "dataset_path"},
+                            "frame": {"frame", "selection_indices"},
+                            "channel": {"channel"},
+                        }[variant]
+                    ):
+                        continue
+                    if any(
+                        c["response"]["result"].get("run_id") == child["run_id"]
+                        and c["arguments"]["plan"]["user_input"]["response"]["request_id"]
+                        == row["request_id"]
+                        for c in later
+                    ):
+                        if reply.get("raw_reply"):
+                            require(
+                                any(reply["raw_reply"] in t["prompt"] for t in turns[1:]),
+                                "stored_reply_not_from_followup",
+                            )
+                        else:
+                            excerpt = excerpts.get(row["request_id"], {})
+                            observed(
+                                excerpt.get("quote")
+                                and any(excerpt["quote"] in t["prompt"] for t in turns[1:])
+                                and excerpt.get("answers") == reply["answers"],
+                                "unverified_followup_excerpt",
+                            )
+                        if case == "J06":
+                            require(
+                                child["physical_measurements"],
+                                "no_child_physical_measurement",
+                            )
+                        if case == "J07":
+                            used = [
+                                s["consumed_artifacts"]["raw"]
+                                for s in child["steps"]
+                                if "raw" in s["consumed_artifacts"]
+                            ]
+                            require(
+                                len(used) >= 2
+                                and len(set(used)) == 1
+                                and child["artifacts"][used[0]]["role"] == "raw",
+                                "no_shared_selected_raw_evidence",
+                            )
+                        matched = True
+            require(matched, "missing_recorded_user_response")
+    if case == "J10":
+        require("DEFERRED_THIS_PHASE" in codes, "missing_reserved_operation_refusal")
+        answer = turns[-1]["answer"]
+        observed(
+            re.search(
+                r"deferred|reserved|not (?:yet )?(?:available|implemented)"
+                r"|延期|未实现|预留|暂不支持",
+                answer,
+                re.I,
+            ),
+            "reserved_limit_not_visible_in_answer",
+        )
+        observed(
+            re.search(r"FFT|GPA|diffraction|atomic|traditional|衍射|原子|传统", answer, re.I),
+            "available_alternative_not_visible_in_answer",
+        )
+    if case == "J11":
+        require(
+            codes
+            or any(r["status"] in {"timed_out", "failed", "interrupted"} for r in runs.values()),
+            "missing_fault_evidence",
+        )
+    if case == "J12":
+        if variant == "interrupted":
+            require(
+                any(
+                    r["status"] == "interrupted" and r["error_code"] == "WORKER_INTERRUPTED"
+                    for r in runs.values()
+                ),
+                "missing_worker_interruption",
+            )
+            return
+        require(
+            any(
+                c["tool"] == "cancel_run"
+                and c["response"]["ok"]
+                and runs.get(c["arguments"]["run_id"], {}).get("status") == "cancelled"
+                for c in calls
+            ),
+            "missing_owned_cancelled_run",
+        )
+        if variant in {"queued_cancel", "running_cancel"}:
+            stage = variant.split("_")[0]
+            states = {}
+            observed_stage = False
+            for c in calls:
+                if not c["response"]["ok"]:
+                    continue
+                data = c["response"]["result"]
+                if c["tool"] == "cancel_run":
+                    observed_stage |= states.get(c["arguments"]["run_id"]) == stage
+                elif c["tool"] in {"submit_analysis", "get_run_status"}:
+                    states[data["run_id"]] = data["status"]
+            require(observed_stage, "pre_cancel_state_not_observed")
+    if case == "J13":
+        submissions = [
+            (c["arguments"].get("idempotency_key"), c["response"]["result"]["run_id"])
+            for c in calls
+            if c["tool"] == "submit_analysis" and c["response"]["ok"]
+        ]
+        require(
+            any(k and submissions.count((k, r)) >= 2 for k, r in submissions)
+            and "IDEMPOTENCY_CONFLICT" in codes,
+            "missing_replay_or_conflict",
+        )
+    if case == "J14":
+        require(
+            any(
+                {s["operation_id"].split(".")[0] for s in r["steps"] if s["status"] == "completed"}
+                >= {"input", "diffraction", "atomic"}
+                for r in completed
+            ),
+            "missing_shared_domain_journey",
+        )
+
+
+def native_turns(spec, base, turns):
+    if spec.get("delegation_mode", "sequential") == "sequential":
+        return []
+    require(spec["delegation_mode"] == "native", "invalid_delegation_mode")
+    children, roles = [], set()
+    for entry in spec.get("native_children", []):
+        profile = entry["profile"]
+        require(profile in DOMAINS, "unknown_delegated_profile")
+        child = read_turn(
+            base, entry, spec["host"], spec["capture_format"], spec.get("server", "autotem")
+        )
+        observed(
+            child["session"] != turns[0]["session"]
+            and child["calls"]
+            and any(c["tool"] == "submit_analysis" and c["response"]["ok"] for c in child["calls"]),
+            "no_delegated_scientific_tool_return",
+        )
+        related = [
+            event for t in turns for event in t["delegation_events"] if child["session"] in event
+        ]
+        observed(
+            any("spawn" in event.lower() for event in related)
+            and any(
+                word in event.lower()
+                for event in related
+                for word in ("wait", "return", "complete_task")
+            ),
+            "native_task_or_return_not_linked_to_parent",
+        )
+        child["profile"] = profile
+        roles.add(profile)
+        children.append(child)
+    observed(
+        children
+        and len({c["session"] for c in children}) == len(children)
+        and (spec["case_id"] != "J14" or roles == DOMAINS),
+        "incomplete_native_profile_traces",
+    )
+    return children
+
+
+def check_tool_runs(calls, runs):
+    validated_files = {}
+    for call in calls:
+        if not call["response"]["ok"]:
+            continue
+        args, tool, data = call["arguments"], call["tool"], call["response"]["result"]
+        if tool == "validate_plan" and isinstance(args.get("plan"), str):
+            validated_files[args["plan"]] = data["plan"]
+        if tool in {"inspect_input", "submit_analysis"}:
+            run = runs[data["run_id"]]
+            plan = args.get("plan", {})
+            if isinstance(plan, str):
+                observed(plan in validated_files, "file_plan_contents_not_recorded")
+                plan = validated_files[plan]
+            require(
+                run["_request"]["input_path"]
+                == (args["path"] if tool == "inspect_input" else plan["input_path"]),
+                "submitted_file_differs_from_run",
+            )
+            require(
+                {s["id"]: s["operation_id"] for s in plan.get("steps", [])}.items()
+                <= {s["step_id"]: s["operation_id"] for s in run["steps"]}.items(),
+                "submitted_steps_differ_from_run",
+            )
+            if "parent_run_id" in args:
+                require(args["parent_run_id"] == run["parent_run_id"], "submitted_parent_mismatch")
+            require(
+                any(j["job_id"] == data.get("job_id") for j in run["jobs"]), "host_job_mismatch"
+            )
+        if tool in {"get_run_status", "cancel_run", "list_artifacts", "export_report"}:
+            require(args["run_id"] in runs, "run_not_created_in_captured_journey")
+            if isinstance(data, dict):
+                require(data.get("run_id") == args["run_id"], "host_result_run_mismatch")
+        if tool == "get_run_status" and data["status"] in {
+            "completed",
+            "failed",
+            "needs_input",
+            "cancelled",
+            "interrupted",
+            "timed_out",
+        }:
+            if data.get("job_id") == runs[args["run_id"]]["job_id"]:
+                require(
+                    data["status"] == runs[args["run_id"]]["status"], "host_terminal_state_mismatch"
+                )
+
+
+def host_observations(spec, base, turns, calls, result):
+    """Recognize effective access separately from first consent and full inventory."""
+    evidence = result["evidence"]
+    checks = result["checks"]
+    # A completed host MCP exchange proves the names actually routed and effective
+    # access. It does not reveal a previous consent dialog or other available tools.
+    seen = {c["tool"] for c in calls}
+    result["observed_tools"] = sorted(seen)
+    checks.update(
+        tool_discovery="passed",
+        effective_tool_permission="passed",
+        full_tool_inventory="not_evaluated",
+        first_authorization="not_evaluated",
+        session_skill_discovery="not_evaluated",
+    )
+    source = spec.get("host_observations", {})
+    for name in ("discovery", "authorization", "skill_discovery"):
+        if not source.get(name):
+            continue
+        ref = source[name]
+        file = capture_file(base, ref if isinstance(ref, str) else ref["original_evidence"])
+        evidence[name + "_sha256"] = digest(file)
+        if isinstance(ref, str):
+            # Host text and structured CLI/UI exports can be checked without a human signature.
+            text = file.read_text("utf-8-sig")
+        else:
+            # Images have no portable text extraction here. Preserve the original
+            # and the actual transcribed content; bind this observation to its session.
+            require(
+                ref.get("session_id") in {t["session"] for t in turns},
+                "host_observation_session_mismatch",
+            )
+            text = ref.get("observed_text", "")
+            observed(isinstance(text, str) and text.strip(), "missing_observation_transcription")
+            evidence[name + "_transcription_sha256"] = text_digest(text)
+        if name == "discovery" and all(re.search(r"\b" + tool + r"\b", text) for tool in TOOLS):
+            checks["full_tool_inventory"] = "passed"
+        if name == "authorization":
+            authorized = re.search(
+                r"\b(allowed|accepted|approved|granted)\b|已授权|已允许", text, re.I
+            )
+            denied = re.search(
+                r"denied|not allowed|not granted|not approved|拒绝|未授权|未允许", text, re.I
+            )
+            if "autotem" in text.lower() and authorized and not denied:
+                checks["first_authorization"] = "passed"
+        if (
+            name == "skill_discovery"
+            and "autotem" in text.lower()
+            and re.search(
+                r"skill.{0,140}(?:invoked|loaded|used|activated)|(?:invoked|loaded|using).{0,140}skill|已加载.{0,140}技能|已调用.{0,140}技能|使用了.{0,140}技能",
+                text,
+                re.I | re.S,
+            )
+        ):
+            checks["session_skill_discovery"] = "passed"
+    if any(t["skill_opened"] for t in turns):
+        checks["session_skill_discovery"] = "passed"
+
+
+def verify(spec_path, *, bundle=None, root=None, project=None):
+    base = spec_path.resolve().parent
+    spec = unique_json(spec_path.read_text("utf-8-sig"))
+    require(
+        spec["schema_version"] == "1.0.0" and spec["host"] in HOSTS and spec["case_id"] in CASES,
+        "unsupported_capture",
+    )
+    result = {
+        "schema_version": "1.0.0",
+        "execution_layer": "real_host_capture",
+        "host": spec["host"],
+        "case_id": spec["case_id"],
+        "case_verdict": "not_evaluated",
+        "scientific_accuracy": "not_evaluated",
+        "release_ready": False,
+        "host_delegation_mode": spec.get("delegation_mode", "sequential"),
+        "evidence": {
+            "case_record_sha256": digest(spec_path),
+            "verifier_sha256": digest(Path(__file__)),
+            "matrix_sha256": digest(Path(__file__).with_name("matrix.json")),
+        },
+        "checks": {},
+        "tool_trace": [],
+        "runs": [],
+        "claims": [],
+        "checked_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    checks = result["checks"]
+    try:
+        if "variant" in spec:
+            require(spec["variant"] in VARIANTS[spec["case_id"]], "unknown_case_variant")
+            result["variant"] = spec["variant"]
+        if bundle:
+            manifest = bundle / "release-manifest.json"
+            observed(manifest.is_file(), "release_manifest_missing")
+        if spec.get("activation_file"):
+            observed(bundle is not None, "activation_release_manifest_missing")
+            activation_file = capture_file(base, spec["activation_file"])
+            activation = unique_json(activation_file.read_text("utf-8-sig"))
+            attempted = digest(manifest)
+            require(
+                activation.get("manifest_sha256") == attempted
+                and activation.get("runtime_id") == f"rt-{attempted[:20]}"
+                and spec["host"] in activation.get("host_installations", {}),
+                "attempted_project_release_mismatch",
+            )
+            result["attempted_release_manifest_sha256"] = attempted
+            result["evidence"]["activation_sha256"] = digest(activation_file)
+        result["capture_stage"] = spec.get(
+            "capture_stage", "host_turn" if spec["observation"] == "recorded" else "not_observed"
+        )
+        require(
+            result["capture_stage"]
+            in {"not_observed", "local_discovery", "host_preflight", "host_turn"},
+            "unknown_capture_stage",
+        )
+        observed(spec["observation"] != "not_evaluated", "journey_not_executed")
+        if spec.get("started_at") and spec.get("ended_at"):
+            start, end = stamp(spec["started_at"]), stamp(spec["ended_at"])
+            require(0 < start <= end, "invalid_observation_window")
+            result.update(started_at=spec["started_at"], ended_at=spec["ended_at"])
+        if spec.get("version_file"):
+            version_file = capture_file(base, spec["version_file"])
+            version = spec.get("host_version", "")
+            require(
+                bool(re.fullmatch(r"[0-9][0-9a-zA-Z.\-+]{1,79}", version))
+                and re.search(
+                    r"(?<![\w.+-])[vV]?" + re.escape(version) + r"(?![\w.+-])",
+                    version_file.read_text("utf-8-sig"),
+                ),
+                "host_version_evidence_mismatch",
+            )
+            result.update(host_version=version)
+            result["evidence"]["host_version_sha256"] = digest(version_file)
+        if spec["observation"] == "blocked":
+            blocker = capture_file(base, spec.get("blocker_file"))
+            code = spec.get("blocker_code", "")
+            require(bool(re.fullmatch(r"[A-Z][A-Z0-9_]{1,79}", code)), "missing_blocker_code")
+            result.update(case_verdict="blocked", reason=code)
+            result["evidence"]["blocker_sha256"] = digest(blocker)
+            if spec.get("blocked_prompt_file"):
+                result["evidence"]["prompt_sha256"] = digest(
+                    capture_file(base, spec["blocked_prompt_file"])
+                )
+            return result
+        require(spec["observation"] == "recorded", "invalid_observation_type")
+        observed("host_version" in result, "host_version_not_observed")
+        observed("ended_at" in result, "missing_capture_window")
+        require(result["capture_stage"] == "host_turn", "scientific_journey_requires_host_turn")
+        turns = [
+            read_turn(base, t, spec["host"], spec["capture_format"], spec.get("server", "autotem"))
+            for t in spec["turns"]
+        ]
+        observed(turns and len({t["session"] for t in turns}) == 1, "missing_single_host_session")
+        children = native_turns(spec, base, turns)
+        calls = [c for t in turns + children for c in t["calls"]]
+        observed(calls, "no_real_autotem_host_call")
+        checks["host_tool_call"] = "passed"
+        result["evidence"]["turns"] = [
+            {
+                "session_sha256": text_digest(t["session"]),
+                "prompt_sha256": t["prompt_sha256"],
+                "trace_sha256": t["trace_sha256"],
+                "answer_sha256": text_digest(t["answer"]),
+                "attachments": t["attachments"],
+            }
+            for t in turns + children
+        ]
+        for c in calls:
+            result["tool_trace"].append(
+                {
+                    "tool": c["tool"],
+                    "line": c["line"],
+                    "ok": c["response"]["ok"],
+                    "argument_sha256": text_digest(
+                        json.dumps(c["arguments"], sort_keys=True, ensure_ascii=False)
+                    ),
+                    "response_sha256": text_digest(
+                        json.dumps(c["response"], sort_keys=True, ensure_ascii=False)
+                    ),
+                }
+            )
+        observed(root and root.is_dir(), "harness_root_missing")
+        ids = {
+            c["response"]["result"]["run_id"]
+            for c in calls
+            if c["tool"] in {"inspect_input", "submit_analysis"} and c["response"]["ok"]
+        }
+        runtime = None
+        if bundle:
+            from autotem.acceptance.driver import runtime_record
+
+            runtime = runtime_record(True, bundle.resolve())
+            result["runtime"] = runtime
+        runs = {i: run_evidence(root.resolve(), i, (start, end), runtime) for i in sorted(ids)}
+        result["runs"] = [
+            {k: v for k, v in r.items() if not k.startswith("_")} for r in runs.values()
+        ]
+        check_tool_runs(calls, runs)
+        variant = spec.get("variant")
+        if spec["case_id"] == "J14":
+            mode = spec.get("delegation_mode", "sequential")
+            require(variant is None or variant == mode, "delegation_variant_mismatch")
+            variant = mode
+        if variant:
+            result["variant"] = variant
+        check_case(spec["case_id"], calls, runs, turns, spec.get("followup_excerpts", {}), variant)
+        checks["case_execution"] = "passed"
+        all_artifacts = {i: a for run in runs.values() for i, a in run["artifacts"].items()}
+        returned = set()
+        reports = set()
+        for c in calls:
+            if not c["response"]["ok"]:
+                continue
+            data = c["response"]["result"]
+            if c["tool"] == "export_report":
+                reports.add(data["run_id"])
+            if c["tool"] == "read_artifact":
+                artifacts = [data["artifact"]]
+                require(
+                    c["arguments"]["artifact_id"] == data["artifact"]["artifact_id"],
+                    "read_result_mismatch",
+                )
+            elif c["tool"] == "list_artifacts":
+                artifacts = data
+            elif c["tool"] in {"inspect_input", "export_report"}:
+                artifacts = data["artifacts"]
+            else:
+                artifacts = []
+            for a in artifacts:
+                i = a["artifact_id"]
+                require(
+                    i in all_artifacts
+                    and all_artifacts[i]["sha256"] == a["sha256"]
+                    and all_artifacts[i]["role"] == a["role"],
+                    "host_artifact_does_not_match_disk",
+                )
+                returned.add(i)
+        diagnostic = (
+            spec["case_id"] in {"J10", "J11", "J12", "J13"}
+            or spec["case_id"] == "J08"
+            and variant in {"unanswered", "invalid_reply"}
+            or spec["case_id"] == "J15"
+            and variant not in {None, "executed"}
+        )
+        if runs and not diagnostic:
+            require(
+                reports & {r["run_id"] for r in runs.values() if r["status"] == "completed"},
+                "host_did_not_export_analysis_report",
+            )
+        final = turns[-1]["answer"]
+        claims = spec.get("claims", [])
+        if not claims:
+            # Replies commonly cite the artifact IDs directly in each result paragraph.
+            for line in final.splitlines():
+                refs = sorted(i for i in returned if i in line)
+                if refs:
+                    claims.append({"quote": line.strip(), "artifact_ids": refs})
+        if runs and not diagnostic:
+            observed(claims, "final_answer_has_no_traceable_citations")
+        if runs and diagnostic and not claims:
+            observed(any(i in final for i in runs), "diagnostic_answer_missing_run_reference")
+        for claim in claims:
+            quote, refs = claim["quote"], claim["artifact_ids"]
+            require(
+                quote
+                and quote in final
+                and refs
+                and all(i in returned and i in final for i in refs),
+                "claim_not_grounded_in_observed_answer_and_evidence",
+            )
+            result["claims"].append({"quote_sha256": text_digest(quote), "artifact_ids": refs})
+        checks["answer_return"] = "passed"
+        host_observations(spec, base, turns + children, calls, result)
+        observed(runtime is not None, "no_verified_release_binding")
+        if spec["case_id"] == "J15" and variant in {None, "executed"}:
+            observed(
+                runtime["release_identity"].get("profile") == "traditional-simulation",
+                "simulation_runtime_profile_not_verified",
+            )
+        observed(project and project.is_dir(), "deployed_host_project_missing")
+        skill = {
+            "codex": ".agents/skills/autotem",
+            "workbuddy": "autotem-host/workbuddy/skill",
+            "openclaw": "skills/autotem",
+        }[spec["host"]]
+        for name, expected in runtime["skill_resource_sha256"].items():
+            path = project / skill / name
+            require(
+                path.is_file() and digest(path) == expected, "deployed_skill_or_profile_mismatch"
+            )
+        checks["release_and_resources"] = "passed"
+        adapter = project / "autotem-host" / spec["host"] / "adapter.json"
+        observed(adapter.is_file(), "missing_project_host_adapter")
+        adapter_data = unique_json(adapter.read_text("utf-8"))
+        require(
+            adapter_data.get("host") == spec["host"]
+            and root.resolve() == (project / ".autotem" / "runs").resolve(),
+            "host_project_binding_mismatch",
+        )
+        result["evidence"]["adapter_sha256"] = digest(adapter)
+        from autotem.installation import host_entry
+
+        control = project.resolve() / ".autotem"
+        entry = adapter_data["mcp"]["mcpServers"]["autotem"]
+        require(
+            host_entry.active_python(control) == Path(sys.executable)
+            and entry["args"] == ["-I", str(control / "host-entry.py"), "mcp"]
+            and Path(entry["command"]).is_file(),
+            "project_runtime_binding_mismatch",
+        )
+        if spec["host"] == "codex":
+            from autotem.harness.hosts import _read_toml
+
+            path = project / ".codex" / "config.toml"
+            observed(path.is_file(), "missing_project_mcp_config")
+            configured = (
+                _read_toml(path.read_text("utf-8-sig"))
+                .get("mcp_servers", {})
+                .get(spec.get("server", "autotem"), {})
+            )
+            require(
+                all(configured.get(k) == entry[k] for k in ("command", "args"))
+                and Path(configured.get("cwd", "")).resolve() == project.resolve(),
+                "active_host_mcp_entry_mismatch",
+            )
+            result["evidence"]["host_config_sha256"] = digest(path)
+        require(
+            digest(control / "host-entry.py") == digest(Path(host_entry.__file__)),
+            "deployed_host_entry_mismatch",
+        )
+        observed(
+            checks["session_skill_discovery"] == "passed", "skill_use_in_host_session_unobserved"
+        )
+        result["case_verdict"] = "passed"
+    except NotEvaluated as exc:
+        result["reason"] = str(exc)
+    except (
+        KeyError,
+        IndexError,
+        ValueError,
+        TypeError,
+        AttributeError,
+        OSError,
+        sqlite3.Error,
+        ImportError,
+        RuntimeError,
+        AssertionError,
+    ) as exc:
+        result.update(
+            case_verdict="failed",
+            reason=str(exc) if type(exc) is EvidenceError else type(exc).__name__,
+        )
+    return result
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="action", required=True)
+    new = sub.add_parser("init")
+    new.add_argument("directory", type=Path)
+    new.add_argument("--host", required=True, choices=HOSTS)
+    new.add_argument("--case", required=True, choices=CASES)
+    check = sub.add_parser("verify")
+    check.add_argument("record", type=Path)
+    check.add_argument("--release", type=Path)
+    check.add_argument("--harness-root", type=Path)
+    check.add_argument("--project", type=Path)
+    check.add_argument("--out", type=Path)
+    args = parser.parse_args(argv)
+    if args.action == "init":
+        args.directory.mkdir(parents=True, exist_ok=True)
+        template = {
+            "schema_version": "1.0.0",
+            "host": args.host,
+            "case_id": args.case,
+            "observation": "not_evaluated",
+            "host_version": "",
+            "started_at": "",
+            "ended_at": "",
+            "capture_format": "codex-exec-jsonl"
+            if args.host == "codex"
+            else "observed-host-export",
+            "turns": [],
+            "delegation_mode": "sequential",
+            "claims": [],
+            "host_observations": {},
+        }
+        with (args.directory / "case.json").open("x", encoding="utf-8") as f:
+            json.dump(template, f, indent=2)
+        return 0
+    try:
+        result = verify(
+            args.record, bundle=args.release, root=args.harness_root, project=args.project
+        )
+        payload = json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False)
+        if args.out:
+            with args.out.open("x", encoding="utf-8") as f:
+                f.write(payload + "\n")
+        else:
+            print(payload)
+        return 0 if result["case_verdict"] == "passed" else 1
+    except (KeyError, ValueError, TypeError, OSError) as exc:
+        parser.exit(2, f"Invalid capture or output: {type(exc).__name__}\n")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

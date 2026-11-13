@@ -1,10 +1,11 @@
-﻿"""Workflow orchestration facade for AutoTEM-Insight."""
+"""Workflow orchestration facade for AutoTEM-Insight."""
 
 from __future__ import annotations
 
 import hashlib
 import importlib.metadata
 import json
+import math
 import platform
 import traceback
 from dataclasses import dataclass
@@ -302,9 +303,7 @@ def _evaluate_quality_gates(
                 "BLOCKING: Diffraction step requested but DiffractionResult is missing."
             )
         if has_diffraction and not has_peaks:
-            gate_warnings.append(
-                "BLOCKING: Diffraction step requested but no peaks were detected."
-            )
+            gate_warnings.append("BLOCKING: Diffraction step requested but no peaks were detected.")
         if has_diffraction and not has_d_spacings:
             gate_warnings.append(
                 "BLOCKING: Diffraction step requested but d-spacing table is empty."
@@ -312,9 +311,7 @@ def _evaluate_quality_gates(
         if has_diffraction and has_peaks and has_d_spacings:
             diffraction_gate_cfg_raw = reporting_parameters.get("diffraction_gates")
             diffraction_gate_cfg = (
-                dict(diffraction_gate_cfg_raw)
-                if isinstance(diffraction_gate_cfg_raw, dict)
-                else {}
+                dict(diffraction_gate_cfg_raw) if isinstance(diffraction_gate_cfg_raw, dict) else {}
             )
             min_peak_count = int(
                 max(1, _cfg_float(diffraction_gate_cfg.get("min_peak_count"), default=4.0))
@@ -343,7 +340,7 @@ def _evaluate_quality_gates(
                 )
 
             center_offset = None
-            center_offset_pass = True
+            center_offset_pass = False
             max_center_offset_override = diffraction_gate_cfg.get("max_center_offset_px")
             max_center_offset = _cfg_float(max_center_offset_override, default=-1.0)
             fft_payload = report.diffraction.provenance.get("fft", {})
@@ -368,7 +365,9 @@ def _evaluate_quality_gates(
                         if h > 0 and w > 0:
                             max_center_offset = float(max(6.0, 0.20 * min(h, w)))
             if center_offset is not None and max_center_offset >= 0:
-                center_offset_pass = center_offset <= max_center_offset
+                center_offset_pass = (
+                    math.isfinite(center_offset) and center_offset <= max_center_offset
+                )
             gate_results["diffraction_center_offset_in_range"] = {
                 "passed": center_offset_pass,
                 "required": True,
@@ -377,8 +376,9 @@ def _evaluate_quality_gates(
             }
             if not center_offset_pass:
                 gate_warnings.append(
-                    "BLOCKING: Diffraction center offset exceeds gate threshold "
-                    f"({center_offset:.3f}px > {max_center_offset:.3f}px)."
+                    "BLOCKING: Diffraction center offset is missing, nonfinite, "
+                    "or outside the validated gate threshold "
+                    f"(observed={center_offset}, threshold={max_center_offset})."
                 )
 
             rel_uncertainties: list[float] = []
@@ -390,16 +390,18 @@ def _evaluate_quality_gates(
                 if not isinstance(item.uncertainty, (int, float)):
                     continue
                 value = float(item.value)
-                if abs(value) <= 1e-12:
+                uncertainty = float(item.uncertainty)
+                if (
+                    not math.isfinite(value)
+                    or not math.isfinite(uncertainty)
+                    or value <= 1e-12
+                    or uncertainty < 0
+                ):
                     continue
-                rel_uncertainties.append(abs(float(item.uncertainty) / value))
-            unc_coverage = (
-                len(rel_uncertainties) / max(1, len(report.diffraction.d_spacings))
-            )
+                rel_uncertainties.append(uncertainty / value)
+            unc_coverage = len(rel_uncertainties) / max(1, len(report.diffraction.d_spacings))
             mean_rel_unc = (
-                float(sum(rel_uncertainties) / len(rel_uncertainties))
-                if rel_uncertainties
-                else 0.0
+                float(sum(rel_uncertainties) / len(rel_uncertainties)) if rel_uncertainties else 0.0
             )
             unc_cov_pass = unc_coverage >= min_unc_coverage
             unc_mean_pass = mean_rel_unc <= max_mean_rel_unc
@@ -427,6 +429,24 @@ def _evaluate_quality_gates(
                 )
 
             if step_names.intersection({"index_diffraction", "phase_match"}):
+                physical_calibration = all(
+                    item.unit.strip().lower() in {"nm", "angstrom", "å", "pm", "um", "µm", "μm"}
+                    and isinstance(item.value, (int, float))
+                    and not isinstance(item.value, bool)
+                    and math.isfinite(float(item.value))
+                    and float(item.value) > 0
+                    for item in report.diffraction.d_spacings
+                )
+                gate_results["phase_matching_physical_calibration"] = {
+                    "passed": physical_calibration,
+                    "required": True,
+                }
+                if not physical_calibration:
+                    gate_warnings.append(
+                        "BLOCKING: Phase indexing/matching requires finite positive "
+                        "d-spacings with physical length units; "
+                        "pixel/unknown values are diagnostic."
+                    )
                 consistency_payload = report.diffraction.provenance.get("b3_b4_consistency", {})
                 indexed_fraction = None
                 if isinstance(consistency_payload, dict):
@@ -438,9 +458,9 @@ def _evaluate_quality_gates(
                     default=0.20,
                 )
                 indexed_fraction_pass = (
-                    True
-                    if indexed_fraction is None
-                    else indexed_fraction >= min_indexed_fraction
+                    indexed_fraction is not None
+                    and math.isfinite(indexed_fraction)
+                    and indexed_fraction >= min_indexed_fraction
                 )
                 gate_results["b3_b4_indexed_fraction_minimum"] = {
                     "passed": indexed_fraction_pass,
@@ -450,8 +470,9 @@ def _evaluate_quality_gates(
                 }
                 if not indexed_fraction_pass:
                     gate_warnings.append(
-                        "BLOCKING: B3/B4 indexed non-zero hkl fraction below gate threshold "
-                        f"({indexed_fraction:.3f} < {min_indexed_fraction:.3f})."
+                        "BLOCKING: B3/B4 indexed non-zero hkl fraction is missing, nonfinite, "
+                        "or below gate threshold "
+                        f"(observed={indexed_fraction}, threshold={min_indexed_fraction})."
                     )
 
     atom_required = "detect_atoms" in step_names
@@ -477,9 +498,7 @@ def _evaluate_quality_gates(
 
     interface_gate_cfg_raw = reporting_parameters.get("interface_gates")
     interface_gate_cfg = (
-        dict(interface_gate_cfg_raw)
-        if isinstance(interface_gate_cfg_raw, dict)
-        else {}
+        dict(interface_gate_cfg_raw) if isinstance(interface_gate_cfg_raw, dict) else {}
     )
     interface_gates_enabled = bool(interface_gate_cfg.get("enabled", True))
     required_items_override_raw = interface_gate_cfg.get("required_items")
@@ -500,9 +519,7 @@ def _evaluate_quality_gates(
     if strain_required:
         default_required_items.append("C.StrainResult")
 
-    required_items = (
-        required_items_override if required_items_override else default_required_items
-    )
+    required_items = required_items_override if required_items_override else default_required_items
     if interface_gates_enabled and required_items:
         checks = evaluate_bc_interface_completeness(report)
         check_map = {f"{item['owner']}.{item['item']}": item["status"] for item in checks}
@@ -596,6 +613,8 @@ class TEMAnalysisSkill:
     """Facade that coordinates load, calibration, analysis, and reporting steps."""
 
     def load_data(self, path: str | Path, metadata: dict[str, object] | None = None) -> TEMDataset:
+        if not Path(path).is_file():
+            raise FileNotFoundError(f"Input file does not exist: {path}")
         dataset = load_tem_dataset(path)
         if metadata:
             merged_metadata = dict(dataset.metadata)
@@ -633,12 +652,14 @@ class TEMAnalysisSkill:
         *,
         quality_after: QualityAssessment | None = None,
         parameters: dict[str, Any] | None = None,
+        output_dir: str | Path | None = None,
     ) -> PreprocessingResult:
         return preprocess_dataset(
             dataset,
             quality_after=quality_after,
             recipe=recipe,
             parameters=parameters,
+            output_dir=output_dir,
         )
 
     def analyze_fft(
@@ -662,6 +683,45 @@ class TEMAnalysisSkill:
     ) -> SimulationResult:
         return simulate_from_diffraction(diffraction, parameters=parameters)
 
+    def run_harness(
+        self,
+        input_path: str | Path,
+        workflow_path: str | Path | None = None,
+        output_dir: str | Path = "outputs/harness",
+        *,
+        plan: dict | None = None,
+        output_formats: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Run a registered headless recipe; retain the legacy facade and strict core models."""
+        from autotem.harness import Harness
+        from autotem.harness.compiler import compile_legacy_recipe, compile_plan
+
+        if plan is not None and workflow_path is not None:
+            raise ValueError("Select one plan or workflow file.")
+        formats = ["json", "html"] if output_formats is None else list(output_formats)
+        if plan is None:
+            if workflow_path is None:
+                raise ValueError("Select an explicit traditional recipe or plan")
+            import yaml
+
+            source = yaml.safe_load(Path(workflow_path).read_text(encoding="utf-8-sig"))
+            if not isinstance(source, dict):
+                raise ValueError("Workflow file must contain one plan or legacy workflow object.")
+            if "workflow" in source:
+                plan = compile_legacy_recipe(input_path, workflow_path, output_formats)
+                formats = plan["user_input"]["legacy_recipe"]["report_formats"]
+            else:
+                source["input_path"] = str(input_path)
+                plan = compile_plan(source).model_dump(mode="json")
+        else:
+            plan = {**plan, "input_path": str(input_path)}
+        if not formats or not set(formats) <= {"json", "html", "pdf"}:
+            raise ValueError("Choose at least one registered report format from json, html or pdf.")
+        harness = Harness(output_dir)
+        state = harness.submit_analysis(plan, asynchronous=False)
+        report = harness.export_report(state["run_id"], formats=formats)
+        return {**state, "execution_status": state["status"], "report": report}
+
     def run(
         self,
         input_path: str | Path,
@@ -679,6 +739,29 @@ class TEMAnalysisSkill:
         pdf_cover_fields: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Run the configured A2 workflow and emit structured outputs."""
+        if workflow_path is not None and Path(workflow_path).is_file():
+            import yaml
+
+            try:
+                explicit = yaml.safe_load(Path(workflow_path).read_text(encoding="utf-8-sig"))
+            except yaml.YAMLError:
+                explicit = None  # The legacy entry records its YAML failure in run.log.
+            if isinstance(explicit, dict) and "workflow" not in explicit and (
+                "steps" in explicit or "envelope_version" in explicit
+            ):
+                if any(value is not None for value in (
+                    metadata, detect_atoms_step, atom_detection_options, report_title,
+                    report_sections_override, open_step_sections, pdf_sections_override,
+                    pdf_max_figure_pages, pdf_cover_fields,
+                )):
+                    raise ValueError(
+                        "For registered recipes put analysis options in plan.steps. "
+                        "Legacy report-layout overrides require a legacy workflow."
+                    )
+                return self.run_harness(
+                    input_path, output_dir=output_dir, plan=explicit,
+                    output_formats=output_formats_override,
+                )
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         ensure_a3_output_layout(output_dir)
@@ -693,6 +776,18 @@ class TEMAnalysisSkill:
             recipe = load_workflow_recipe(workflow_path)
             if detect_atoms_step is True:
                 _ensure_forced_step(recipe.workflow, "detect_atoms")
+            if any(step.name == "simulate" for step in recipe.workflow.steps):
+                simulation_parameters = _extract_stage_parameters(
+                    recipe.workflow.parameters,
+                    _STEP_TO_PARAM_KEYS.get("simulate", ("simulation",)),
+                )
+                if not any(
+                    key in simulation_parameters for key in ("diffsims_timeout_s", "timeout_s")
+                ):
+                    # Optional native imports may stall before the solver starts.
+                    # The default workflow must use a bounded worker, even without a Harness.
+                    simulation_parameters["diffsims_timeout_s"] = 30.0
+                    recipe.workflow.parameters["simulation"] = simulation_parameters
             workflow_parameters = dict(recipe.workflow.parameters)
             reporting_parameters = _extract_stage_parameters(
                 workflow_parameters,
@@ -791,6 +886,12 @@ class TEMAnalysisSkill:
                             recipe=prep_recipe,
                             quality_after=quality,
                             parameters=stage_parameters,
+                            output_dir=output_dir
+                            / (
+                                "intermediates"
+                                if recipe.workflow.save_intermediates
+                                else ".runtime"
+                            ),
                         )
                         step_record.status = "warning" if preprocessing.warnings else "done"
                         step_record.warnings.extend(preprocessing.warnings)
@@ -891,17 +992,13 @@ class TEMAnalysisSkill:
                             step_record.outputs.extend(["AtomLattice", "atom_coordinates.csv"])
                         except Exception as exc:  # noqa: BLE001
                             step_record.status = "warning"
-                            step_record.warnings.append(
-                                f"detect_atoms step fallback: {exc}"
-                            )
+                            step_record.warnings.append(f"detect_atoms step fallback: {exc}")
                             step_record.warnings.append(
                                 "detect_atoms integration fallback used; "
                                 "step kept as contract warning."
                             )
                         if owner is not None:
-                            step_record.warnings.append(
-                                f"Reserved ownership: Member {owner}."
-                            )
+                            step_record.warnings.append(f"Reserved ownership: Member {owner}.")
                     else:
                         step_record.status = "warning"
                         contract = _RESERVED_STEP_CONTRACTS.get(step_record.name, {})
@@ -917,9 +1014,7 @@ class TEMAnalysisSkill:
                             "not implemented in A2 baseline."
                         )
                         if owner is not None:
-                            step_record.warnings.append(
-                                f"Reserved ownership: Member {owner}."
-                            )
+                            step_record.warnings.append(f"Reserved ownership: Member {owner}.")
                 else:
                     step_record.status = "skipped"
                     step_record.warnings.append(
@@ -1091,35 +1186,6 @@ class TEMAnalysisSkill:
             artifacts.extend(figure_artifacts)
             artifacts.extend(overlay_artifacts)
 
-            if "json" in requested_formats:
-                artifacts.extend(export_json_bundle(report, output_dir))
-            if "csv" in requested_formats:
-                csv_artifacts, report_tables = export_csv_tables_with_models(report, output_dir)
-                report.tables = report_tables
-                artifacts.extend(csv_artifacts)
-            if "html" in requested_formats:
-                artifacts.append(
-                    export_html_report(
-                        report,
-                        output_dir,
-                        options={
-                            "sections": requested_sections,
-                            "open_step_sections": open_sections_setting,
-                        },
-                    )
-                )
-            if "pdf" in requested_formats:
-                artifacts.append(
-                    export_pdf_report(
-                        report,
-                        output_dir,
-                        options={
-                            "sections": pdf_sections,
-                            "max_figure_pages": pdf_max_pages if pdf_max_pages is not None else 8,
-                            "cover_fields": pdf_cover,
-                        },
-                    )
-                )
             if recipe.workflow.save_intermediates:
                 artifacts.extend(persist_intermediate_artifacts(report, output_dir))
             gate_warnings, gate_summary = _evaluate_quality_gates(
@@ -1180,11 +1246,7 @@ class TEMAnalysisSkill:
                     ]
                     step_record.warnings = _collect_warnings(
                         step_record.warnings,
-                        [
-                            warning
-                            for warning in report.warnings
-                            if warning.startswith("Validation notice:")
-                        ],
+                        validation_warnings,
                     )
                     if isinstance(acceptance, dict) and acceptance.get("all_passed") is False:
                         step_record.status = "warning"
@@ -1226,6 +1288,78 @@ class TEMAnalysisSkill:
                     )
                     if benchmark_result.passed is False:
                         step_record.status = "warning"
+
+            # Execution, quality checks and reference-backed acceptance are separate facts.
+            # Preserve the legacy summary string for existing consumers.
+            incomplete_steps = [
+                step.name
+                for step in workflow.steps
+                if step.status == "skipped"
+                or any(
+                    "not implemented in A2 baseline" in warning
+                    or "integration fallback used" in warning
+                    for warning in step.warnings
+                )
+            ]
+            if simulation is not None:
+                adapter_status = simulation.provenance.get("adapter", {})
+                if isinstance(adapter_status, dict) and adapter_status.get("active") is False:
+                    if "simulate" not in incomplete_steps:
+                        incomplete_steps.append("simulate")
+            execution_status = (
+                "failed"
+                if any(step.status == "failed" for step in workflow.steps)
+                else "partial"
+                if incomplete_steps
+                else "completed"
+            )
+            validation_acceptance = validation_payload.get("acceptance", {})
+            validation_status = (
+                str(validation_acceptance.get("status", "not_evaluated"))
+                if isinstance(validation_acceptance, dict)
+                else "not_evaluated"
+            )
+            benchmark_passed = report.benchmark.passed if report.benchmark is not None else None
+            outcome = {
+                "execution_status": execution_status,
+                "incomplete_steps": incomplete_steps,
+                "quality_gates_passed": bool(gate_summary["passed"]),
+                "validation_status": validation_status,
+                "benchmark_passed": benchmark_passed,
+            }
+            report.provenance["run_outcome"] = outcome
+
+            # Export every user-facing snapshot from the same finalized evidence.
+            # CSV precedes the bundle so its table count is accurate.
+            if "csv" in requested_formats:
+                csv_artifacts, report_tables = export_csv_tables_with_models(report, output_dir)
+                report.tables = report_tables
+                artifacts.extend(csv_artifacts)
+            if "json" in requested_formats:
+                artifacts.extend(export_json_bundle(report, output_dir))
+            if "html" in requested_formats:
+                artifacts.append(
+                    export_html_report(
+                        report,
+                        output_dir,
+                        options={
+                            "sections": requested_sections,
+                            "open_step_sections": open_sections_setting,
+                        },
+                    )
+                )
+            if "pdf" in requested_formats:
+                artifacts.append(
+                    export_pdf_report(
+                        report,
+                        output_dir,
+                        options={
+                            "sections": pdf_sections,
+                            "max_figure_pages": pdf_max_pages if pdf_max_pages is not None else 8,
+                            "cover_fields": pdf_cover,
+                        },
+                    )
+                )
 
             run_summary_path = output_dir / "run_summary.json"
             summary = RunSummary(
@@ -1324,6 +1458,7 @@ class TEMAnalysisSkill:
                 "log_path": summary.log_path,
                 "atom_lattice": atom_lattice,
                 "atom_count": len(atom_lattice.atoms) if atom_lattice is not None else 0,
+                **outcome,
             }
         except Exception as exc:
             logger.error(f"Run failed: {exc}")

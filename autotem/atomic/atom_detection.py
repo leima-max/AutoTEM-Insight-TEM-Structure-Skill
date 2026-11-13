@@ -428,12 +428,13 @@ def _estimate_confidence(
 
 
 def _save_overlay(image: np.ndarray, coordinates: np.ndarray, path: str) -> None:
-    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
 
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(6, 6), dpi=180)
+    fig = Figure(figsize=(6, 6), dpi=180)
+    ax = fig.subplots()
     ax.imshow(image, cmap="gray")
     if len(coordinates) > 0:
         ax.scatter(coordinates[:, 1], coordinates[:, 0], s=16, c="r", marker="o", linewidths=0.4)
@@ -441,4 +442,3 @@ def _save_overlay(image: np.ndarray, coordinates: np.ndarray, path: str) -> None
     ax.axis("off")
     fig.tight_layout()
     fig.savefig(str(p), bbox_inches="tight")
-    plt.close(fig)

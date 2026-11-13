@@ -127,7 +127,14 @@ def _normalize_unit_interval(image: np.ndarray) -> np.ndarray:
     return np.asarray((image - min_v) / (max_v - min_v), dtype=np.float32)
 
 
-def _build_output_uri(dataset: TEMDataset) -> Path | None:
+def _build_output_uri(
+    dataset: TEMDataset, output_dir: str | Path | None = None,
+) -> Path | None:
+    if output_dir is not None:
+        target = Path(output_dir) / "preprocessed_image.npy"
+        if dataset.source_path and target.resolve() == Path(dataset.source_path).resolve():
+            raise ValueError("Preprocessing output must not overwrite its raw input.")
+        return target
     source_path = dataset.source_path.strip()
     if not source_path:
         return None
@@ -143,8 +150,13 @@ def preprocess_dataset(
     quality_after: QualityAssessment | None = None,
     recipe: str = "auto",
     parameters: dict[str, Any] | None = None,
+    output_dir: str | Path | None = None,
 ) -> PreprocessingResult:
-    """Apply baseline clipping/normalization/denoise/background subtraction."""
+    """Preprocess and optionally persist inside a run-specific artifact directory.
+
+    Omitting ``output_dir`` retains the legacy source-adjacent storage convention.
+    Workflow callers should provide an isolated run directory.
+    """
     params = dict(parameters or {})
     warnings: list[str] = []
     operations: list[str] = []
@@ -248,7 +260,7 @@ def preprocess_dataset(
             description="Estimated low-frequency background.",
         )
 
-    output_uri = _build_output_uri(dataset)
+    output_uri = _build_output_uri(dataset, output_dir)
     if output_uri is not None:
         try:
             output_uri.parent.mkdir(parents=True, exist_ok=True)

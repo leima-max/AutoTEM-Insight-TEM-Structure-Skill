@@ -581,6 +581,8 @@ def test_mp_lookup_candidate_flows_into_diffsims_phase_matching(
         "autotem.simulation.basic.simulate_diffraction_with_diffsims",
         fake_simulate_diffraction_with_diffsims,
     )
+    # Scope the fake adapter to this process. The separate worker is covered by real_diffsims.
+    monkeypatch.setattr("autotem.simulation.basic._diffsims_timeout_s", lambda parameters: None)
 
     input_path = tmp_path / "mp_lookup_diffsims_input.npy"
     np.save(input_path, _synthetic_cubic_fft_image())

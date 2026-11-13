@@ -1,0 +1,14 @@
+input_path: INPUT_FILE
+modality: HRTEM
+selection: {}
+network_enabled: false
+budgets: {operation_seconds: 120, simulation_seconds: 30, run_seconds: 900}
+steps:
+  - {id: load, operation_id: input.load, parameters: {}, depends_on: [], inputs: {}, optional: false}
+  - {id: quality, operation_id: quality.assess, parameters: {}, depends_on: [load], inputs: {}, optional: false}
+  - {id: calibration, operation_id: calibration.resolve, parameters: {}, depends_on: [quality], inputs: {}, optional: false}
+  - {id: preprocess, operation_id: preprocessing.apply, parameters: {}, depends_on: [calibration], inputs: {}, optional: false}
+  - {id: fft, operation_id: diffraction.fft, parameters: {}, depends_on: [preprocess], inputs: {}, optional: false}
+  - {id: center, operation_id: diffraction.center, parameters: {}, depends_on: [fft], inputs: {}, optional: false}
+  - {id: peaks, operation_id: diffraction.peaks, parameters: {}, depends_on: [center], inputs: {}, optional: false}
+  - {id: metrics, operation_id: diffraction.metrics, parameters: {}, depends_on: [peaks], inputs: {}, optional: false}

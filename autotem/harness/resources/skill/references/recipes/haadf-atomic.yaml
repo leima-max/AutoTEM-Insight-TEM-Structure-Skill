@@ -1,0 +1,13 @@
+input_path: INPUT_FILE
+modality: HAADF-STEM
+selection: {}
+network_enabled: false
+budgets: {operation_seconds: 120, simulation_seconds: 30, run_seconds: 900}
+steps:
+  - {id: load, operation_id: input.load, parameters: {}, depends_on: [], inputs: {}, optional: false}
+  - {id: quality, operation_id: quality.assess, parameters: {}, depends_on: [load], inputs: {}, optional: false}
+  - {id: calibration, operation_id: calibration.resolve, parameters: {}, depends_on: [quality], inputs: {}, optional: false}
+  - {id: detect, operation_id: atomic.detect, parameters: {}, depends_on: [calibration], inputs: {}, optional: false}
+  - {id: refine, operation_id: atomic.refine, parameters: {method: gaussian}, depends_on: [detect], inputs: {}, optional: false}
+  - {id: distances, operation_id: atomic.distances, parameters: {}, depends_on: [refine], inputs: {}, optional: false}
+  - {id: intensity, operation_id: atomic.intensity, parameters: {}, depends_on: [refine], inputs: {}, optional: false}

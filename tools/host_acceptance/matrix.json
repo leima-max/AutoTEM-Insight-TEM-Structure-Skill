@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0.0",
+  "hosts": ["codex", "openclaw", "workbuddy"],
+  "cases": {
+    "J01": [],
+    "J02": [],
+    "J03": [],
+    "J04": [],
+    "J05": ["saed", "nbed"],
+    "J06": [],
+    "J07": ["dataset", "frame", "channel"],
+    "J08": ["answered", "unanswered", "invalid_reply"],
+    "J09": ["snapshot", "reference"],
+    "J10": [],
+    "J11": ["invalid_file", "missing_dependency", "broken_dependency", "numerical_failure", "timeout"],
+    "J12": ["queued_cancel", "running_cancel", "interrupted"],
+    "J13": [],
+    "J14": ["sequential", "native"],
+    "J15": ["executed", "missing_dependency", "broken_dependency", "timeout"]
+  }
+}

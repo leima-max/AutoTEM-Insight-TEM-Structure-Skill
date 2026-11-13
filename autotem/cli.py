@@ -1,4 +1,4 @@
-﻿"""Command-line entry points for AutoTEM-Insight."""
+"""Command-line entry points for AutoTEM-Insight."""
 
 from __future__ import annotations
 
@@ -10,12 +10,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+from pydantic import TypeAdapter
+
 from autotem.diffraction.phase_lookup import (
     materials_project_api_config_path,
     materials_project_api_setup_guidance,
     resolve_materials_project_api_key,
     write_materials_project_api_config,
 )
+from autotem.harness.contracts import HarnessError
 from autotem.validation import run_benchmark_suite_from_file, run_diffsims_smoke_validation
 from autotem.workflows.pipeline import TEMAnalysisSkill
 
@@ -32,6 +35,19 @@ def build_parser() -> argparse.ArgumentParser:
     analyze = subparsers.add_parser("analyze", help="Analyze a TEM input file.")
     analyze.add_argument("input", type=Path, help="Input image or microscopy data file.")
     analyze.add_argument("--workflow", type=Path, default=None, help="YAML workflow recipe.")
+    analyze.add_argument(
+        "--harness",
+        action="store_true",
+        help="Execute an explicit headless recipe through the registered domain services.",
+    )
+    analyze.add_argument(
+        "--fail-on-blocking",
+        action="store_true",
+        help=(
+            "Return a nonzero exit code for incomplete execution "
+            "or failed quality/acceptance gates."
+        ),
+    )
     analyze.add_argument(
         "--output",
         type=Path,
@@ -220,6 +236,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "analyze":
         try:
             skill = TEMAnalysisSkill()
+            if args.harness and any((
+                args.detect_atoms, args.report_title, args.report_sections, args.open_step_sections,
+                args.pdf_sections, args.pdf_max_figures is not None, args.pdf_cover_field,
+            )):
+                raise ValueError(
+                    "Configure operations in the Harness plan. Report layout options require "
+                    "a legacy workflow."
+                )
             format_override = None
             if args.formats:
                 format_override = [
@@ -228,46 +252,53 @@ def main(argv: list[str] | None = None) -> int:
             report_sections_override = None
             if args.report_sections:
                 report_sections_override = [
-                    item.strip().lower()
-                    for item in args.report_sections.split(",")
-                    if item.strip()
+                    item.strip().lower() for item in args.report_sections.split(",") if item.strip()
                 ]
             pdf_sections_override = None
             if args.pdf_sections:
                 pdf_sections_override = [
-                    item.strip().lower()
-                    for item in args.pdf_sections.split(",")
-                    if item.strip()
+                    item.strip().lower() for item in args.pdf_sections.split(",") if item.strip()
                 ]
             pdf_cover_fields: dict[str, str] | None = None
             if args.pdf_cover_field:
                 parsed: dict[str, str] = {}
                 for entry in args.pdf_cover_field:
                     if "=" not in entry:
-                        raise ValueError(
-                            "Invalid --pdf-cover-field value. Use key=value format."
-                        )
+                        raise ValueError("Invalid --pdf-cover-field value. Use key=value format.")
                     key, value = entry.split("=", 1)
                     key = key.strip()
                     if not key:
-                        raise ValueError(
-                            "Invalid --pdf-cover-field value. Key cannot be empty."
-                        )
+                        raise ValueError("Invalid --pdf-cover-field value. Key cannot be empty.")
                     parsed[key] = value.strip()
                 pdf_cover_fields = parsed
-            result = skill.run(
-                input_path=args.input,
-                workflow_path=args.workflow,
-                output_dir=args.output,
-                detect_atoms_step=True if args.detect_atoms else None,
-                output_formats_override=format_override,
-                report_title=args.report_title,
-                report_sections_override=report_sections_override,
-                open_step_sections=True if args.open_step_sections else None,
-                pdf_sections_override=pdf_sections_override,
-                pdf_max_figure_pages=args.pdf_max_figures,
-                pdf_cover_fields=pdf_cover_fields,
+            result = (
+                skill.run_harness(
+                    input_path=args.input,
+                    workflow_path=args.workflow,
+                    output_dir=args.output,
+                    output_formats=format_override,
+                )
+                if args.harness
+                else skill.run(
+                    input_path=args.input,
+                    workflow_path=args.workflow,
+                    output_dir=args.output,
+                    detect_atoms_step=True if args.detect_atoms else None,
+                    output_formats_override=format_override,
+                    report_title=args.report_title,
+                    report_sections_override=report_sections_override,
+                    open_step_sections=True if args.open_step_sections else None,
+                    pdf_sections_override=pdf_sections_override,
+                    pdf_max_figure_pages=args.pdf_max_figures,
+                    pdf_cover_fields=pdf_cover_fields,
+                )
             )
+            serialized_result = TypeAdapter(dict[str, object]).dump_json(result, indent=2).decode()
+        except HarnessError as exc:
+            print(f"AutoTEM {exc.code}: {exc.message}", file=sys.stderr)
+            if exc.code.startswith("LEGACY_") or exc.code.startswith("INVALID_"):
+                return EXIT_CONFIG_ERROR
+            return EXIT_RUNTIME_ERROR
         except ValueError as exc:
             print(f"AutoTEM analyze configuration error: {exc}", file=sys.stderr)
             return EXIT_CONFIG_ERROR
@@ -281,7 +312,21 @@ def main(argv: list[str] | None = None) -> int:
         print(result["status"])
         if "atom_count" in result:
             print(f"Detected atoms: {result['atom_count']}")
-        print(json.dumps(result, indent=2))
+        print(serialized_result)
+        if args.harness or "run_id" in result:
+            return (
+                EXIT_OK
+                if result["execution_status"] == "completed"
+                and (not args.fail_on_blocking or result.get("acceptance_status") != "blocked")
+                else EXIT_RUNTIME_ERROR
+            )
+        if args.fail_on_blocking and (
+            result.get("execution_status") != "completed"
+            or result.get("quality_gates_passed") is not True
+            or result.get("validation_status") in {"failed", "invalid"}
+            or result.get("benchmark_passed") is False
+        ):
+            return EXIT_RUNTIME_ERROR
         return EXIT_OK
 
     if args.command == "benchmark":
@@ -302,9 +347,7 @@ def main(argv: list[str] | None = None) -> int:
 
         acceptance = summary.get("acceptance", {})
         all_passed = (
-            bool(acceptance.get("all_passed", False))
-            if isinstance(acceptance, dict)
-            else False
+            bool(acceptance.get("all_passed", False)) if isinstance(acceptance, dict) else False
         )
         status = "A4 benchmark suite completed."
         print(status)
@@ -317,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
         if importlib.util.find_spec("streamlit") is None:
             print(
                 "AutoTEM preview configuration error: streamlit is not installed. "
-                "Install UI extras via `pip install \"autotem-insight[ui]\"`.",
+                'Install UI extras via `pip install "autotem-insight[ui]"`.',
                 file=sys.stderr,
             )
             return EXIT_CONFIG_ERROR
@@ -348,8 +391,7 @@ def main(argv: list[str] | None = None) -> int:
             env["AUTOTEM_UI_OUTPUT_ROOT"] = str(args.output_root)
 
         print(
-            "Launching B1-B5 diffraction debug UI on "
-            f"http://{args.host}:{args.port} ...",
+            f"Launching B1-B5 diffraction debug UI on http://{args.host}:{args.port} ...",
         )
         try:
             completed = subprocess.run(cmd, check=False, env=env)
@@ -394,11 +436,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
 
     if args.command == "validate-diffsims":
-        materials = [
-            item.strip()
-            for item in str(args.materials).split(",")
-            if item.strip()
-        ]
+        materials = [item.strip() for item in str(args.materials).split(",") if item.strip()]
         try:
             result = run_diffsims_smoke_validation(
                 materials=materials,

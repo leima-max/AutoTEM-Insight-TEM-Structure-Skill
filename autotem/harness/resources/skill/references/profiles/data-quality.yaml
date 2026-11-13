@@ -1,0 +1,23 @@
+schema_version: '1.0.0'
+profile_id: data-quality
+version: '1.0.0'
+software_role: Input quality, physical calibration and conservative preprocessing
+supported_modalities: [TEM, HRTEM, STEM, HAADF-STEM, ABF-STEM, SAED, NBED]
+execution_mode: sequential
+native_installation_verified: false
+inputs: [authorized_input_path, question_summary, selection, supplied_metadata]
+outputs: [dataset, raw, quality, scalebar_candidate, scalebar_roi, calibration, processed, warnings, human_input_request]
+allowed_operations: [input.load, quality.assess, calibration.scalebar_candidate, calibration.resolve, preprocessing.apply]
+budgets: {max_steps: 8, max_retries: 1, operation_seconds: 120, run_seconds: 900}
+workflow:
+  - Inspect input and select dataset/frame/channel explicitly.
+  - Assess quality and modality; preserve raw and inspect calibration source.
+  - Resolve supplied or credible metadata calibration; record uncertainty and units.
+  - Request endpoint confirmation for scale-bar candidates before using them as calibration evidence.
+  - Apply requested conservative processing and hand off dataset/calibration/raw/processed refs.
+human_input_conditions: [missing_physical_scale, ambiguous_dataset_selection, unsupported_modality]
+failure_policy:
+  missing_calibration: Return pixel diagnostics and needs_input for absolute measurements.
+  bad_input: Return structured failure with preserved diagnostics, no fabricated array.
+prohibited: [raw_overwrite, unauthorized_upload, invent_calibration, absolute_measurement_without_scale]
+return_contract: references/tool-contracts.md

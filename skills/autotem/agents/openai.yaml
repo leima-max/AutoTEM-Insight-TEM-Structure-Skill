@@ -1,0 +1,6 @@
+interface:
+  display_name: "AutoTEM"
+  short_description: "Traditional TEM analysis with calibration and traceable evidence"
+  default_prompt: "Use $autotem to analyze my TEM data with calibrated traditional tools."
+policy:
+  allow_implicit_invocation: true

@@ -50,6 +50,38 @@ class B4IndexingResult:
     provenance: dict[str, Any]
 
 
+def _measurement_in_nm(
+    measurement: Measurement | None, *, reciprocal: bool = False
+) -> float | None:
+    """Normalize explicit physical lengths/frequencies; never infer pixel calibration."""
+    if measurement is None or isinstance(measurement.value, bool):
+        return None
+    unit = str(measurement.unit).strip().lower().replace(" ", "")
+    unit = unit.replace("å", "angstrom").replace("µ", "u").replace("μ", "u")
+    unit = unit.replace("{", "").replace("}", "").replace("⁻¹", "^-1")
+    if reciprocal:
+        if unit.startswith("1/"):
+            unit = unit[2:]
+        elif unit.startswith("cycles/"):
+            unit = unit[7:]
+        elif unit.endswith("^-1"):
+            unit = unit[:-3]
+        else:
+            return None
+    scales = {"nm": 1.0, "pm": 0.001, "angstrom": 0.1, "um": 1000.0}
+    scale = scales.get(unit)
+    if scale is None:
+        return None
+    try:
+        value = float(measurement.value)
+    except (TypeError, ValueError):
+        return None
+    value = value / scale if reciprocal else value * scale
+    if not np.isfinite(value) or (not reciprocal and value <= 0.0):
+        return None
+    return value
+
+
 def _as_float(value: Any, *, field_name: str) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be numeric.")
@@ -931,33 +963,41 @@ def run_b4_indexing(
             phases.append(phase)
             existing.add(key)
 
-    if not phases:
-        return B4IndexingResult(
-            indexed_spots=initial_indexed_spots,
-            phase_candidates=[],
-            warnings=warnings
-            + ["No valid B4 phase candidates found; fallback to existing indexing."],
-            provenance={
-                "mode": "b4_strict" if strict_mode else "b4_mvp",
-                "active": False,
-                "reason": "no_phase_candidates",
-            },
-        )
-
     gxy: list[np.ndarray] = []
     d_per_peak: list[float | None] = []
     intensities: list[float] = []
+    rejected_measurements: list[dict[str, Any]] = []
     for idx, peak in enumerate(peaks):
         if idx >= len(g_vectors):
             break
-        gx = float(g_vectors[idx].gx.value)
-        gy = float(g_vectors[idx].gy.value)
-        gxy.append(np.array([gx, gy], dtype=np.float64))
-        d_per_peak.append(
-            None
-            if idx >= len(d_by_peak) or d_by_peak[idx] is None
-            else float(d_by_peak[idx].value)
-        )
+        vector = g_vectors[idx]
+        gx = _measurement_in_nm(vector.gx, reciprocal=True)
+        gy = _measurement_in_nm(vector.gy, reciprocal=True)
+        d_measurement = d_by_peak[idx] if idx < len(d_by_peak) else None
+        d_nm = _measurement_in_nm(d_measurement)
+        norm = float(np.hypot(gx, gy)) if gx is not None and gy is not None else 0.0
+        valid_vector = np.isfinite(norm) and norm > 1e-12
+        if vector.magnitude is not None:
+            magnitude = _measurement_in_nm(vector.magnitude, reciprocal=True)
+            valid_vector = valid_vector and magnitude is not None and magnitude > 0.0
+        if not valid_vector or d_nm is None:
+            rejected_measurements.append(
+                {
+                    "peak_index": idx,
+                    "reason": (
+                        "invalid_physical_g_vector" if not valid_vector else "invalid_d_spacing"
+                    ),
+                    "gx_unit": vector.gx.unit,
+                    "gy_unit": vector.gy.unit,
+                    "d_unit": d_measurement.unit if d_measurement is not None else None,
+                }
+            )
+            # Keep original peak indices; a missing d-spacing cannot receive a new hkl.
+            gxy.append(np.zeros(2, dtype=np.float64))
+            d_per_peak.append(None)
+        else:
+            gxy.append(np.array([gx, gy], dtype=np.float64))
+            d_per_peak.append(d_nm)
         intensities.append(float(peak.intensity or 1.0))
 
     valid_d_count = int(sum(1 for value in d_per_peak if value is not None))
@@ -968,18 +1008,65 @@ def run_b4_indexing(
         "phase_candidate_count": len(phases),
         "d_tolerance_rel": float(d_tolerance_rel),
         "angle_tolerance_deg": float(angle_tolerance_deg),
+        "normalized_units": {"g_vector": "1/nm", "d_spacing": "nm"},
+        "rejected_measurements": rejected_measurements,
     }
+    if rejected_measurements:
+        warnings.append(
+            f"B4 excluded {len(rejected_measurements)} uncalibrated or invalid measurement(s): "
+            "physical g-vectors and finite positive d-spacings are required."
+        )
 
-    if not gxy:
+    if valid_d_count == 0:
+        withheld_hkl = [
+            {"peak_index": spot.peak_index, "hkl": [spot.h, spot.k, spot.l]}
+            for spot in initial_indexed_spots
+            if (spot.h, spot.k, spot.l) != (0, 0, 0)
+        ]
+        safe_initial = [
+            spot.model_copy(
+                update={
+                    "h": 0, "k": 0, "l": 0, "confidence": 0.0,
+                    "d_spacing": (
+                        d_by_peak[spot.peak_index]
+                        if 0 <= spot.peak_index < len(d_by_peak)
+                        else None
+                    ),
+                    "error": Measurement(
+                        value=1.0, unit="relative", method="b4_physical_unit_gate",
+                        warnings=["Previous hkl withheld: current physical inputs are invalid."],
+                    ),
+                }
+            )
+            if (spot.h, spot.k, spot.l) != (0, 0, 0)
+            else spot
+            for spot in initial_indexed_spots
+        ]
+        return B4IndexingResult(
+            indexed_spots=safe_initial,
+            phase_candidates=[],
+            warnings=warnings + [
+                "B4 indexing skipped: no valid physical measurements; "
+                "pixel/unknown units cannot be compared with theoretical nm lattice spacings."
+            ],
+            provenance={
+                "mode": "b4_strict" if strict_mode else "b4_mvp",
+                "active": False,
+                "reason": "no_valid_physical_measurements" if gxy else "no_g_vectors",
+                "diagnostics": {**common_diag, "withheld_initial_hkl": withheld_hkl},
+            },
+        )
+
+    if not phases:
         return B4IndexingResult(
             indexed_spots=initial_indexed_spots,
             phase_candidates=[],
             warnings=warnings
-            + ["No g-vectors available for B4 indexing; fallback to existing indexing."],
+            + ["No valid B4 phase candidates found; fallback to existing indexing."],
             provenance={
                 "mode": "b4_strict" if strict_mode else "b4_mvp",
                 "active": False,
-                "reason": "no_g_vectors",
+                "reason": "no_phase_candidates",
                 "diagnostics": common_diag,
             },
         )
