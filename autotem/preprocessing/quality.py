@@ -10,6 +10,7 @@ import numpy as np
 from scipy import ndimage as ndi
 
 from autotem.core import Measurement, QualityAssessment, TEMDataset
+from autotem.io.readers import read_numeric_file
 
 try:
     from skimage.measure import blur_effect as _skimage_blur_effect
@@ -129,11 +130,8 @@ def _load_from_uri(uri: str | None) -> np.ndarray | None:
     if not path.exists() or not path.is_file():
         return None
     suffix = path.suffix.lower()
-    if suffix == ".npy":
-        array = np.load(path, allow_pickle=False)
-        return np.asarray(array, dtype=np.float64) if array.ndim == 2 else None
-    if suffix in {".txt", ".csv"}:
-        array = np.loadtxt(path)
+    if suffix in {".npy", ".txt", ".csv"}:
+        array = read_numeric_file(path)
         return np.asarray(array, dtype=np.float64) if array.ndim == 2 else None
     if suffix in {".tif", ".tiff", ".png", ".jpg", ".jpeg"}:
         try:

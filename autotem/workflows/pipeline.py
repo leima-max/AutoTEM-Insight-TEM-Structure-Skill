@@ -1088,17 +1088,26 @@ class TEMAnalysisSkill:
                                 dataset.provenance.get("selected_npy_sha256") if dataset else None
                             )
                             detector_input = input_path
+                            options = detector_api_options
                             if plane_hash:
                                 import numpy as np
 
                                 detector_input = np.load(dataset.data.uri, allow_pickle=False)
+                                requested_slice = options.get("slice_index", 0)
+                                if requested_slice != 0:
+                                    step_record.warnings.append(
+                                        f"load already selected the 2D input. Detector slice_index="
+                                        f"{requested_slice} was ignored for this plane."
+                                    )
+                                    options = {**options, "slice_index": 0}
+                                    step_record.parameters["slice_index"] = 0
                             detection_result = detect_atoms(
                                 detector_input,
                                 **{
                                     key: value for key, value in detector_parameters.items()
                                     if key != "image_role"
                                 },
-                                **detector_api_options,
+                                **options,
                             )
                             atom_lattice = detection_result.to_atom_lattice("pixel")
                             atom_lattice.provenance["image_role"] = detector_parameters.get(
@@ -1107,8 +1116,8 @@ class TEMAnalysisSkill:
                             if plane_hash:
                                 atom_lattice.provenance["selected_npy_sha256"] = plane_hash
                                 atom_lattice.provenance["selection"] = dataset.metadata["selection"]
-                            step_record.status = "warning" if detection_result.warnings else "done"
-                            step_record.warnings.extend(list(detection_result.warnings))
+                            step_record.warnings.extend(detection_result.warnings)
+                            step_record.status = "warning" if step_record.warnings else "done"
                             step_record.outputs.extend(["AtomLattice", "atom_coordinates.csv"])
                         except Exception as exc:  # noqa: BLE001
                             step_record.status = "warning"

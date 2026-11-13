@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from autotem.core import AnalysisReport, OutputArtifact, ReportFigure
+from autotem.io.readers import read_numeric_file
 
 try:
     import imageio.v3 as iio
@@ -26,10 +27,8 @@ def _load_array(uri: str | None) -> np.ndarray | None:
     if not path.exists() or not path.is_file():
         return None
     suffix = path.suffix.lower()
-    if suffix == ".npy":
-        return np.load(path, allow_pickle=False)
-    if suffix in {".txt", ".csv"}:
-        return np.loadtxt(path)
+    if suffix in {".npy", ".txt", ".csv"}:
+        return read_numeric_file(path)
     if suffix in {".tif", ".tiff", ".png", ".jpg", ".jpeg"} and iio is not None:
         image = np.asarray(iio.imread(path))
         if image.ndim == 3:

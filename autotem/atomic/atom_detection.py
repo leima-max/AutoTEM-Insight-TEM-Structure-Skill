@@ -8,6 +8,7 @@ import numpy as np
 from scipy import ndimage as ndi
 
 from autotem.core.models import ArrayReference, AtomLattice, AtomSite, Measurement
+from autotem.io.readers import read_numeric_file
 
 try:
     import tifffile
@@ -228,7 +229,9 @@ def _load_image(
     suffix = path.suffix.lower()
     source = {"type": "file", "path": str(path.resolve()), "suffix": suffix}
 
-    if suffix in {".dm", ".dm3", ".dm4"}:
+    if suffix in {".npy", ".txt", ".csv"}:
+        arr = read_numeric_file(path, mmap_mode="r")
+    elif suffix in {".dm", ".dm3", ".dm4"}:
         arr = _read_dm(path)
     elif suffix in {".tif", ".tiff"}:
         arr = _read_tiff(path)

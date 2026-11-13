@@ -22,7 +22,12 @@ from autotem.harness.contracts import (
     StrictParameters,
 )
 from autotem.io.metadata import normalize_metadata
-from autotem.io.readers import _to_jsonable, require_spatial_indices, select_image_page
+from autotem.io.readers import (
+    _to_jsonable,
+    read_numeric_file,
+    require_spatial_indices,
+    select_image_page,
+)
 from autotem.preprocessing.background import subtract_background
 from autotem.preprocessing.basic import assess_quality, preprocess_dataset
 from autotem.preprocessing.denoise import apply_denoise
@@ -296,10 +301,8 @@ def _read_selected(path: Path, p: InputParameters) -> tuple[np.ndarray, dict, di
                         require_spatial_indices(shape)
             array = handle[selected]
             selection["dataset_path"] = selected
-    elif suffix == ".npy":
-        array = np.load(path, allow_pickle=False, mmap_mode="r")
-    elif suffix in {".csv", ".txt"}:
-        array = np.loadtxt(path, delimiter="," if suffix == ".csv" else None)
+    elif suffix in {".npy", ".csv", ".txt"}:
+        array = read_numeric_file(path, mmap_mode="r")
     elif suffix in {".dm3", ".dm4"}:
         try:
             from ncempy.io import dm

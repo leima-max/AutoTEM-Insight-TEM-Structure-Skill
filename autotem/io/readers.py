@@ -259,16 +259,32 @@ def _read_standard_image(path: Path, *, require_plane: bool = False) -> ReadResu
         )
 
 
-def _read_numpy_or_text(path: Path, *, require_plane: bool = False) -> ReadResult:
+def read_numeric_file(path: Path, *, mmap_mode: str | None = None) -> np.ndarray:
+    """Read original NPY pixels or a whitespace- or comma-delimited numeric table."""
     suffix = path.suffix.lower()
     if suffix == ".npy":
-        array = np.load(path, allow_pickle=False, mmap_mode="r" if require_plane else None)
-        if require_plane:
-            require_spatial_indices(array.shape)
-    elif suffix in {".txt", ".csv"}:
-        array = np.loadtxt(path)
-    else:
-        raise ValueError(f"Unsupported array text format: {suffix}")
+        return np.load(path, allow_pickle=False, mmap_mode=mmap_mode)
+    if suffix == ".txt":
+        return np.loadtxt(path)
+    if suffix == ".csv":
+        # Historical CSV files may contain whitespace-separated values.
+        with path.open(encoding="utf-8-sig") as stream:
+            for line in stream:
+                fields = line.partition("#")[0].strip()
+                if fields:
+                    break
+            else:
+                raise ValueError(f"Numeric CSV contains no data: {path.name}")
+            stream.seek(0)
+            return np.loadtxt(stream, delimiter="," if "," in fields else None)
+    raise ValueError(f"Unsupported numeric file: {suffix}")
+
+
+def _read_numpy_or_text(path: Path, *, require_plane: bool = False) -> ReadResult:
+    suffix = path.suffix.lower()
+    array = read_numeric_file(path, mmap_mode="r" if require_plane else None)
+    if require_plane and suffix == ".npy":
+        require_spatial_indices(array.shape)
 
     if array.ndim != 2:
         raise ValueError(f"Expected 2D array but got shape {array.shape} for {path.name}.")

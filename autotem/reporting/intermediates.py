@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from autotem.core import AnalysisReport, OutputArtifact
+from autotem.io.readers import read_numeric_file
 
 try:
     import h5py
@@ -32,10 +33,8 @@ def _load_array_from_uri(uri: str | None) -> np.ndarray | None:
     if not path.exists() or not path.is_file():
         return None
     suffix = path.suffix.lower()
-    if suffix == ".npy":
-        return np.load(path, allow_pickle=False)
-    if suffix in {".txt", ".csv"}:
-        return np.loadtxt(path)
+    if suffix in {".npy", ".txt", ".csv"}:
+        return read_numeric_file(path)
     if suffix in {".tif", ".tiff", ".png", ".jpg", ".jpeg"} and iio is not None:
         image = np.asarray(iio.imread(path))
         if image.ndim == 3:

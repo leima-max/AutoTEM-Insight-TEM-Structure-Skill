@@ -30,6 +30,7 @@ from autotem.diffraction.peak_detection import (
     suggest_peak_parameter_defaults,
 )
 from autotem.diffraction.phase_lookup import PhaseLookupResult, lookup_phase_candidates
+from autotem.io.readers import read_numeric_file
 
 _SUPPORTED_IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 
@@ -93,11 +94,8 @@ def _array_from_reference(reference: ArrayReference) -> np.ndarray | None:
     if not path.exists() or not path.is_file():
         return None
     suffix = path.suffix.lower()
-    if suffix == ".npy":
-        data = np.load(path, allow_pickle=False)
-        return np.asarray(data, dtype=np.float64) if data.ndim == 2 else None
-    if suffix in {".txt", ".csv"}:
-        data = np.loadtxt(path)
+    if suffix in {".npy", ".txt", ".csv"}:
+        data = read_numeric_file(path)
         return np.asarray(data, dtype=np.float64) if data.ndim == 2 else None
     if suffix in _SUPPORTED_IMAGE_SUFFIXES:
         with Image.open(path) as handle:
