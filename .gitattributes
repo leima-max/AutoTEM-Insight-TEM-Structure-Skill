@@ -1,0 +1,32 @@
+# Freeze the same release and test bytes on Windows and POSIX checkouts.
+/.gitattributes text eol=lf
+/README.md text eol=lf
+/pyproject.toml text eol=lf
+/LICENSE* text=auto eol=lf
+/LICENSE*/** text=auto eol=lf
+/NOTICE* text=auto eol=lf
+/NOTICE*/** text=auto eol=lf
+/COPYING* text=auto eol=lf
+/COPYING*/** text=auto eol=lf
+/autotem/** text=auto eol=lf
+/skills/autotem/** text=auto eol=lf
+/configs/harness/** text=auto eol=lf
+/configs/release/** text=auto eol=lf
+/configs/benchmarks/** text=auto eol=lf
+/configs/*.yaml text eol=lf
+/configs/**/*.yaml text eol=lf
+/requirements/release/** text=auto eol=lf
+/tools/release/** text=auto eol=lf
+/tools/acceptance/** text=auto eol=lf
+/tools/setup/** text=auto eol=lf
+/tools/host_acceptance/** text=auto eol=lf
+/tests/** text=auto eol=lf
+/apps/atom_detection_ui.py text eol=lf
+/apps/requirements.txt text eol=lf
+/docs/HARNESS_RELEASE_TECHNICAL_DEVELOPMENT_PLAN.md text eol=lf
+/docs/harness-windows-release.md text eol=lf
+/docs/harness-report-compatibility.md text eol=lf
+/docs/harness-host-adapters.md text eol=lf
+/docs/harness-release-qualification.md text eol=lf
+/.github/workflows/windows-release.yml text eol=lf
+/.github/release-baselines/*.zip binary

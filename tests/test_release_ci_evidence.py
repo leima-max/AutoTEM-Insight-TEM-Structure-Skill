@@ -9,6 +9,7 @@ from zipfile import ZipFile
 import pytest
 import yaml
 
+from tools.release import build_release
 from tools.release import ci_evidence as proof
 
 pytestmark = pytest.mark.smoke
@@ -165,6 +166,30 @@ def test_invalid_or_unfinished_archive_is_rejected(cli, tmp_path, fault):
     with pytest.raises((ValueError, FileExistsError)):
         proof.collect(bundle, evidence, None, out)
     assert out.read_bytes() == b"historic evidence" if fault == "overwrite" else not out.exists()
+
+
+def test_windows_release_triggers_on_every_frozen_source_rule():
+    # BaseLoader preserves GitHub's literal key 'on'; YAML 1.1 otherwise reads it as True.
+    workflow = yaml.load(
+        (ROOT / ".github/workflows/windows-release.yml").read_bytes(), Loader=yaml.BaseLoader
+    )
+    triggers = set(workflow["on"]["pull_request"]["paths"])
+    expected = {".github/release-baselines/**"}
+    for pattern in build_release.SOURCE_PATHS:
+        if (ROOT / pattern).is_dir():
+            expected.add(pattern + "/**")
+        elif pattern == "configs/*.yaml":
+            # Git ls-files matches nested YAML with this pathspec. Actions' '*' stops at '/'.
+            expected.add("configs/**/*.yaml")
+        elif pattern.endswith("*") and "/" not in pattern:
+            # The same Git pathspec includes entries in e.g. LICENSES/vendor.txt.
+            expected.update({pattern, pattern + "/**"})
+        else:
+            expected.add(pattern)
+    assert expected <= triggers, f"Missing Windows release triggers: {sorted(expected - triggers)}"
+    assert {".gitattributes", "apps/atom_detection_ui.py", "apps/requirements.txt"} <= set(
+        build_release.SOURCE_PATHS
+    )
 
 
 def test_ci_joins_three_editions_before_publishing():

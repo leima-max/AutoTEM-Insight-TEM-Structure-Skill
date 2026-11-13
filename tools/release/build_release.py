@@ -43,7 +43,8 @@ from autotem.installation.release import (  # noqa: E402
 
 SNAPSHOT_INDEX = "autotem-source-index.json"
 SOURCE_PATHS = [
-    "README.md", "pyproject.toml", "LICENSE*", "NOTICE*", "COPYING*", "autotem",
+    ".gitattributes", "README.md", "pyproject.toml", "LICENSE*", "NOTICE*", "COPYING*", "autotem",
+    "apps/atom_detection_ui.py", "apps/requirements.txt",
     "skills/autotem", "configs/harness", "configs/release", "tools/release", "tools/acceptance",
     "requirements/release", "tools/setup", "tools/host_acceptance",
     "tests", "configs/*.yaml", "configs/benchmarks", ".github/workflows/windows-release.yml",
