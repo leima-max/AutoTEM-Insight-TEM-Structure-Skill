@@ -3,7 +3,7 @@
 import json
 import sqlite3
 from contextlib import closing
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from zipfile import ZipFile
 
 import pytest
@@ -190,6 +190,29 @@ def test_windows_release_triggers_on_every_frozen_source_rule():
     assert {".gitattributes", "apps/atom_detection_ui.py", "apps/requirements.txt"} <= set(
         build_release.SOURCE_PATHS
     )
+
+
+def test_windows_release_triggers_on_source_suite_git_inputs():
+    workflow = yaml.load(
+        (ROOT / ".github/workflows/windows-release.yml").read_bytes(), Loader=yaml.BaseLoader
+    )
+    triggers = set(workflow["on"]["pull_request"]["paths"])
+    suite_path = "benchmarks/suite_public_minimal.yaml"
+    assert {
+        "apps/b1_b3_preview_ui.py", "apps/b2_diffraction_ui.py", suite_path,
+        "examples/diffsims_closed_loop.yaml", "examples/materials_project_diffsims_lookup.yaml",
+    } <= triggers
+    suite = yaml.safe_load((ROOT / suite_path).read_bytes())
+    report_paths = [
+        (PurePosixPath("benchmarks") / case["report_path"]).as_posix() for case in suite["cases"]
+    ]
+    assert report_paths
+    report_pattern = "benchmarks/cases/*/analysis_report.json"
+    for report in report_paths:
+        # GitHub paths are case-sensitive and anchored at the repository root on every runner.
+        assert report in triggers or (
+            report_pattern in triggers and PurePosixPath("/", report).match("/" + report_pattern)
+        ), report
 
 
 def test_ci_joins_three_editions_before_publishing():
