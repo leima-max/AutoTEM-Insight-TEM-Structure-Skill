@@ -43,7 +43,7 @@ def test_faults_change_only_the_requested_bound_or_sites(faults, positive_plan):
     expected = copy.deepcopy(clean)
     expected["steps"][1]["parameters"]["diffsims_timeout_s"] = 1.0
     assert plans["backend_timeout"] == expected
-    assert plans["worker_timeout"] == {**clean, "budgets": {"simulation_seconds": 1.0}}
+    assert plans["worker_timeout"] == {**clean, "budgets": {"simulation_seconds": 0.1}}
     expected = copy.deepcopy(clean)
     expected["steps"][0]["parameters"]["candidate_phase_params"][0]["atom_sites"] = []
     assert plans["missing_structure"] == expected

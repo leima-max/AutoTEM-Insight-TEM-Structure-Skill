@@ -72,8 +72,9 @@ def fault_plan(positive_plan, name, path):
     if name == "backend_timeout":
         parameters(plan, SIMULATION)["diffsims_timeout_s"] = 1.0
     elif name == "worker_timeout":
-        # The unchanged inner parameter is clipped to this limit by the real service.
-        plan["budgets"]["simulation_seconds"] = 1.0
+        # The real backend subprocess waits at least one second. Exercise the outer
+        # supervisor independently, with a shorter deadline than that inner timer.
+        plan["budgets"]["simulation_seconds"] = 0.1
     elif name == "missing_structure":
         (candidate,) = parameters(plan, "diffraction.index")["candidate_phase_params"]
         candidate["atom_sites"] = []
@@ -468,8 +469,11 @@ def verify_case(folder, name, positive, positive_plan, snapshot, image, python):
                 "Wrong backend failure",
             )
         elif name == "worker_timeout":
+            budget = plan["budgets"]["simulation_seconds"]
             require(
-                error["step_id"] == sim["step_id"] and sim["ended"] - sim["started"] >= 1,
+                error["step_id"] == sim["step_id"]
+                and error["seconds"] == budget
+                and sim["ended"] - sim["started"] >= budget,
                 "Wrong outer deadline",
             )
         frame = sibling("qualify_local").RecordedRun(folder, name, rid, w["report_artifact_id"])
