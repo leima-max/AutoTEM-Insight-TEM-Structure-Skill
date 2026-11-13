@@ -82,7 +82,7 @@ def operation_status(outstanding):
 
 def source_collection(report, data, cases):
     schema = data.get("schema_version", "1.0.0")
-    require(schema in {"1.0.0", "1.1.0", "1.2.0"}, "Unknown source regression schema")
+    require(schema in {"1.0.0", "1.1.0", "1.2.0", "1.3.0"}, "Unknown source regression schema")
     if schema == "1.0.0" and "collection_sha256" not in data:
         return {"verdict": "not_evaluated"}
     inventory = report.with_suffix(".collection.json")
@@ -104,12 +104,20 @@ def source_collection(report, data, cases):
         and all(len(fields) == 1 for fields in node_fields)
         and Counter(fields[0].get("value") for fields in node_fields) == Counter(selected)
     )
-    return {
+    result = {
         "verdict": "passed" if complete else "failed",
         "collected": len(nodes),
         "deselected": len(deselected),
         "sha256": data["collection_sha256"],
     }
+    if schema == "1.3.0":
+        require(
+            selection.get("source_import", {}).get("path") == "autotem/__init__.py"
+            and re.fullmatch(r"[0-9a-f]{64}", selection["source_import"].get("sha256", "")),
+            "Missing actual pytest source import",
+        )
+        result["source_import"] = selection["source_import"]
+    return result
 
 
 def source_tests(
@@ -128,7 +136,7 @@ def source_tests(
     suites = root.findall("testsuite") if root.tag == "testsuites" else [root]
     cases = root.findall(".//testcase")
     counts = Counter()
-    passed_names = set()
+    passed_names, passed_nodes = set(), set()
     for case in cases:
         outcomes = [t for t in ("failure", "error", "skipped") if case.find(t) is not None]
         require(len(outcomes) <= 1, "Ambiguous JUnit result")
@@ -136,6 +144,9 @@ def source_tests(
         counts[status] += 1
         if status == "passed":
             passed_names.add(case.attrib["name"])
+            fields = case.findall("./properties/property[@name='autotem_nodeid']")
+            if len(fields) == 1:
+                passed_nodes.add(fields[0].get("value"))
     totals = {
         "tests": len(cases),
         "passed": counts["passed"],
@@ -160,7 +171,7 @@ def source_tests(
     optional = expected <= passed_names and expected <= set(data.get("optional_tests_passed", []))
     collection = source_collection(report, data, cases)
     environment = {"verdict": "not_evaluated"}
-    if data.get("schema_version") == "1.2.0":
+    if data.get("schema_version") in {"1.2.0", "1.3.0"}:
         nodes = {
             field.get("value")
             for case in cases
@@ -178,7 +189,8 @@ def source_tests(
                 "test_optional_real_simulation_and_matching_from_disk",
             }
         )
-        environment = load_module(Path(__file__).with_name("source_test_environment.py")).recheck(
+        test_env = load_module(Path(__file__).with_name("source_test_environment.py"))
+        environment = test_env.recheck(
             report,
             data,
             identity,
@@ -186,6 +198,15 @@ def source_tests(
             bundle=bundle,
             simulation_identity=simulation_identity,
         )
+        if data["schema_version"] == "1.3.0":
+            wheel_passed = test_env.DEPLOYMENT_NODE in passed_nodes
+            environment["wheel_entrypoint"] = "passed" if wheel_passed else "failed"
+            source_hash_observed = collection["source_import"]["sha256"]
+            require(
+                environment["wheel_init_sha256"] == source_hash_observed,
+                "Collected source import differs from the issued wheel",
+            )
+            optional = optional and wheel_passed
     passed = (
         data["case_verdict"] == "passed"
         and data["execution_layer"] == "source_checkout"

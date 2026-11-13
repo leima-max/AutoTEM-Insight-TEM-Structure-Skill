@@ -38,6 +38,17 @@ class CollectionInventory:
             "selected": [item.nodeid for item in session.items],
             "deselected": self.deselected,
         }
+        if os.environ.get("AUTOTEM_DEPLOYMENT_WHEEL") == "1":
+            import autotem
+
+            module = Path(autotem.__file__).resolve()
+            root = Path.cwd().resolve()
+            if module != root / "autotem/__init__.py":
+                raise ValueError("Pytest imported the installed wheel instead of the staged source")
+            selection["source_import"] = {
+                "path": module.relative_to(root).as_posix(),
+                "sha256": hashlib.sha256(module.read_bytes()).hexdigest(),
+            }
         with self.path.open("x", encoding="utf-8") as stream:
             print(json.dumps(selection, indent=2), file=stream)
 
@@ -165,6 +176,7 @@ def run(
     cases = ET.parse(junit).getroot().findall(".//testcase")
     totals = Counter()
     optional = []
+    startup_passed = False
     for case in cases:
         state = next(
             (k for k in ("error", "failure", "skipped") if case.find(k) is not None), "passed"
@@ -175,6 +187,10 @@ def run(
             "test_optional_real_simulation_and_matching_from_disk",
         }:
             optional.append(case.get("name"))
+        fields = case.findall("./properties/property[@name='autotem_nodeid']")
+        if state == "passed" and [p.get("value") for p in fields] == [environment.DEPLOYMENT_NODE]:
+            startup_passed = True
+    wheel_startup = environment.DEPLOYMENT_TEST in index["files"]
     passed = (
         bool(cases)
         and process.returncode == 0
@@ -182,9 +198,10 @@ def run(
         and totals["passed"] == len(cases)
         and not selection["deselected"]
         and len(selection["selected"]) == len(cases)
+        and (not wheel_startup or startup_passed)
     )
     result = {
-        "schema_version": "1.2.0",
+        "schema_version": "1.3.0" if wheel_startup else "1.2.0",
         "release_manifest_sha256": verifier.sha256(manifest_file),
         "source_archive_sha256": source["archive_sha256"],
         "support_git_commit": source["git_commit"],

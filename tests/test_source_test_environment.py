@@ -250,6 +250,54 @@ def test_isolated_regression_replays_with_and_without_original_bundle(receipts):
         check(report, data)
 
 
+@pytest.mark.parametrize("fault", [None, "skipped_startup", "mixed_import", "wrong_wheel"])
+def test_wheel_startup_receipt_requires_source_import_and_exact_junit_node(receipts, fault):
+    report, _, data, environment = receipts
+    init = "a" * 64
+    environment["schema_version"] = "1.1.0"
+    observed = environment["probe"]
+    del observed["editable_source"]
+    observed.update(
+        installed_module="autotem/__init__.py",
+        checkout_on_sys_path=False,
+        verified_package_members=2,
+        wheel_sha256="e" * 64 if fault == "wrong_wheel" else "2" * 64,
+        wheel_init_sha256=init,
+    )
+    data["schema_version"] = "1.3.0"
+    data["environment_sha256"] = write(report.with_suffix(".environment.json"), environment)
+    selection_path = report.with_suffix(".collection.json")
+    selection = json.loads(selection_path.read_bytes())
+    selection["source_import"] = {
+        "path": "autotem/__init__.py",
+        "sha256": "f" * 64 if fault == "mixed_import" else init,
+    }
+    selection["selected"].append(env.DEPLOYMENT_NODE)
+    data["collection_sha256"] = write(selection_path, selection)
+    junit = report.with_suffix(".junit.xml")
+    suite = ET.parse(junit).getroot()
+    suite.set("tests", "3")
+    case = ET.SubElement(suite, "testcase", name=env.DEPLOYMENT_NODE.split("::")[1])
+    props = ET.SubElement(case, "properties")
+    ET.SubElement(props, "property", name="autotem_nodeid", value=env.DEPLOYMENT_NODE)
+    skipped = fault == "skipped_startup"
+    if skipped:
+        ET.SubElement(case, "skipped")
+    suite.set("skipped", str(int(skipped)))
+    ET.ElementTree(suite).write(junit, encoding="utf-8")
+    data["junit_sha256"] = env.sha(junit)
+    data["results"].update(tests=3, collected=3, skipped=int(skipped), passed=3 - int(skipped))
+    write(report, data)
+    if fault in {"wrong_wheel", "mixed_import"}:
+        with pytest.raises(ValueError, match="wheel|Wheel"):
+            check(report, data)
+    else:
+        result = check(report, data)
+        expected = "failed" if skipped else "passed"
+        assert result["verdict"] == result["environment"]["wheel_entrypoint"] == expected
+        assert result["collection"]["source_import"] == selection["source_import"]
+
+
 @pytest.mark.parametrize("bad", ["global", "wheel", "user-site", "declaration", "psf"])
 def test_changed_or_ambient_source_environment_cannot_pass(receipts, bad):
     report, bundle, data, environment = receipts

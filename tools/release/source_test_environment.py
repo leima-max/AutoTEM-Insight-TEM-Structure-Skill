@@ -17,6 +17,10 @@ from pathlib import Path
 TEST_LOCK = "requirements/release/win-amd64-cp312-source-tests.txt"
 PRODUCT = "autotem-insight"
 PROFILES = {"core": "traditional-core-mcp", "simulation": "traditional-simulation"}
+DEPLOYMENT_TEST = "tests/test_streamlit_deployment.py"
+DEPLOYMENT_NODE = (
+    DEPLOYMENT_TEST + "::test_installed_wheel_starts_entrypoint_without_repository_imports"
+)
 
 
 def require(value, message):
@@ -75,7 +79,7 @@ def process_env(scratch):
     return env
 
 
-def probe(checkout):
+def probe(checkout, wheel=None):
     prefix = Path(sys.prefix).resolve()
     module = Path(importlib.util.find_spec("autotem").origin).resolve()
     require(
@@ -83,10 +87,6 @@ def probe(checkout):
         and sys.flags.isolated
         and not site.ENABLE_USER_SITE,
         "Test interpreter must use an isolated venv without user site-packages",
-    )
-    require(
-        module == checkout / "autotem/__init__.py",
-        "Product import did not resolve to the frozen source checkout",
     )
     installed = {}
     for dist in importlib.metadata.distributions():
@@ -96,17 +96,51 @@ def probe(checkout):
             "Duplicate or external Python distribution in the source-test environment",
         )
         installed[name] = dist.version
-    direct = json.loads(importlib.metadata.distribution(PRODUCT).read_text("direct_url.json"))
-    require(
-        direct["url"].rstrip("/") == checkout.as_uri() and direct["dir_info"]["editable"] is True,
-        "AutoTEM must be installed editable from the tested source checkout",
-    )
+    dist = importlib.metadata.distribution(PRODUCT)
+    if wheel is None:
+        direct = json.loads(dist.read_text("direct_url.json"))
+        require(
+            module == checkout / "autotem/__init__.py"
+            and direct["url"].rstrip("/") == checkout.as_uri()
+            and direct["dir_info"]["editable"] is True,
+            "AutoTEM must be installed editable from the tested source checkout",
+        )
+        origin = {"editable_source": "autotem/__init__.py"}
+    else:
+        installed_root = Path(dist.locate_file("")).resolve()
+        direct = json.loads(dist.read_text("direct_url.json") or "{}")
+        require(
+            module == installed_root / "autotem/__init__.py"
+            and not module.is_relative_to(checkout)
+            and not direct.get("dir_info", {}).get("editable")
+            and all(not Path(p).resolve().is_relative_to(checkout) for p in sys.path if p),
+            "Deployment interpreter exposes the checkout or an editable AutoTEM",
+        )
+        with zipfile.ZipFile(wheel) as archive:
+            runtime = {
+                n for n in archive.namelist() if n.startswith("autotem/") and not n.endswith("/")
+            }
+            require(
+                "autotem/io/upload_lifecycle.py" in runtime, "Upload helper missing from the wheel"
+            )
+            for name in runtime:
+                require(
+                    (installed_root / name).read_bytes() == archive.read(name),
+                    f"Deployment wheel bytes differ: {name}",
+                )
+        origin = {
+            "wheel_sha256": sha(wheel),
+            "verified_package_members": len(runtime),
+            "installed_module": "autotem/__init__.py",
+            "wheel_init_sha256": sha(module),
+            "checkout_on_sys_path": False,
+        }
     return {
         "python_version": platform.python_version(),
         "isolated": True,
         "user_site": False,
         "base_executable_sha256": sha(Path(sys._base_executable)),
-        "editable_source": "autotem/__init__.py",
+        **origin,
         "all_distributions_in_test_venv": True,
         "installed": installed,
     }
@@ -154,6 +188,8 @@ def prepare(verifier, bundles, checkout, out, scratch, env, test_pool, explicit_
         sha(Path(sys._base_executable)) == base_digest,
         "Source runner differs from the issued PSF base executable",
     )
+    with zipfile.ZipFile(bundles["core"] / bound["core"]["source"]["archive"]) as archive:
+        wheel_startup = DEPLOYMENT_TEST in archive.namelist()
     runtime_lock = scratch / "simulation-dependencies.txt"
     runtime_lock.write_text(
         "".join(f"{n}=={v} --hash=sha256:{h}\n" for n, (v, h) in runtime.items() if n != PRODUCT),
@@ -225,28 +261,38 @@ def prepare(verifier, bundles, checkout, out, scratch, env, test_pool, explicit_
                 str(extra),
             ]
         )
-        run(
-            [
-                *pip,
-                "install",
-                "--no-index",
-                "--no-build-isolation",
-                "--no-deps",
-                "-e",
-                str(checkout),
-            ]
-        )
+        if wheel_startup:
+            run([*pip, "install", "--no-index", "--no-deps", str(sim.wheel)])
+        else:
+            run(
+                [
+                    *pip,
+                    "install",
+                    "--no-index",
+                    "--no-build-isolation",
+                    "--no-deps",
+                    "-e",
+                    str(checkout),
+                ]
+            )
         run([*pip, "check"])
     env["PATH"] = str(python.parent) + os.pathsep + env.get("PATH", "")
     observed = json.loads(
         subprocess.check_output(
-            [str(python), "-I", "-B", str(Path(__file__).resolve()), str(checkout)],
+            [
+                str(python),
+                "-I",
+                "-B",
+                str(Path(__file__).resolve()),
+                str(checkout),
+                *([str(sim.wheel)] if wheel_startup else []),
+            ],
             cwd=scratch,
             env=env,
         )
     )
     result = {
-        "schema_version": "1.0.0",
+        "schema_version": "1.1.0" if wheel_startup else "1.0.0",
         "execution_layer": "isolated_source_test_venv",
         "probe": observed,
         "simulation_manifest_sha256": sim.manifest_sha256,
@@ -260,6 +306,8 @@ def prepare(verifier, bundles, checkout, out, scratch, env, test_pool, explicit_
     base.with_suffix(".environment.json").write_text(
         json.dumps(result, sort_keys=True, indent=2), encoding="utf-8"
     )
+    if wheel_startup:
+        env["AUTOTEM_DEPLOYMENT_WHEEL"] = "1"
     return python
 
 
@@ -327,7 +375,7 @@ def recheck(report, data, identity, source_hash, *, bundle=None, simulation_iden
     supplements = pins(extra)
     runtime = pins(report.with_suffix(".simulation.lock.txt"))
     require(
-        env["schema_version"] == "1.0.0"
+        env["schema_version"] == ("1.1.0" if data.get("schema_version") == "1.3.0" else "1.0.0")
         and env["execution_layer"] == "isolated_source_test_venv"
         and not supplements.keys() & runtime.keys()
         and env["test_lock_sha256"] == sha(extra)
@@ -354,13 +402,29 @@ def recheck(report, data, identity, source_hash, *, bundle=None, simulation_iden
         and obs["isolated"] is True
         and obs["user_site"] is False
         and obs["all_distributions_in_test_venv"] is True
-        and obs["editable_source"] == "autotem/__init__.py"
         and obs["python_version"] == data["python_version"] == core["target"]["python_version"]
         and re.fullmatch("[a-f0-9]{64}", obs["base_executable_sha256"])
         and obs["base_executable_sha256"] == env["psf_executable_sha256"]
         and env["pip_check"] == "passed",
         "Installed source-test environment differs from its locks or source",
     )
+    wheel_startup = data.get("schema_version") == "1.3.0"
+    if wheel_startup:
+        require(
+            obs.get("wheel_sha256") == runtime[PRODUCT][1]
+            and obs.get("checkout_on_sys_path") is False
+            and obs.get("installed_module") == "autotem/__init__.py"
+            and re.fullmatch("[a-f0-9]{64}", obs.get("wheel_init_sha256", ""))
+            and type(obs.get("verified_package_members")) is int
+            and obs["verified_package_members"] > 0
+            and "editable_source" not in obs,
+            "Deployment interpreter or release wheel inspection differs",
+        )
+    else:
+        require(
+            obs.get("editable_source") == "autotem/__init__.py",
+            "Source-test editable installation differs",
+        )
     origin = env["test_lock_origin"]
     require(
         origin in {"archived_source", "explicit_legacy_lock"}, "Unknown source-test lock origin"
@@ -373,6 +437,18 @@ def recheck(report, data, identity, source_hash, *, bundle=None, simulation_iden
         require(sha(archive) == source_hash, "Source-test source archive changed")
         with zipfile.ZipFile(archive) as z:
             archived = TEST_LOCK in z.namelist()
+            require(
+                (DEPLOYMENT_TEST in z.namelist()) == wheel_startup,
+                "Archived deployment test does not match the receipt schema",
+            )
+            if wheel_startup:
+                indexed = json.loads(z.read(core["source"]["inventory_member"]))["files"]
+                require(
+                    obs["verified_package_members"]
+                    == sum(name.startswith("autotem/") for name in indexed)
+                    and obs["wheel_init_sha256"] == indexed["autotem/__init__.py"],
+                    "Deployment interpreter differs from the archived package members",
+                )
             require(
                 archived == (origin == "archived_source")
                 and (not archived or z.read(TEST_LOCK) == extra.read_bytes()),
@@ -395,8 +471,28 @@ def recheck(report, data, identity, source_hash, *, bundle=None, simulation_iden
         "test_lock_sha256": sha(extra),
         "test_lock_origin": origin,
         "installed_distributions": len(expected),
+        **(
+            {
+                "wheel_init_sha256": obs["wheel_init_sha256"],
+                "wheel_sha256": obs["wheel_sha256"],
+                "deployment_package_versions": {
+                    name: obs["installed"][name]
+                    for name in ("streamlit", "streamlit-drawable-canvas")
+                    if name in obs["installed"]
+                },
+            }
+            if wheel_startup
+            else {}
+        ),
     }
 
 
 if __name__ == "__main__":
-    print(json.dumps(probe(Path(sys.argv[1]).resolve())))
+    print(
+        json.dumps(
+            probe(
+                Path(sys.argv[1]).resolve(),
+                Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else None,
+            )
+        )
+    )
