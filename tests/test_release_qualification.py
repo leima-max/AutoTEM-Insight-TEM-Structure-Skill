@@ -235,7 +235,8 @@ def test_junit_body_and_counts_are_checked(tmp_path):
 
 
 @pytest.mark.parametrize("filtered", [False, True])
-def test_collection_inventory_links_each_real_junit_node(tmp_path, filtered):
+def test_collection_inventory_links_each_real_junit_node(tmp_path, filtered, monkeypatch):
+    monkeypatch.setenv("AUTOTEM_DEPLOYMENT_WHEEL", "1")
     tests = tmp_path / "tests"
     tests.mkdir()
     (tests / "test_sample.py").write_text("def test_keep(): pass\ndef test_second(): pass\n")
@@ -267,6 +268,7 @@ def test_collection_inventory_links_each_real_junit_node(tmp_path, filtered):
         "collection_sha256": release.sha(inventory),
         "results": {"collected": 2, "deselected": int(filtered)},
     }
+    assert "source_import" not in json.loads(inventory.read_bytes())
     cases = ET.parse(junit).getroot().findall(".//testcase")
     result = release.source_collection(report, data, cases)
     assert result["verdict"] == ("failed" if filtered else "passed")
@@ -275,6 +277,30 @@ def test_collection_inventory_links_each_real_junit_node(tmp_path, filtered):
         fields = cases[0].find("./properties")
         fields.remove(fields.find("property[@name='autotem_nodeid']"))
         assert release.source_collection(report, data, cases)["verdict"] == "failed"
+
+
+@pytest.mark.parametrize("correct_origin", [False, True])
+def test_staged_inventory_requires_the_checkout_import(tmp_path, correct_origin, monkeypatch):
+    monkeypatch.delenv("AUTOTEM_DEPLOYMENT_WHEEL", raising=False)
+    monkeypatch.chdir(tmp_path)
+    package = tmp_path / ("autotem" if correct_origin else "site-packages/autotem")
+    package.mkdir(parents=True)
+    init = package / "__init__.py"
+    init.write_bytes(b"# staged source\n")
+    monkeypatch.setitem(sys.modules, "autotem", SimpleNamespace(__file__=str(init)))
+    inventory = tmp_path / "inventory.json"
+    plugin = run_source_tests.CollectionInventory(inventory, verify_staged_source=True)
+    session = SimpleNamespace(items=[], config=SimpleNamespace(args=[], getoption=lambda key: ""))
+    if correct_origin:
+        plugin.pytest_collection_finish(session)
+        assert json.loads(inventory.read_bytes())["source_import"] == {
+            "path": "autotem/__init__.py",
+            "sha256": release.sha(init),
+        }
+    else:
+        with pytest.raises(ValueError, match="instead of the staged source"):
+            plugin.pytest_collection_finish(session)
+        assert not inventory.exists()
 
 
 def test_headless_watch_covers_work_packages_and_attempted_imports(tmp_path):

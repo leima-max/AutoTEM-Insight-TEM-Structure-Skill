@@ -16,13 +16,15 @@ from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+STAGED_INVENTORY = "--staged-source-inventory"
 
 
 class CollectionInventory:
     """Record pytest's actual selection and link each JUnit case to its collected node."""
 
-    def __init__(self, path):
+    def __init__(self, path, *, verify_staged_source=False):
         self.path = path
+        self.verify_staged_source = verify_staged_source
         self.deselected = []
 
     def pytest_deselected(self, items):
@@ -38,7 +40,7 @@ class CollectionInventory:
             "selected": [item.nodeid for item in session.items],
             "deselected": self.deselected,
         }
-        if os.environ.get("AUTOTEM_DEPLOYMENT_WHEEL") == "1":
+        if self.verify_staged_source:
             import autotem
 
             module = Path(autotem.__file__).resolve()
@@ -146,6 +148,7 @@ def run(
     )
     junit = out / "source-regression.junit.xml"
     inventory = out / "source-regression.collection.json"
+    wheel_startup = environment.DEPLOYMENT_TEST in index["files"]
     started = time.monotonic()
     with (out / "pytest.log").open("wb") as log:
         process = subprocess.run(
@@ -156,7 +159,7 @@ def run(
                 "-X",
                 "utf8",
                 str(checkout / "tools/release/run_source_tests.py"),
-                "--pytest-inventory",
+                STAGED_INVENTORY if wheel_startup else "--pytest-inventory",
                 str(inventory),
                 "-o",
                 "addopts=-q",
@@ -190,7 +193,6 @@ def run(
         fields = case.findall("./properties/property[@name='autotem_nodeid']")
         if state == "passed" and [p.get("value") for p in fields] == [environment.DEPLOYMENT_NODE]:
             startup_passed = True
-    wheel_startup = environment.DEPLOYMENT_TEST in index["files"]
     passed = (
         bool(cases)
         and process.returncode == 0
@@ -243,12 +245,14 @@ def run(
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["--pytest-inventory"]:
+    if sys.argv[1:2] in (["--pytest-inventory"], [STAGED_INVENTORY]):
         import pytest
 
         # Match `python -m pytest` in the detached archive checkout.
         sys.path.insert(0, str(Path.cwd()))
-        inventory_plugin = CollectionInventory(Path(sys.argv[2]))
+        inventory_plugin = CollectionInventory(
+            Path(sys.argv[2]), verify_staged_source=sys.argv[1] == STAGED_INVENTORY
+        )
         raise SystemExit(pytest.main(sys.argv[3:], plugins=[inventory_plugin]))
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("bundle", "simulation-bundle", "checkout", "out", "scratch"):
