@@ -261,7 +261,7 @@ def _estimate_astigmatism_risk(fft_magnitude: np.ndarray) -> float:
 
 def _estimate_high_freq_ratio(fft_mag: np.ndarray) -> float:
     h, w = fft_mag.shape
-    yy, xx = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
+    yy, xx = np.indices((h, w), sparse=True)
     cy = (h - 1) / 2.0
     cx = (w - 1) / 2.0
     rr = np.hypot(yy - cy, xx - cx)

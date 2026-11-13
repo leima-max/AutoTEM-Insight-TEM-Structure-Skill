@@ -32,6 +32,10 @@ When running an analysis, a multipage TIFF or an image with several bands (TIFF,
 
 A unique grayscale plane uses the original image reader and preserves TIFF calibration tags. Ordinary two-dimensional NPY, TXT and previously supported CSV inputs retain their reader metadata. The low-level `autotem.io.read_image()` still provides its historical first-page grayscale preview and corresponding warnings for multipage RGB TIFFs.
 
+For a legacy `detect_atoms` step, put scientific settings under `workflow.parameters.detect_atoms` or `workflow.parameters.atom_detection`. Both default entry points apply `mode`, `gaussian_sigma`, `min_distance`, `threshold_rel` (greater than zero and at most one), and `max_atoms` to the raw plane. For example, `atom_detection: {mode: dog, min_distance: 9, threshold_rel: 0.85, max_atoms: 1}` returns at most one candidate. A Python caller's `atom_detection_options` overrides individual scientific fields. The effective workflow and report step record the merged scientific settings. Duplicate fields across the two YAML groups, unused groups, unknown fields, and invalid values report configuration errors.
+
+The historical detector uses pixel coordinates. Set `image_role: raw` explicitly if needed. For `image_role: processed`, select a registered recipe with preprocessing and detection, or run a supported legacy recipe through `--harness`. The Python-only output option `overlay_path` and reader argument `slice_index` remain available to direct callers. Use `workflow.parameters.load` to select a plane in a recipe.
+
 ## Translate a legacy YAML workflow
 
 | Legacy step or parameter group | Registered operations | Scope |

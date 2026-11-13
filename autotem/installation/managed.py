@@ -504,6 +504,24 @@ def _active_state(profile):
     return "host_setup_required" if "mcp" in PROFILE_EXTRAS[profile] else "local_cli_ready"
 
 
+def _host_install_order(control, owners, requested):
+    hosts = sorted(set(owners) | {requested})
+    if len(hosts) > 1:
+        # Only the host that installed the shared launcher may replace it. Other
+        # adapters will then encounter the new bytes as an unchanged project file.
+        for host, key in owners.items():
+            if key:
+                _, receipt = removal._host_receipt(control, key)
+                if any(
+                    row["path"] == ".autotem/host-entry.py" and not row.get("preexisting_unmanaged")
+                    for row in receipt["files"]
+                ):
+                    hosts.remove(host)
+                    hosts.insert(0, host)
+                    break
+    return hosts
+
+
 def manage(
     project,
     bundle,
@@ -702,7 +720,7 @@ def manage(
             removal.record_new_runtime(control, path, record, fresh=fresh_runtime)
             boot._atomic_json(path, record)
             owners = dict(previous["host_installations"]) if previous else {}
-            hosts = sorted(set(owners) | {host})
+            hosts = _host_install_order(control, owners, host)
             command = [
                 staged["python_executable"],
                 "-I",

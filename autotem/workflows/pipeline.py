@@ -188,6 +188,56 @@ def _parameter_signature(parameters: dict[str, Any]) -> str:
     return json.dumps(parameters, sort_keys=True, default=str)
 
 
+def _legacy_atom_options(
+    workflow: WorkflowConfig, overrides: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Resolve both legacy YAML aliases once and retain an effective, replayable recipe."""
+    groups = ("detect_atoms", "atom_detection")
+    supplied = [name for name in groups if name in workflow.parameters]
+    if "detect_atoms" not in {step.name for step in workflow.steps}:
+        if supplied or overrides:
+            raise ValueError("Atom detection parameters require a detect_atoms step.")
+        return {}, {}
+    from autotem.harness.contracts import HarnessError
+    from autotem.services.atomic import DetectParameters
+
+    values: dict[str, Any] = {}
+    for name in supplied:
+        group = workflow.parameters[name]
+        if not isinstance(group, dict):
+            raise ValueError(f"workflow.parameters.{name} must be a mapping.")
+        for key, value in group.items():
+            if key not in DetectParameters.model_fields or key in values:
+                raise HarnessError("LEGACY_PARAMETER_REQUIRES_MIGRATION", f"{name}.{key}")
+            values[key] = value
+    options = dict(overrides or {})
+    # These file-output and input-reader options belonged to the Python call before
+    # YAML mapping was supported. They are not registered scientific parameters.
+    api_options = {
+        key: options.pop(key) for key in ("overlay_path", "slice_index") if key in options
+    }
+    if "return_overlay_array" in options and options.pop("return_overlay_array") is not False:
+        raise ValueError("return_overlay_array is unimplemented. Use overlay_path to save a PNG.")
+    if options.pop("coordinate_unit", "pixel") != "pixel":
+        raise ValueError(
+            "detect_atoms returns pixel coordinates. Convert them before changing units."
+        )
+    if not values and not options:
+        return {}, api_options
+    effective = DetectParameters.model_validate({**values, **options}).model_dump()
+    if effective["image_role"] != "raw":
+        raise ValueError(
+            "Legacy detect_atoms reads raw. Use a registered workflow for image_role=processed."
+        )
+    if effective["threshold_rel"] == 0:
+        raise ValueError("detect_atoms threshold_rel must be in (0, 1].")
+    if supplied or overrides:
+        for name in supplied:
+            del workflow.parameters[name]
+        workflow.parameters[supplied[0] if supplied else "detect_atoms"] = effective
+    return effective, api_options
+
+
 def _ensure_forced_step(workflow: WorkflowConfig, step_name: str) -> None:
     existing = [step.name for step in workflow.steps]
     if step_name in existing:
@@ -802,6 +852,9 @@ class TEMAnalysisSkill:
             recipe = load_workflow_recipe(workflow_path)
             if detect_atoms_step is True:
                 _ensure_forced_step(recipe.workflow, "detect_atoms")
+            detector_parameters, detector_api_options = _legacy_atom_options(
+                recipe.workflow, atom_detection_options
+            )
             if any(step.name == "simulate" for step in recipe.workflow.steps):
                 simulation_parameters = _extract_stage_parameters(
                     recipe.workflow.parameters,
@@ -1027,6 +1080,11 @@ class TEMAnalysisSkill:
                             step_record.inputs = [str(item) for item in expected_inputs]
                         if isinstance(expected_outputs, list):
                             step_record.outputs = [str(item) for item in expected_outputs]
+                        step_record.parameters = {**detector_parameters, **detector_api_options}
+                        if "overlay_path" in step_record.parameters:
+                            step_record.parameters["overlay_path"] = str(
+                                step_record.parameters["overlay_path"]
+                            )
                         try:
                             plane_hash = (
                                 dataset.provenance.get("selected_npy_sha256") if dataset else None
@@ -1038,12 +1096,15 @@ class TEMAnalysisSkill:
                                 detector_input = np.load(dataset.data.uri, allow_pickle=False)
                             detection_result = detect_atoms(
                                 detector_input,
-                                **dict(atom_detection_options or {}),
+                                **{
+                                    key: value for key, value in detector_parameters.items()
+                                    if key != "image_role"
+                                },
+                                **detector_api_options,
                             )
-                            atom_lattice = detection_result.to_atom_lattice(
-                                coordinate_unit=str(
-                                    (atom_detection_options or {}).get("coordinate_unit", "pixel")
-                                )
+                            atom_lattice = detection_result.to_atom_lattice("pixel")
+                            atom_lattice.provenance["image_role"] = detector_parameters.get(
+                                "image_role", "raw"
                             )
                             if plane_hash:
                                 atom_lattice.provenance["selected_npy_sha256"] = plane_hash

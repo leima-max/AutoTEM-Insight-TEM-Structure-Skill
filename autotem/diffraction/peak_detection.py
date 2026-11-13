@@ -218,7 +218,7 @@ def detect_bragg_peaks(
         detector_sigma=float(detector_sigma),
         dog_sigma_ratio=float(dog_sigma_ratio),
     )
-    yy, xx = np.indices(response.shape)
+    yy, xx = np.indices(response.shape, sparse=True)
     rr = np.hypot(xx - float(center[0]), yy - float(center[1]))
     max_radius = (
         None

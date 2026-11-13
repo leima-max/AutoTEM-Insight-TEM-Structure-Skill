@@ -9,6 +9,7 @@ import importlib.metadata
 import inspect
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,7 +33,8 @@ def _finish_unclaimed(db, run_id, job_id, status, step_status, error, ended):
     """Settle a verified unclaimed package under its caller's write transaction."""
     encoded = encode(error)
     db.execute(
-        "UPDATE runs SET status=?,error=?,updated=? WHERE run_id=?",
+        "UPDATE runs SET status=?,error=?,updated=?,worker_pid=NULL,worker_identity=NULL "
+        "WHERE run_id=?",
         (status, encoded, ended, run_id),
     )
     db.execute(
@@ -151,6 +153,8 @@ class Harness:
         asynchronous: bool = True,
         run_id: str | None = None,
     ) -> dict:
+        from .worker import process_identity
+
         reject_credentials(user_request)
         reject_credentials(idempotency_key)
         if idempotency_key is not None and (not idempotency_key or len(idempotency_key) > 200):
@@ -287,6 +291,10 @@ class Harness:
         now = time.time()
         run_id = uuid.uuid4().hex
         job_id = uuid.uuid4().hex
+        # Before queue publication, the submitting process owns preparation. The scheduler
+        # and scientific worker claim their own identities only after this handoff.
+        preparer_pid = os.getpid()
+        preparer_identity = process_identity(preparer_pid)
         parameter_diff = None
         if parent:
             parameter_diff = {
@@ -323,7 +331,8 @@ class Harness:
             db.execute(
                 "INSERT INTO runs(run_id,parent_run_id,idempotency_key,request_hash,request,"
                 "status,created,updated,input_path,source_hash,execution_mode,user_request,"
-                "parameter_diff,submitted_hash) VALUES(?,?,?,?,?,'preparing',?,?,?,?,?,?,?,?)",
+                "parameter_diff,submitted_hash,worker_pid,worker_identity) "
+                "VALUES(?,?,?,?,?,'preparing',?,?,?,?,?,?,?,?,?,?)",
                 (
                     run_id,
                     parent_run_id,
@@ -338,6 +347,8 @@ class Harness:
                     user_request,
                     encode(parameter_diff) if parameter_diff else None,
                     submitted_hash,
+                    preparer_pid,
+                    preparer_identity,
                 ),
             )
             for step in request["steps"]:
@@ -421,7 +432,8 @@ class Harness:
                 if preparing:
                     stamp = time.time()
                     db.execute(
-                        "UPDATE runs SET input_path=?,status='queued',updated=? WHERE run_id=?",
+                        "UPDATE runs SET input_path=?,status='queued',updated=?,"
+                        "worker_pid=NULL,worker_identity=NULL WHERE run_id=?",
                         (str(input_path), stamp, run_id),
                     )
                     submitted = {
@@ -459,8 +471,13 @@ class Harness:
         return self.get_run_status(run_id) if asynchronous else self._wait(run_id)
 
     def _existing_submission(self, run_id, asynchronous):
-        if self.store.get_run(run_id)["status"] == "queued":
+        run = self.store.get_run(run_id)
+        if run["status"] == "queued":
             self._launch_scheduler(run_id)
+        elif run["status"] == "preparing" and run["worker_pid"] is None:
+            # Pre-upgrade clients left no owner identity. Return the recorded status to
+            # a waiting retry so the user can inspect or cancel it without spawning work.
+            return self.get_run_status(run_id)
         return self.get_run_status(run_id) if asynchronous else self._wait(run_id)
 
     def _append_work_package(self, run_id, request, key, user_request, asynchronous):
@@ -662,6 +679,44 @@ class Harness:
         from .worker import process_alive
 
         run = self.store.get_run(run_id)
+        if (
+            run["status"] == "preparing"
+            and run["worker_pid"]
+            and not process_alive(run["worker_pid"], run["worker_identity"])
+        ):
+            job_id = run["job_id"]
+            error = {
+                "code": "PREPARATION_INTERRUPTED",
+                "message": "The submitting process exited before the job was queued. "
+                "Use a new idempotency key to submit a replacement.",
+            }
+            with self.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                if owns_preparation(db, run_id, job_id):
+                    stamp = time.time()
+                    _finish_unclaimed(
+                        db, run_id, job_id, "interrupted", "interrupted", error, stamp
+                    )
+                    db.execute(
+                        "INSERT INTO events(run_id,kind,payload,created) "
+                        "VALUES(?,'interrupted',?,?)",
+                        (run_id, encode(error), stamp),
+                    )
+            run = self.store.get_run(run_id)
+        if (
+            run["status"] == "interrupted"
+            and (run["error"] or {}).get("code") == "PREPARATION_INTERRUPTED"
+        ):
+            # No producer can publish this staging file. A locked file can be retried
+            # on the next query without undoing the already committed job diagnosis.
+            directory = self.store.run_dir(run_id)
+            if directory.resolve() == directory and re.fullmatch(
+                r"[0-9a-f]{32}", run["job_id"] or ""
+            ):
+                try:
+                    (directory / f".snapshot-{run['job_id']}.tmp").unlink(missing_ok=True)
+                except PermissionError:
+                    pass
         with self.store.connect() as db:
             scheduler = db.execute("SELECT * FROM scheduler WHERE singleton=1").fetchone()
         scheduler_healthy = bool(
@@ -762,6 +817,8 @@ class Harness:
         next_action = None
         if public_status == "completed":
             next_action = "export_report"
+        elif public_status == "preparing" and run["worker_pid"] is None:
+            next_action = "check_submitting_client_or_cancel_run"
         elif public_status == "needs_input":
             next_action = "provide_required_input_in_child_run"
             if latest_child:

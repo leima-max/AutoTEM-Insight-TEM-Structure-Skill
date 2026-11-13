@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import copy
+import json
 import sqlite3
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -193,6 +196,129 @@ def test_reference_reply_rechecks_missing_or_changed_source(tmp_path):
         h.submit_analysis(answered, **kwargs)
     assert missing.value.code == "INPUT_NOT_FOUND"
     assert not h.get_run_status(parent["run_id"])["input_responses"]
+
+
+def test_disconnected_reply_reuses_interrupted_child_and_discards_partial_snapshot(tmp_path):
+    harness, source, plan, parent, request = missing_calibration(tmp_path)
+    parent_id = parent["run_id"]
+    original_hash = file_hash(source)
+    parent_artifacts = {a["path"]: a["sha256"] for a in harness.list_artifacts(parent_id)}
+    source.rename(tmp_path / "moved.npy")
+    answer = answer_plan(plan, request, pixel_size_nm={"value": 25, "unit": "pm/pixel"})
+    args = {"plan": answer, "parent_run_id": parent_id, "idempotency_key": "lost-reply"}
+    signal = tmp_path / "snapshot-started"
+    disconnect = tmp_path / "disconnect"
+    # Crash the actual submitting interpreter, including when Windows uses a venv launcher.
+    submit = """
+import json, os, pathlib, sys, time
+from autotem.harness import Harness, service
+root, signal, disconnect = map(pathlib.Path, sys.argv[1:])
+def partial_copy(src, dst):
+    with open(src, "rb") as original, open(dst, "xb") as staging:
+        staging.write(original.read(16))
+        staging.flush()
+        signal.touch()
+        deadline = time.monotonic() + 60
+        while not disconnect.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        os._exit(27)
+service.shutil.copyfile = partial_copy
+Harness(root).submit_analysis(**json.load(sys.stdin))
+"""
+    with subprocess.Popen(
+        [sys.executable, "-B", "-c", submit, str(harness.root), str(signal), str(disconnect)],
+        cwd=Path(__file__).resolve().parents[1],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ) as client:
+        try:
+            client.stdin.write(json.dumps(args).encode())
+            client.stdin.close()
+            deadline = time.monotonic() + 45
+            while not signal.exists():
+                assert client.poll() is None, client.stderr.read()
+                assert time.monotonic() < deadline, "The snapshot writer did not reach staging"
+                time.sleep(0.05)
+            reopened = Harness(harness.root)
+            live = call(reopened, "submit_analysis", **args, asynchronous=True)
+            child_id, job_id = live["run_id"], live["job_id"]
+            assert live["status"] == "preparing" and live["jobs"][0]["status"] == "queued"
+            directory = reopened.store.run_dir(child_id)
+            partial = directory / f".snapshot-{job_id}.tmp"
+            assert partial.stat().st_size == 16 < (tmp_path / "moved.npy").stat().st_size
+            other = directory / ".snapshot-unrelated.tmp"
+            other.write_bytes(b"other job")
+        finally:
+            disconnect.touch()
+            assert client.wait(timeout=15) == 27
+
+    def retry(_):
+        return call(Harness(harness.root), "submit_analysis", **args, asynchronous=False)
+
+    # A regression must fail promptly rather than leaving a synchronous retry hung.
+    assert reopened.get_run_status(child_id)["status"] == "interrupted"
+    with ThreadPoolExecutor(2) as pool:
+        replies = list(pool.map(retry, range(2)))
+    for result in replies:
+        assert (result["run_id"], result["job_id"], result["status"]) == (
+            child_id,
+            job_id,
+            "interrupted",
+        )
+        assert result["error"]["code"] == "PREPARATION_INTERRUPTED"
+        assert result["jobs"][0]["status"] == "interrupted"
+        assert all(step["status"] == "interrupted" for step in result["steps"])
+        assert [e["kind"] for e in result["events"]] == ["interrupted"]
+    assert (
+        not partial.exists()
+        and not list((directory / "raw").iterdir())
+        and other.read_bytes() == b"other job"
+    )
+    assert all(a["step_id"] == "_request" for a in harness.list_artifacts(child_id))
+    original = harness.get_run_status(parent_id)
+    assert (
+        original["latest_response_child_run_id"] == child_id
+        and len(original["input_responses"]) == 1
+    )
+    changed = answer_plan(plan, request, pixel_size_nm={"value": 30, "unit": "pm/pixel"})
+    with pytest.raises(HarnessError) as err:
+        harness.submit_analysis(**{**args, "plan": changed})
+    assert err.value.code == "IDEMPOTENCY_CONFLICT"
+    with harness.store.connect() as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 2
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 2
+    replacement = harness.submit_analysis(
+        **{**args, "idempotency_key": "replacement"}, asynchronous=False
+    )
+    assert replacement["status"] == "completed" and replacement["run_id"] != child_id
+    assert replacement["parent_run_id"] == parent_id
+    assert (
+        file_hash(Path(harness.store.get_run(replacement["run_id"])["input_path"])) == original_hash
+    )
+    assert all(file_hash(Path(path)) == digest for path, digest in parent_artifacts.items())
+
+
+def test_unknown_preparation_owner_remains_available_for_manual_cancel(tmp_path, monkeypatch):
+    h = Harness(tmp_path / "h")
+    path = tmp_path / "image.npy"
+    np.save(path, np.arange(64).reshape(8, 8))
+    plan = calibration_plan(path)
+    monkeypatch.setattr(h, "_launch_scheduler", lambda *_: None)
+    state = h.submit_analysis(plan, idempotency_key="previous-client")
+    with h.store.connect() as db:
+        db.execute(
+            "UPDATE runs SET status='preparing',worker_pid=NULL,worker_identity=NULL "
+            "WHERE run_id=?",
+            (state["run_id"],),
+        )
+    assert (
+        h.get_run_status(state["run_id"])["next_action"] == "check_submitting_client_or_cancel_run"
+    )
+    retry = h.submit_analysis(plan, idempotency_key="previous-client", asynchronous=False)
+    assert retry["run_id"] == state["run_id"] and retry["status"] == "preparing"
+    assert retry["next_action"] == "check_submitting_client_or_cancel_run"
+    assert h.cancel_run(retry["run_id"])["status"] == "cancelled"
 
 
 def test_inspection_dataset_and_axis_replies_validate_actual_choices(tmp_path):

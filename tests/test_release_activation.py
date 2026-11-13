@@ -218,6 +218,44 @@ def test_switching_profile_restores_exact_codex_config_and_rolls_back(release_pr
     assert config.read_bytes() == with_mcp
 
 
+@pytest.mark.parametrize("owner", ["codex", "openclaw", "workbuddy"])
+def test_shared_entry_upgrade_and_rollback_follow_its_recorded_owner(
+    release_project, monkeypatch, owner
+):
+    project, _ = release_project
+    hosts = ["codex", "openclaw", "workbuddy"]
+    for host in [owner, *(name for name in hosts if name != owner)]:
+        assert managed.manage(project, "first", host=host, apply=True)["ok"]
+    pointer = project / ".autotem/active-runtime.json"
+    entry = project / ".autotem/host-entry.py"
+    previous_pointer = pointer.read_bytes()
+    previous_entry = entry.read_bytes()
+    adapters = {host: project / f"autotem-host/{host}/adapter.json" for host in hosts}
+    old_adapters = {host: path.read_bytes() for host, path in adapters.items()}
+    replacement = project.parent / "next-host-entry.py"
+    replacement.write_bytes(previous_entry + b"\n# Next release of the managed entry.\n")
+    monkeypatch.setattr(host_entry, "__file__", str(replacement))
+
+    if owner == "workbuddy":
+        edited = previous_entry + b"\n# Local customization.\n"
+        entry.write_bytes(edited)
+        blocked = managed.manage(project, "second", host="codex", apply=True)
+        assert not blocked["ok"] and blocked["error"]["code"] == "HOST_FILE_CONFLICT"
+        assert entry.read_bytes() == edited and pointer.read_bytes() == previous_pointer
+        assert {host: path.read_bytes() for host, path in adapters.items()} == old_adapters
+        entry.write_bytes(previous_entry)
+
+    current = managed.manage(project, "second", host="codex", apply=True)
+    assert current["ok"], current
+    assert entry.read_bytes() == replacement.read_bytes()
+    assert set(json.loads(pointer.read_bytes())["host_installations"]) == set(hosts)
+    for path in adapters.values():
+        assert json.loads(path.read_bytes())["python_executable"] == current["python_executable"]
+    assert managed.manage(project, "second", rollback=True, apply=True)["ok"]
+    assert pointer.read_bytes() == previous_pointer and entry.read_bytes() == previous_entry
+    assert {host: path.read_bytes() for host, path in adapters.items()} == old_adapters
+
+
 def test_cli_switch_preserves_user_modified_codex_config(release_project):
     root, _ = release_project
     assert managed.manage(root, "first", apply=True)["ok"]
