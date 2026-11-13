@@ -210,6 +210,12 @@ def _read_selected(path: Path, p: InputParameters) -> tuple[np.ndarray, dict, di
     suffix = path.suffix.lower()
     metadata: dict = {}
     selection: dict = {}
+    if p.dataset_path == "":
+        raise HarnessError("INVALID_SELECTION", "Choose a named dataset")
+    if p.dataset_path is not None and suffix not in {".h5", ".hdf5", ".hdf", ".emd", ".npz"}:
+        raise HarnessError("INVALID_SELECTION", "dataset_path applies only to HDF/EMD/NPZ")
+    if p.dataset_index is not None and suffix not in {".dm3", ".dm4", ".ser"}:
+        raise HarnessError("INVALID_SELECTION", "dataset_index applies only to DM or SER inputs")
     if suffix in {".h5", ".hdf5", ".hdf", ".emd"}:
         try:
             import h5py
@@ -378,37 +384,19 @@ def _read_selected(path: Path, p: InputParameters) -> tuple[np.ndarray, dict, di
             return _selection(array, remaining, channel_last=True), metadata, selection
     else:
         raise HarnessError("UNSUPPORTED_FORMAT", f"Unsupported input extension: {suffix}")
-    if suffix not in {".dm3", ".dm4"} and p.dataset_index is not None:
-        raise HarnessError("INVALID_SELECTION", "dataset_index applies only to DM inputs")
-    if suffix != ".npz" and p.dataset_path is not None:
-        raise HarnessError("INVALID_SELECTION", "dataset_path applies only to HDF/EMD/NPZ")
     selection["source_shape"] = list(array.shape)
     return _selection(array, p), metadata, selection
 
 
-def load_input(ctx: OperationContext, params: dict) -> ServiceResult:
-    supplied = {**ctx.request.get("selection", {}), **params}
-    supplied.setdefault("modality", ctx.request.get("modality", "unknown"))
-    p = validated(InputParameters, supplied)
-    path = Path(ctx.input_path)
+def read_selected_input(
+    path: Path, params: dict, *, dataset_id: str
+) -> tuple[np.ndarray, TEMDataset]:
+    """Read one explicit 2D selection. The caller assigns its persisted array reference."""
+    p = validated(InputParameters, params)
     if not path.is_file():
         raise HarnessError("INPUT_NOT_FOUND", "Input snapshot is not a regular file")
     try:
         array, metadata, selection = _read_selected(path, p)
-    except NeedsInput as exc:
-        fields = exc.details["fields"]
-        evidence_id = ctx.emit_json(
-            "input_selection_options",
-            {
-                "reason": str(exc),
-                "fields": [dict(field) for field in fields],
-                "source_format": path.suffix.lower(),
-            },
-            {"scientific_level": "diagnostic"},
-        )
-        for field in fields:
-            field["evidence"] = {"selection_artifact_id": evidence_id}
-        raise
     except HarnessError:
         raise
     except (ValueError, OSError, KeyError, TypeError) as exc:
@@ -460,6 +448,49 @@ def load_input(ctx: OperationContext, params: dict) -> ServiceResult:
         warnings.append(
             "Anisotropic MRC calibration requires per-axis support; scalar scale withheld."
         )
+    pixel_nm = normalized.get("pixel_size_nm")
+    pixel = None
+    if isinstance(pixel_nm, (int, float)) and np.isfinite(pixel_nm) and pixel_nm > 0:
+        pixel = Measurement(value=float(pixel_nm), unit="nm/pixel", method="reader.metadata")
+    dataset = TEMDataset(
+        data=ArrayReference(shape=array.shape, dtype=str(array.dtype)),
+        dataset_id=dataset_id,
+        source_path=str(path),
+        modality=p.modality,
+        pixel_size=pixel,
+        pixel_unit="nm" if pixel else "unknown",
+        metadata={
+            "raw": metadata,
+            "normalized": normalized,
+            "selection": {**selection, **p.model_dump(exclude_none=True)},
+        },
+        provenance={"method": "input.load", "source_path": str(path)},
+        warnings=warnings,
+    )
+    return array, dataset
+
+
+def load_input(ctx: OperationContext, params: dict) -> ServiceResult:
+    supplied = {**ctx.request.get("selection", {}), **params}
+    supplied.setdefault("modality", ctx.request.get("modality", "unknown"))
+    path = Path(ctx.input_path)
+    try:
+        array, dataset = read_selected_input(path, supplied, dataset_id=f"{ctx.run_id}:selected")
+    except NeedsInput as exc:
+        fields = exc.details["fields"]
+        evidence_id = ctx.emit_json(
+            "input_selection_options",
+            {
+                "reason": str(exc),
+                "fields": [dict(field) for field in fields],
+                "source_format": path.suffix.lower(),
+            },
+            {"scientific_level": "diagnostic"},
+        )
+        for field in fields:
+            field["evidence"] = {"selection_artifact_id": evidence_id}
+        raise
+    selection = dataset.metadata["selection"]
     raw = ctx.emit_array("raw", array, {"selection": selection, "source_path": str(path)})
     ctx.emit_image(
         "raw_preview",
@@ -470,30 +501,13 @@ def load_input(ctx: OperationContext, params: dict) -> ServiceResult:
             "display_transform": "linear_minmax_to_uint8",
         },
     )
-    pixel_nm = normalized.get("pixel_size_nm")
-    pixel = None
-    if isinstance(pixel_nm, (int, float)) and np.isfinite(pixel_nm) and pixel_nm > 0:
-        pixel = Measurement(value=float(pixel_nm), unit="nm/pixel", method="reader.metadata")
-    dataset = TEMDataset(
-        data=raw,
-        dataset_id=f"{ctx.run_id}:selected",
-        source_path=str(path),
-        modality=p.modality,
-        pixel_size=pixel,
-        pixel_unit="nm" if pixel else "unknown",
-        metadata={
-            "raw": metadata,
-            "normalized": normalized,
-            "selection": {**selection, **p.model_dump(exclude_none=True)},
-        },
-        provenance={"method": "harness.input.load", "source_path": str(path)},
-        warnings=warnings,
-    )
+    dataset.data = raw
+    dataset.provenance["method"] = "harness.input.load"
     outputs = {"raw": raw, "dataset": dataset}
-    if p.modality in {"SAED", "NBED"}:
+    if dataset.modality in {"SAED", "NBED"}:
         outputs["reciprocal_image"] = ctx.emit_array("reciprocal_image", array)
         outputs["reciprocal_context"] = {"kind": "direct_diffraction", "shape": list(array.shape)}
-    return ServiceResult(outputs=outputs, warnings=warnings)
+    return ServiceResult(outputs=outputs, warnings=dataset.warnings)
 
 
 def assess(ctx: OperationContext, params: dict) -> ServiceResult:

@@ -8,13 +8,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 import yaml
+from PIL import Image
 
 from autotem import TEMAnalysisSkill
-from autotem.cli import EXIT_CONFIG_ERROR, EXIT_OK, main
-from autotem.core import AnalysisReport, StrainResult, TEMDataset
+from autotem.cli import EXIT_CONFIG_ERROR, EXIT_OK, EXIT_RUNTIME_ERROR, main
+from autotem.core import AnalysisReport, RunSummary, StrainResult, TEMDataset
 from autotem.harness import Harness
 from autotem.harness.compiler import compile_legacy_recipe
 from autotem.harness.contracts import HarnessError
+from autotem.preprocessing.quality import load_dataset_array
 from autotem.reporting.harness_evidence import delivery_index
 
 pytestmark = pytest.mark.smoke
@@ -183,6 +185,7 @@ def test_minimal_legacy_and_registered_facades_agree_on_disk_input(tmp_path, cap
     old = skill.run(path, legacy, old_root)
     old_model = AnalysisReport.model_validate_json(Path(old["report_path"]).read_bytes())
     assert old_model.schema_version == "0.1.0" and old_model.dataset.data.shape == data.shape
+    np.testing.assert_array_equal(load_dataset_array(old_model.dataset), data)
     migrated = skill.run_harness(path, legacy, tmp_path / "migrated")
     report, _ = published(migrated["report"])
     assert report["completeness"]["required_steps"] == 1
@@ -220,6 +223,109 @@ def test_minimal_legacy_and_registered_facades_agree_on_disk_input(tmp_path, cap
         )
         assert dataset.data.shape == old_model.dataset.data.shape
         np.testing.assert_array_equal(store.load_array(store.role(result["run_id"], "raw")), data)
+
+
+@pytest.mark.parametrize("kind", ["channel", "frame", "dataset"])
+def test_legacy_selection_reloads_the_requested_pixels(tmp_path, capsys, kind):
+    grid = np.arange(78 * 90, dtype=np.int16).reshape(78, 90)
+    if kind == "channel":
+        source = tmp_path / "image.tif"
+        pages = [
+            np.stack([(grid + offset + c) % 251 for c in (0, 7, 13)], axis=-1).astype(np.uint8)
+            for offset in (0, 50)
+        ]
+        Image.fromarray(pages[0]).save(
+            source, save_all=True, append_images=[Image.fromarray(pages[1])]
+        )
+        params, plane = {"frame": 1, "channel": 2}, pages[1][..., 2]
+    elif kind == "frame":
+        source = tmp_path / "stack.npy"
+        np.save(source, np.stack((grid + 23, grid)))
+        params, plane = {"frame": 1}, grid
+    else:
+        source = tmp_path / "sets.npz"
+        np.savez(source, first=grid + 18, second=np.stack((grid + 23, grid)))
+        params, plane = {"dataset_path": "second", "selection_indices": [1]}, grid
+    params["roi"] = [3, 71, 5, 80]
+    expected = plane[3:71, 5:80]
+    original = source.read_bytes()
+    out = tmp_path / "out"
+    recipe = write_recipe(
+        tmp_path / "recipe.yaml",
+        {
+            "workflow": {"steps": ["load", "report"], "parameters": {"load": params}},
+            "outputs": {"formats": ["json"], "save_intermediates": kind != "frame"},
+        },
+    )
+    if kind == "channel":
+        rc = main(["analyze", str(source), "--workflow", str(recipe), "--output", str(out)])
+        captured = capsys.readouterr()
+        assert rc == EXIT_OK, captured.err
+        result = json.loads(captured.out[captured.out.index("{") :])
+    else:
+        result = TEMAnalysisSkill().run(source, recipe, out)
+    report = AnalysisReport.model_validate_json(Path(result["report_path"]).read_bytes())
+    summary = RunSummary.model_validate_json((out / "run_summary.json").read_bytes())
+    assert (
+        result["execution_status"] == "completed"
+        and summary.schema_version == report.schema_version == "0.1.0"
+    )
+    raw_path = Path(report.dataset.data.uri)
+    assert raw_path.is_relative_to(out) and report.dataset.source_path == str(source)
+    assert report.dataset.data.inline is None and expected.size > 4096
+    assert any(a.uri == str(raw_path) and a.kind == "array" for a in report.artifacts)
+    stored = np.load(raw_path, allow_pickle=False)
+    assert stored.dtype == expected.dtype and stored.tobytes() == expected.tobytes()
+    np.testing.assert_array_equal(load_dataset_array(report.dataset), expected)
+    assert report.dataset.metadata["selection"]["roi_origin_yx"] == [3, 5]
+    assert report.workflow.steps[0].parameters == params and source.read_bytes() == original
+    if kind == "channel":
+        unselected = write_recipe(
+            tmp_path / "read.yaml", {"workflow": {"steps": ["load", "report"]}}
+        )
+        old = TEMAnalysisSkill().run(source, unselected, tmp_path / "unselected")
+        original_report = AnalysisReport.model_validate_json(Path(old["report_path"]).read_bytes())
+        np.testing.assert_array_equal(
+            load_dataset_array(original_report.dataset), pages[0].mean(axis=2)
+        )
+        assert any(
+            "IMAGE_MULTIFRAME_TIFF" in warning for warning in original_report.dataset.warnings
+        )
+
+
+@pytest.mark.parametrize(
+    ("options", "code"),
+    [
+        ({"frame": 1}, "NEEDS_INPUT"),
+        ({"channel": 2}, "NEEDS_INPUT"),
+        ({"frame": 2, "channel": 0}, "INVALID_SELECTION"),
+        ({"frame": 1, "channel": 3}, "INVALID_SELECTION"),
+        ({"frame": 1, "channel": 2, "roi": [0, 17, 0, 4]}, "INVALID_ROI"),
+        ({"dataset_index": 0}, "INVALID_SELECTION"),
+        ({"frame": True}, "INVALID_PARAMETERS"),
+        ({"bad_option": 1}, "INVALID_PARAMETERS"),
+    ],
+)
+def test_legacy_selection_refuses_ambiguous_and_invalid_requests(tmp_path, capsys, options, code):
+    source = tmp_path / "image.tif"
+    page = Image.fromarray(np.zeros((16, 24, 3), dtype=np.uint8))
+    page.save(source, save_all=True, append_images=[page.copy()])
+    recipe = write_recipe(
+        tmp_path / "recipe.yaml",
+        {
+            "workflow": {"steps": ["load", "report"], "parameters": {"load": options}},
+        },
+    )
+    with pytest.raises(HarnessError) as error:
+        TEMAnalysisSkill().run(source, recipe, tmp_path / "api")
+    assert error.value.code == code
+    rc = main(
+        ["analyze", str(source), "--workflow", str(recipe), "--output", str(tmp_path / "cli")]
+    )
+    assert rc == (EXIT_RUNTIME_ERROR if code == "NEEDS_INPUT" else EXIT_CONFIG_ERROR)
+    assert code in capsys.readouterr().err
+    assert not list(tmp_path.rglob("analysis_report.json"))
+    assert not list(tmp_path.rglob("selected-*.npy"))
 
 
 @pytest.mark.parametrize(

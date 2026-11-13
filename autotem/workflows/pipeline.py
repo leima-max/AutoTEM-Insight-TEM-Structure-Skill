@@ -11,6 +11,7 @@ import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 from autotem.atomic.atom_detection import detect_atoms
@@ -209,6 +210,30 @@ def _sha256_of_file(path: Path) -> str | None:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _load_selected_dataset(path: Path, selection: dict, directory: Path) -> TEMDataset:
+    import numpy as np
+
+    from autotem.services.data_quality import read_selected_input
+
+    pixels, dataset = read_selected_input(path, selection, dataset_id=path.stem)
+    # Consumers reopen data.uri after the strict report is reloaded. The source container
+    # alone cannot reproduce the chosen channel, leading axes or crop.
+    directory.mkdir(parents=True, exist_ok=True)
+    selected_file = NamedTemporaryFile(
+        dir=directory, prefix="selected-", suffix=".npy", delete=False
+    )
+    plane = Path(selected_file.name)
+    try:
+        with selected_file:
+            np.save(selected_file, pixels, allow_pickle=False)
+    except BaseException:
+        plane.unlink(missing_ok=True)
+        raise
+    dataset.data.uri = str(plane.resolve())
+    dataset.provenance["selected_npy_sha256"] = _sha256_of_file(plane)
+    return dataset
 
 
 def _runtime_dependency_versions() -> dict[str, str]:
@@ -826,7 +851,27 @@ class TEMAnalysisSkill:
                 logger.info(f"Executing step '{step_record.name}'.")
 
                 if step_record.name == "load":
-                    dataset = self.load_data(input_path, metadata=metadata)
+                    load_options = workflow_parameters.get("load", {})
+                    if not isinstance(load_options, dict):
+                        raise ValueError("workflow.parameters.load must be a mapping.")
+                    if load_options:
+                        source = Path(input_path)
+                        if not source.is_file():
+                            raise FileNotFoundError(f"Input file does not exist: {source}")
+                        directory = output_dir / (
+                            "intermediates" if recipe.workflow.save_intermediates else ".runtime"
+                        )
+                        dataset = _load_selected_dataset(source, load_options, directory)
+                        if metadata:
+                            dataset.metadata = {
+                                **dataset.metadata,
+                                **metadata,
+                                "selection": dataset.metadata["selection"],
+                            }
+                        step_record.parameters = dict(load_options)
+                        step_record.outputs = [dataset.data.uri]
+                    else:
+                        dataset = self.load_data(input_path, metadata=metadata)
                     step_record.status = "warning" if dataset.warnings else "done"
                     step_record.warnings.extend(dataset.warnings)
                 elif step_record.name == "assess_quality":
@@ -1058,6 +1103,16 @@ class TEMAnalysisSkill:
                     mime_type="application/x-yaml",
                 ),
             ]
+            if dataset is not None and "selected_npy_sha256" in dataset.provenance:
+                artifacts.append(
+                    OutputArtifact(
+                        kind="array",
+                        uri=dataset.data.uri,
+                        label="Selected input plane",
+                        mime_type="application/octet-stream",
+                        provenance={"sha256": dataset.provenance["selected_npy_sha256"]},
+                    )
+                )
             requested_formats = {item.lower() for item in recipe.outputs.formats}
             requested_formats.update(item.lower() for item in recipe.workflow.output_formats)
             if output_formats_override:
