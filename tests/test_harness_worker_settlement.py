@@ -223,7 +223,9 @@ def test_live_previous_worker_is_respected_even_before_legacy_job_bookkeeping(qu
 
 
 @pytest.mark.parametrize("elapsed", [0.0, 0.25], ids=["same-clock-tick", "clock-advanced"])
-def test_plugin_disappearing_after_submit_fails_before_worker_ownership(queued, monkeypatch, elapsed):
+def test_plugin_disappearing_after_submit_fails_before_worker_ownership(
+    queued, monkeypatch, elapsed
+):
     h, rid, jid = queued
     tick = 10.0
     monkeypatch.setattr(worker.time, "monotonic", lambda: tick)
