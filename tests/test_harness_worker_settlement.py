@@ -52,14 +52,20 @@ def diagnostic(h, rid, jid, status, code):
 def test_launch_failures_close_job_and_preserve_first_diagnosis(queued, monkeypatch, failure, code):
     h, rid, jid = queued
     original = f"fixture {failure} refusal"
+    tick = 10.0
+    monkeypatch.setattr(worker.time, "monotonic", lambda: tick)
 
     def refused_launch(*args, **kwargs):
+        nonlocal tick
+        tick += 0.25
         raise OSError(original)
 
     def refused_tree(process):
+        nonlocal tick
         # Model the real Windows constructor's failed attachment: it closes its own child.
         process.terminate()
         process.wait(timeout=10)
+        tick += 0.25
         raise RuntimeError(original)
 
     if failure == "spawn":
@@ -68,7 +74,8 @@ def test_launch_failures_close_job_and_preserve_first_diagnosis(queued, monkeypa
         monkeypatch.setattr(worker, "ProcessTree", refused_tree)
     worker.schedule(str(h.root))
     state = diagnostic(h, rid, jid, "failed", code)
-    assert state["error"]["message"] == original and state["execution_seconds"] > 0
+    assert state["error"]["message"] == original
+    assert state["execution_seconds"] == 0.25
     assert all(
         s["status"] == "blocked" and s["error"]["code"] == code and s["ended"]
         for s in state["steps"]
@@ -215,10 +222,15 @@ def test_live_previous_worker_is_respected_even_before_legacy_job_bookkeeping(qu
     assert h.store.get_run(rid)["status"] == "running"
 
 
-def test_plugin_disappearing_after_submit_fails_before_worker_ownership(queued, monkeypatch):
+@pytest.mark.parametrize("elapsed", [0.0, 0.25], ids=["same-clock-tick", "clock-advanced"])
+def test_plugin_disappearing_after_submit_fails_before_worker_ownership(queued, monkeypatch, elapsed):
     h, rid, jid = queued
+    tick = 10.0
+    monkeypatch.setattr(worker.time, "monotonic", lambda: tick)
 
     def missing(*_):
+        nonlocal tick
+        tick += elapsed
         raise HarnessError("PLUGIN_NOT_FOUND", "vanished after submit")
 
     monkeypatch.setattr(worker, "default_registry", missing)
@@ -227,7 +239,10 @@ def test_plugin_disappearing_after_submit_fails_before_worker_ownership(queued, 
     )
     worker.schedule(str(h.root))
     state = diagnostic(h, rid, jid, "failed", "PLUGIN_NOT_FOUND")
-    assert state["error"]["message"] == "vanished after submit" and state["execution_seconds"] > 0
+    assert state["error"]["message"] == "vanished after submit"
+    assert state["execution_seconds"] == elapsed
+    worker.schedule(str(h.root))
+    assert h.get_run_status(rid)["execution_seconds"] == elapsed
 
 
 def test_plugin_failure_inside_owned_child_survives_supervisor_cleanup(queued, monkeypatch):
