@@ -34,7 +34,8 @@ from autotem.core import (
     write_json,
 )
 from autotem.diffraction import run_diffraction_analysis
-from autotem.io import load_tem_dataset
+from autotem.io import load_tem_dataset, to_temdataset
+from autotem.io.readers import read_workflow_plane
 from autotem.preprocessing import assess_quality, preprocess_dataset
 from autotem.reporting import (
     ensure_a3_output_layout,
@@ -854,10 +855,10 @@ class TEMAnalysisSkill:
                     load_options = workflow_parameters.get("load", {})
                     if not isinstance(load_options, dict):
                         raise ValueError("workflow.parameters.load must be a mapping.")
-                    if load_options:
-                        source = Path(input_path)
-                        if not source.is_file():
-                            raise FileNotFoundError(f"Input file does not exist: {source}")
+                    source = Path(input_path)
+                    if not source.is_file():
+                        raise FileNotFoundError(f"Input file does not exist: {source}")
+                    if load_options or source.suffix.lower() == ".npz":
                         directory = output_dir / (
                             "intermediates" if recipe.workflow.save_intermediates else ".runtime"
                         )
@@ -870,8 +871,12 @@ class TEMAnalysisSkill:
                             }
                         step_record.parameters = dict(load_options)
                         step_record.outputs = [dataset.data.uri]
+                    elif (plane := read_workflow_plane(source)) is not None:
+                        dataset = to_temdataset(plane)
+                        if metadata:
+                            dataset.metadata.update(metadata)
                     else:
-                        dataset = self.load_data(input_path, metadata=metadata)
+                        dataset = self.load_data(source, metadata=metadata)
                     step_record.status = "warning" if dataset.warnings else "done"
                     step_record.warnings.extend(dataset.warnings)
                 elif step_record.name == "assess_quality":

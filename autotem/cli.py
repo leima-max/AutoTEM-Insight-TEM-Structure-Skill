@@ -296,6 +296,9 @@ def main(argv: list[str] | None = None) -> int:
             serialized_result = TypeAdapter(dict[str, object]).dump_json(result, indent=2).decode()
         except HarnessError as exc:
             print(f"AutoTEM {exc.code}: {exc.message}", file=sys.stderr)
+            if exc.code == "NEEDS_INPUT" and exc.details:
+                print("Set workflow.parameters.load in the recipe (--workflow).", file=sys.stderr)
+                print(json.dumps(exc.details, ensure_ascii=True), file=sys.stderr)
             if exc.code.startswith("LEGACY_") or exc.code.startswith("INVALID_"):
                 return EXIT_CONFIG_ERROR
             return EXIT_RUNTIME_ERROR

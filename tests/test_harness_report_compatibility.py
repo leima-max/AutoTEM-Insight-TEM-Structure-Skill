@@ -16,6 +16,7 @@ from autotem.core import AnalysisReport, RunSummary, StrainResult, TEMDataset
 from autotem.harness import Harness
 from autotem.harness.compiler import compile_legacy_recipe
 from autotem.harness.contracts import HarnessError
+from autotem.io import read_image
 from autotem.preprocessing.quality import load_dataset_array
 from autotem.reporting.harness_evidence import delivery_index
 
@@ -280,16 +281,116 @@ def test_legacy_selection_reloads_the_requested_pixels(tmp_path, capsys, kind):
     assert report.dataset.metadata["selection"]["roi_origin_yx"] == [3, 5]
     assert report.workflow.steps[0].parameters == params and source.read_bytes() == original
     if kind == "channel":
-        unselected = write_recipe(
-            tmp_path / "read.yaml", {"workflow": {"steps": ["load", "report"]}}
-        )
-        old = TEMAnalysisSkill().run(source, unselected, tmp_path / "unselected")
-        original_report = AnalysisReport.model_validate_json(Path(old["report_path"]).read_bytes())
-        np.testing.assert_array_equal(
-            load_dataset_array(original_report.dataset), pages[0].mean(axis=2)
-        )
-        assert any(
-            "IMAGE_MULTIFRAME_TIFF" in warning for warning in original_report.dataset.warnings
+        preview = read_image(source)
+        np.testing.assert_array_equal(preview.array, pages[0].mean(axis=2).astype(np.float32))
+        codes = {warning["code"] for warning in preview.warnings}
+        assert {"IMAGE_MULTIFRAME_TIFF", "IMAGE_RGB_TO_GRAYSCALE"} <= codes
+
+
+@pytest.mark.parametrize("bare", [False, True], ids=["load-report", "no-yaml"])
+def test_legacy_workflow_asks_for_the_real_frame_before_science(tmp_path, capsys, bare):
+    source = tmp_path / "two-pages.tif"
+    grid = np.arange(35, dtype=np.uint8).reshape(5, 7)
+    pages = [np.stack([grid + offset + c for c in (0, 5, 9)], axis=-1) for offset in (0, 80)]
+    Image.fromarray(pages[0]).save(source, save_all=True, append_images=[Image.fromarray(pages[1])])
+    recipe = (
+        None
+        if bare
+        else write_recipe(tmp_path / "read.yaml", {"workflow": {"steps": ["load", "report"]}})
+    )
+    with pytest.raises(HarnessError) as exc:
+        TEMAnalysisSkill().run(source, recipe, tmp_path / "api")
+    details = {"fields": [{"name": "frame", "count": 2}]}
+    assert (exc.value.code, exc.value.details) == ("NEEDS_INPUT", details)
+    command = ["analyze", str(source), "--output", str(tmp_path / "cli")]
+    if recipe is not None:
+        command += ["--workflow", str(recipe)]
+    assert main(command) == EXIT_RUNTIME_ERROR
+    stderr = capsys.readouterr().err
+    assert "NEEDS_INPUT" in stderr and "workflow.parameters.load" in stderr
+    assert json.loads(stderr.splitlines()[-1]) == details
+    assert not list(tmp_path.rglob("analysis_report.json"))
+    assert not list(tmp_path.rglob("selected-*.npy"))
+
+
+def test_implicit_stack_and_archive_choices_precede_pixel_loading(tmp_path, monkeypatch):
+    recipe = write_recipe(tmp_path / "read.yaml", {"workflow": {"steps": ["load", "report"]}})
+    stack = np.arange(120, dtype=np.int16).reshape(2, 3, 4, 5)
+    source = tmp_path / "stack.npy"
+    np.save(source, stack)
+    multi = tmp_path / "data.npz"
+    np.savez_compressed(multi, survey=stack[0, 0], scan=stack)
+    single = tmp_path / "single.npz"
+    np.savez_compressed(single, scan=stack)
+    with np.load(multi, allow_pickle=False) as archive:
+
+        def fail_if_decoded(*args):
+            pytest.fail("An incomplete archive selection decompressed a pixel array")
+
+        monkeypatch.setattr(type(archive), "__getitem__", fail_if_decoded)
+    indices = {"name": "selection_indices", "count": 2, "shape": [2, 3, 4, 5]}
+    datasets = {"name": "dataset_path", "choices": ["survey", "scan"]}
+    for path, field in [(source, indices), (multi, datasets), (single, indices)]:
+        with pytest.raises(HarnessError) as exc:
+            TEMAnalysisSkill().run(path, recipe, tmp_path / path.name.replace(".", "-"))
+        assert exc.value.code == "NEEDS_INPUT" and exc.value.details == {"fields": [field]}
+
+
+@pytest.mark.parametrize("suffix", ["png", "jpg", "tiff"])
+def test_image_headers_request_a_channel_without_decoding_pixels(tmp_path, monkeypatch, suffix):
+    from autotem.services.data_quality import read_selected_input
+
+    source = tmp_path / f"color.{suffix}"
+    Image.fromarray(np.zeros((12, 20, 3), dtype=np.uint8)).save(source)
+    recipe = write_recipe(tmp_path / "read.yaml", {"workflow": {"steps": ["load", "report"]}})
+
+    def unexpected_buffer(*args, **kwargs):
+        pytest.fail("An incomplete channel selection decoded the image")
+
+    monkeypatch.setattr(Image.Image, "tobytes", unexpected_buffer)
+    with pytest.raises(HarnessError) as legacy:
+        TEMAnalysisSkill().run(source, recipe, tmp_path / "out")
+    with pytest.raises(HarnessError) as shared:
+        read_selected_input(source, {}, dataset_id="color")
+    assert legacy.value.code == shared.value.code == "NEEDS_INPUT"
+    assert (
+        legacy.value.details
+        == shared.value.details
+        == {"fields": [{"name": "channel", "count": 3}]}
+    )
+
+
+@pytest.mark.parametrize("suffix", ["tif", "npy", "txt", "csv", "npz"])
+def test_unique_2d_inputs_retain_pixels_and_strict_report_contract(tmp_path, suffix):
+    grid = np.arange(80, dtype=np.uint16).reshape(8, 10)
+    source = tmp_path / f"single.{suffix}"
+    if suffix == "tif":
+        Image.fromarray(grid).save(source, dpi=(50_800_000, 50_800_000))
+    elif suffix == "npy":
+        np.save(source, grid)
+    elif suffix == "npz":
+        np.savez_compressed(source, only=grid)
+    else:
+        np.savetxt(source, grid)
+    recipe = write_recipe(tmp_path / "read.yaml", {"workflow": {"steps": ["load", "report"]}})
+    out = tmp_path / "report"
+    result = TEMAnalysisSkill().run(source, recipe, out)
+    report = AnalysisReport.model_validate_json(Path(result["report_path"]).read_bytes())
+    summary = RunSummary.model_validate_json((out / "run_summary.json").read_bytes())
+    assert result["execution_status"] == "completed"
+    assert report.schema_version == summary.schema_version == "0.1.0"
+    assert report.dataset.source_path == str(source)
+    np.testing.assert_array_equal(load_dataset_array(report.dataset), grid)
+    if suffix == "npz":
+        assert report.dataset.metadata["selection"]["dataset_path"] == "only"
+    else:
+        direct = read_image(source)
+        assert report.dataset.provenance == direct.provenance
+        assert report.dataset.metadata["raw"] == direct.metadata_raw
+    if suffix == "tif":
+        assert report.dataset.pixel_size.value == pytest.approx(0.5)
+        assert {"XResolution", "ResolutionUnit", "282", "296"} <= set(
+            report.dataset.metadata["raw"]
         )
 
 
@@ -323,7 +424,13 @@ def test_legacy_selection_refuses_ambiguous_and_invalid_requests(tmp_path, capsy
         ["analyze", str(source), "--workflow", str(recipe), "--output", str(tmp_path / "cli")]
     )
     assert rc == (EXIT_RUNTIME_ERROR if code == "NEEDS_INPUT" else EXIT_CONFIG_ERROR)
-    assert code in capsys.readouterr().err
+    stderr = capsys.readouterr().err
+    assert code in stderr
+    if code == "NEEDS_INPUT":
+        field = (
+            {"name": "channel", "count": 3} if "frame" in options else {"name": "frame", "count": 2}
+        )
+        assert json.loads(stderr.splitlines()[-1]) == error.value.details == {"fields": [field]}
     assert not list(tmp_path.rglob("analysis_report.json"))
     assert not list(tmp_path.rglob("selected-*.npy"))
 

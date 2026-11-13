@@ -14,6 +14,7 @@ from PIL import Image, TiffTags
 from .metadata import normalize_metadata
 
 ReaderFn = Callable[[Path], "ReadResult"]
+_IMAGE_EXTENSIONS = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
 
 
 def _mk_warning(
@@ -172,8 +173,41 @@ def _to_jsonable(value: Any) -> Any:
         return str(value)
 
 
-def _read_standard_image(path: Path) -> ReadResult:
+def select_image_page(img: Image.Image, frame: int | None, channel: int | None) -> int:
+    """Resolve page and band from metadata before decoding any pixel buffer."""
+    from autotem.harness.contracts import HarnessError, NeedsInput
+
+    count = getattr(img, "n_frames", 1)
+    if count > 1 and frame is None:
+        raise NeedsInput([{"name": "frame", "count": count}], "Select an image frame explicitly")
+    page = frame if frame is not None else 0
+    if not 0 <= page < count:
+        raise HarnessError("INVALID_SELECTION", "Image frame is out of bounds")
+    img.seek(page)
+    bands = len(img.getbands())
+    if bands > 1 and channel is None:
+        raise NeedsInput(
+            [{"name": "channel", "count": bands}], "Select an image channel explicitly"
+        )
+    if channel is not None and (bands == 1 or not 0 <= channel < bands):
+        raise HarnessError("INVALID_SELECTION", "Channel index is invalid for this image")
+    return page
+
+
+def require_spatial_indices(shape: tuple[int, ...]) -> None:
+    from autotem.harness.contracts import NeedsInput
+
+    if len(shape) > 2:
+        raise NeedsInput(
+            [{"name": "selection_indices", "shape": list(shape), "count": len(shape) - 2}],
+            "Select each leading dimension; the final two dimensions are spatial",
+        )
+
+
+def _read_standard_image(path: Path, *, require_plane: bool = False) -> ReadResult:
     with Image.open(path) as img:
+        if require_plane:
+            select_image_page(img, frame=None, channel=None)
         metadata_raw: dict[str, Any] = _to_jsonable(dict(img.info))
         warnings: list[dict[str, Any]] = []
 
@@ -182,7 +216,7 @@ def _read_standard_image(path: Path) -> ReadResult:
                 metadata_raw[_tag_name(tag_id)] = _to_jsonable(value)
                 metadata_raw[str(tag_id)] = _to_jsonable(value)
 
-        if getattr(img, "n_frames", 1) > 1:
+        if not require_plane and getattr(img, "n_frames", 1) > 1:
             warnings.append(
                 _mk_warning(
                     "IMAGE_MULTIFRAME_TIFF",
@@ -192,6 +226,7 @@ def _read_standard_image(path: Path) -> ReadResult:
             )
 
         array = np.asarray(img)
+        original_dtype = str(array.dtype)
         if array.ndim == 3:
             warnings.append(
                 _mk_warning(
@@ -219,15 +254,17 @@ def _read_standard_image(path: Path) -> ReadResult:
                 "reader": "pil",
                 "format": img.format,
                 "path": str(path),
-                "dtype_original": str(np.asarray(img).dtype),
+                "dtype_original": original_dtype,
             },
         )
 
 
-def _read_numpy_or_text(path: Path) -> ReadResult:
+def _read_numpy_or_text(path: Path, *, require_plane: bool = False) -> ReadResult:
     suffix = path.suffix.lower()
     if suffix == ".npy":
-        array = np.load(path, allow_pickle=False)
+        array = np.load(path, allow_pickle=False, mmap_mode="r" if require_plane else None)
+        if require_plane:
+            require_spatial_indices(array.shape)
     elif suffix in {".txt", ".csv"}:
         array = np.loadtxt(path)
     else:
@@ -397,7 +434,7 @@ def build_default_registry() -> ReaderRegistry:
         description="NumPy/text array reader.",
     )
     registry.register(
-        [".tif", ".tiff", ".png", ".jpg", ".jpeg"],
+        _IMAGE_EXTENSIONS,
         _read_standard_image,
         description="Baseline PIL image reader for common image formats.",
     )
@@ -428,6 +465,16 @@ def read_image(path: str | Path, registry: ReaderRegistry | None = None) -> Read
     """Read an image file using the supplied/default registry."""
     registry = registry or build_default_registry()
     return registry.read(path)
+
+
+def read_workflow_plane(path: Path) -> ReadResult | None:
+    """Read a single image/NPY plane with legacy metadata, or defer to its registered reader."""
+    suffix = path.suffix.lower()
+    if suffix in _IMAGE_EXTENSIONS:
+        return _read_standard_image(path, require_plane=True)
+    if suffix == ".npy":
+        return _read_numpy_or_text(path, require_plane=True)
+    return None
 
 
 def _collect_series_paths(

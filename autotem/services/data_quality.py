@@ -22,7 +22,7 @@ from autotem.harness.contracts import (
     StrictParameters,
 )
 from autotem.io.metadata import normalize_metadata
-from autotem.io.readers import _to_jsonable
+from autotem.io.readers import _to_jsonable, require_spatial_indices, select_image_page
 from autotem.preprocessing.background import subtract_background
 from autotem.preprocessing.basic import assess_quality, preprocess_dataset
 from autotem.preprocessing.denoise import apply_denoise
@@ -171,18 +171,9 @@ def image_array(array: Any, role: str = "raw", *, nonnegative: bool = False) -> 
     return result
 
 
-def _selection(array: Any, p: InputParameters, *, channel_last: bool = False) -> np.ndarray:
+def _selection(array: Any, p: InputParameters) -> np.ndarray:
     array = np.asarray(array)
-    if channel_last and array.ndim == 3:
-        if p.channel is None:
-            raise NeedsInput(
-                [{"name": "channel", "count": array.shape[-1]}],
-                "Select an image channel explicitly",
-            )
-        if p.channel >= array.shape[-1]:
-            raise HarnessError("INVALID_SELECTION", "Channel index is out of bounds")
-        array = array[..., p.channel]
-    elif p.channel is not None:
+    if p.channel is not None:
         raise HarnessError("INVALID_SELECTION", "channel applies only to channel images")
     if p.selection_indices is not None and p.frame is not None:
         raise HarnessError("INVALID_SELECTION", "Use either frame or selection_indices")
@@ -191,12 +182,9 @@ def _selection(array: Any, p: InputParameters, *, channel_last: bool = False) ->
         if array.ndim != 3:
             raise HarnessError("INVALID_SELECTION", "frame requires a three-dimensional stack")
         indices = [p.frame]
-    if array.ndim > 2 and indices is None:
-        raise NeedsInput(
-            [{"name": "selection_indices", "shape": list(array.shape), "count": array.ndim - 2}],
-            "Select each leading dimension; the final two dimensions are spatial",
-        )
-    if indices is not None:
+    if indices is None:
+        require_spatial_indices(array.shape)
+    else:
         if len(indices) != max(0, array.ndim - 2):
             raise HarnessError("INVALID_SELECTION", "Selection must leave exactly two dimensions")
         if any(index < 0 or index >= array.shape[axis] for axis, index in enumerate(indices)):
@@ -292,6 +280,20 @@ def _read_selected(path: Path, p: InputParameters) -> tuple[np.ndarray, dict, di
             selected = p.dataset_path or (choices[0] if choices else "")
             if selected not in choices:
                 raise HarnessError("INVALID_SELECTION", "Unknown NPZ dataset_path")
+            if p.frame is None and p.selection_indices is None:
+                # NpzFile.__getitem__ decompresses the entire member. Numeric NPY v1/v2
+                # headers already contain the dimensions needed for the next question.
+                with handle.zip.open(selected + ".npy") as member:
+                    version = np.lib.format.read_magic(member)
+                    reader = {
+                        (1, 0): np.lib.format.read_array_header_1_0,
+                        (2, 0): np.lib.format.read_array_header_2_0,
+                    }.get(version)
+                    if reader is not None:
+                        shape, _, dtype = reader(member)
+                        if dtype.kind not in "uif":
+                            raise HarnessError("INVALID_IMAGE", "NPZ requires real numeric pixels")
+                        require_spatial_indices(shape)
             array = handle[selected]
             selection["dataset_path"] = selected
     elif suffix == ".npy":
@@ -362,26 +364,19 @@ def _read_selected(path: Path, p: InputParameters) -> tuple[np.ndarray, dict, di
         )
     elif suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif"}:
         with Image.open(path) as handle:
-            count = getattr(handle, "n_frames", 1)
-            if count > 1 and p.frame is None:
-                raise NeedsInput(
-                    [{"name": "frame", "count": count}], "Select an image frame explicitly"
+            frame = select_image_page(handle, p.frame, p.channel)
+            if p.selection_indices is not None:
+                raise HarnessError(
+                    "INVALID_SELECTION", "Image input accepts frame/channel selection"
                 )
-            frame = p.frame or 0
-            if frame >= count:
-                raise HarnessError("INVALID_SELECTION", "Image frame is out of bounds")
-            handle.seek(frame)
             array = np.asarray(handle)
             metadata = _to_jsonable(dict(handle.info))
             if hasattr(handle, "tag_v2"):
                 metadata.update(_to_jsonable(dict(handle.tag_v2)))
             selection = {"frame": frame, "source_shape": list(array.shape)}
-            if p.selection_indices is not None or p.dataset_path or p.dataset_index is not None:
-                raise HarnessError(
-                    "INVALID_SELECTION", "Image input accepts frame/channel selection"
-                )
-            remaining = p.model_copy(update={"frame": None})
-            return _selection(array, remaining, channel_last=True), metadata, selection
+            if p.channel is not None:
+                array = array[..., p.channel]
+            return image_array(array), metadata, selection
     else:
         raise HarnessError("UNSUPPORTED_FORMAT", f"Unsupported input extension: {suffix}")
     selection["source_shape"] = list(array.shape)
