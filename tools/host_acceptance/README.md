@@ -4,6 +4,31 @@
 
 ## 采集一次旅程
 
+Windows 已安装项目可用 `field_capture.py` 在原机建立记录和核验原件。它从原发行包核对并读取同版 `verify.py` 和矩阵，使用当前活动项目的私有解释器与作业库。填写已安装的项目目录、当初解压安装包的目录和本机私有取证目录。工具参数可以使用含空格或中文的路径。
+
+```powershell
+$project = (Resolve-Path -LiteralPath (Read-Host '已安装的项目目录')).Path
+$bundle = (Resolve-Path -LiteralPath (Read-Host '解压后的发行目录')).Path
+$field = (Resolve-Path -LiteralPath (Read-Host 'field_capture.py 的位置')).Path
+$capture = Read-Host '本次私有取证目录的绝对路径'
+$active = Get-Content -Raw -LiteralPath (Join-Path $project '.autotem/active-runtime.json') | ConvertFrom-Json
+$python = Join-Path $project ".autotem/runtimes/$($active.runtime_id)/Scripts/python.exe"
+& $python -I -B -X utf8 $field --project $project --release $bundle init $capture --host codex --case J01
+```
+
+初始化产生 `observation=not_evaluated` 的 `case.json`。按下表保存实际用户请求、会话中的 Skill 加载、工具返回和最终回答。J01 的测量结论应引用真实返回的 `artifact_id`。对于 Codex 桌面会话，可用 `observed-host-export` 绑定会话导出或界面原件。CLI 的逐轮 JSONL 使用 `codex-exec-jsonl`。用真实记录补齐模板，保留带时区的开始与结束时间，然后单独运行核验。
+
+```powershell
+$sample = Join-Path $project '现场验收/inputs/J01 合成 HRTEM.npy'
+& $python -I -B -X utf8 $field --project $project --release $bundle verify (Join-Path $capture 'case.json') --expected-input $sample --out (Join-Path $capture 'summary.json')
+```
+
+`--expected-input` 用于本轮各 run 应读取同一输入的场景。核验通过的摘要会列出实际文件哈希和 `checks.expected_input`，J01 的值还应与现场材料 `index.json` 的 `inputs.j01.sha256` 一致。通用场景及有意变更原始输入的任务可省略此参数。
+
+原宿主以安装项目根目录解析相对路径，取证助手也从该目录核验 `reference` 模式的输入。发行包现场验收应使用独立安装项目。当前冻结验证器要求从源码检出之外运行安装态科学验收。
+
+`summary.json` 可交给复审人。每次复验选择新的输出文件名。需要纳入发布索引时，保留原安装项目和取证目录，在原机向 `qualify_release.py` 加入 `--host-capture <case.json> <项目目录>`。仿真档的 J15 使用 `--simulation-host-capture`。资格工具会重放冻结的通用场景校验，随现场卡移交单一输入的比对摘要。SQLite 的快照和产物路径指向原安装位置。
+
 在授权项目选用本次安装的私有运行时。以下命令在新目录生成 `case.json`。
 
 ```powershell

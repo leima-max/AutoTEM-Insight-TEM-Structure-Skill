@@ -3,9 +3,9 @@
     "case_id": "J01", "variant": null, "inputs": ["j01"], "profiles": ["traditional-core-mcp"], "condition": "ready",
     "setup": "使用合成 HRTEM 样本。横向和纵向的标定、候选晶胞都来自样本生成定义。",
     "turns": [
-      {"when": "start", "text": "请用 AutoTEM 分析“{j01}”。这幅 HRTEM 图的横纵标定都是 0.02 nm/像素。请测量两个方向的晶面间距，结合 FFT、峰表和间距表判断与候选 synthetic-cubic（a=b=c=0.16 nm）的相容性，解释能确定到什么程度。请给出运行编号、数据表，以及可以打开的 HTML 和 JSON 报告。"}
+      {"when": "start", "text": "请用 AutoTEM 分析“{j01}”。这幅 HRTEM 图的横纵标定都是 0.02 nm/像素。请测量两个方向的晶面间距，结合 FFT、峰表和间距表判断与候选 synthetic-cubic（a=b=c=0.16 nm）的相容性，解释能确定到什么程度。请在结论旁列出本次实际返回、可核对该结论的产物编号（artifact_id），并给出运行编号、数据表及可打开的 HTML 和 JSON 报告。"}
     ],
-    "observe": ["用报告的峰位置、正的物理间距和标定来源复核生成图的两个 8 像素轴向周期（0.16 nm）。", "打开本次运行的报告，检查候选匹配数、单位、证据限制和运行编号。"]
+    "observe": ["保存会话中实际加载 AutoTEM Skill 的记录、调用返回和最终答复原文。", "用报告的峰位置、正的物理间距和标定来源复核生成图的两个 8 像素轴向周期（0.16 nm）。", "打开本次运行的报告，检查候选匹配数、单位、证据限制，以及答复引用的运行与产物编号。"]
   },
   {
     "case_id": "J02", "variant": null, "inputs": ["j02"], "profiles": ["traditional-core-mcp"], "condition": "ready",
