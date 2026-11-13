@@ -1,5 +1,7 @@
 # 三宿主真实旅程取证
 
+J08 提供独立的 [GPA 选峰与参考区现场卡](field/J08-GPA.zh-CN.md)。使用支持这些变体的发行包，初始化时可在 `init <目录> --host codex --case J08` 后加 `--variant gpa_answered`、`--variant gpa_unanswered` 或 `--variant gpa_invalid_reply`。现场脚本会使用原安装包的冻结校验器。已登记的原子应变记录保留其原变体；GPA 专项结果按宿主单列，使用 J03 合成 HRTEM 输入。
+
 此工具读取已经发生的宿主调用和 Harness 登记产物。每一份记录对应一个宿主版本、一次会话、一个 J01–J15 场景和一个发行包。原始输入、宿主日志、截图、原话和 SQLite 保留在操作者的本地证据目录。可分发摘要包含哈希、运行标识、角色、形状及逐项判定。科学精度保留为 `not_evaluated`。
 
 ## 采集一次旅程

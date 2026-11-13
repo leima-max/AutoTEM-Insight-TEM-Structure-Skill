@@ -348,6 +348,8 @@ def host_results(bundle, observations, native):
             if any(r["checks"].get("full_tool_inventory") == "passed" for r in verified)
             else "not_evaluated",
         }
+        if "j08_gpa_observations" in group:
+            hosts[name]["j08_gpa_observations"] = group["j08_gpa_observations"]
     return {
         "hosts": hosts,
         "required_variants": table["required_variant_counts"],

@@ -40,6 +40,7 @@ def main(argv=None):
     prepare.add_argument("directory", type=Path)
     prepare.add_argument("--host", required=True, choices=("codex", "openclaw", "workbuddy"))
     prepare.add_argument("--case", required=True)
+    prepare.add_argument("--variant", help="Variant supported by the installed release verifier")
     check = actions.add_parser("verify", help="Verify case originals and write a new summary")
     check.add_argument("record", type=Path)
     check.add_argument("--out", required=True, type=Path)
@@ -68,6 +69,8 @@ def main(argv=None):
         if args.host not in (activation.get("host_installations") or {}):
             raise ValueError(f"This project has no installation for {args.host}.")
         command = ["init", str(args.directory.absolute()), "--host", args.host, "--case", args.case]
+        if args.variant is not None:
+            command.extend(["--variant", args.variant])
     else:
         output = args.out.absolute()
         expected = args.expected_input.resolve(strict=True) if args.expected_input else None

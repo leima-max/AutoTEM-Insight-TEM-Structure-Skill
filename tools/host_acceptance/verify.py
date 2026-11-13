@@ -16,6 +16,13 @@ MATRIX = json.loads(Path(__file__).with_name("matrix.json").read_text("utf-8"))
 HOSTS = tuple(MATRIX["hosts"])
 VARIANTS = MATRIX["cases"]
 CASES = tuple(VARIANTS)
+GPA_VARIANTS = ("gpa_answered", "gpa_unanswered", "gpa_invalid_reply")
+
+
+def case_variants(case):
+    return (*VARIANTS[case], *GPA_VARIANTS) if case == "J08" else VARIANTS[case]
+
+
 TOOLS = {
     "list_capabilities",
     "inspect_input",
@@ -291,21 +298,21 @@ def run_evidence(root, run_id, window, runtime):
         replies = [
             dict(r)
             for r in db.execute(
-                "SELECT parent_run_id,child_run_id,request_id,response,validation "
+                "SELECT parent_run_id,child_run_id,request_id,response,validation,adopted_values "
                 "FROM input_responses WHERE child_run_id=?",
                 (run_id,),
             )
         ]
-        questions = {
-            r[0]: [f["name"] for f in unique_json(r[1])]
-            for r in db.execute(
-                "SELECT request_id,fields FROM input_requests WHERE run_id=?", (run_id,)
-            )
-        }
-        question_evidence = {
-            r[0]: unique_json(r[1])
-            for r in db.execute(
-                "SELECT request_id,evidence_artifact_ids FROM input_requests WHERE run_id=?",
+        question_records = {
+            row["request_id"]: {
+                "step_id": row["step_id"],
+                "operation_id": row["operation_id"],
+                "fields": unique_json(row["fields"]),
+                "evidence": unique_json(row["evidence_artifact_ids"]),
+            }
+            for row in db.execute(
+                "SELECT request_id,step_id,operation_id,fields,evidence_artifact_ids "
+                "FROM input_requests WHERE run_id=?",
                 (run_id,),
             )
         }
@@ -459,8 +466,12 @@ def run_evidence(root, run_id, window, runtime):
         "physical_measurements": physical_measurements,
         "strain_validity": science,
         "_replies": replies,
-        "requested_fields": questions,
-        "question_evidence": question_evidence,
+        "requested_fields": {
+            key: [field["name"] for field in item["fields"]]
+            for key, item in question_records.items()
+        },
+        "question_evidence": {key: item["evidence"] for key, item in question_records.items()},
+        "_questions": question_records,
         "_children": all_children,
         "_request": request,
     }
@@ -544,10 +555,288 @@ def positive_distance_units(role, result):
     )
 
 
+def gpa_submission(turn, runs):
+    ids = {
+        c["response"]["result"]["run_id"]
+        for c in turn["calls"]
+        if c["tool"] == "submit_analysis" and c["response"]["ok"]
+    }
+    require(len(ids) == 1, "gpa_turn_requires_one_submitted_run")
+    return runs[ids.pop()]
+
+
+def gpa_question(turn, run, name):
+    require(
+        run["status"] == "needs_input" and run["error_code"] == "NEEDS_INPUT", "gpa_not_waiting"
+    )
+    questions = [
+        (qid, q)
+        for qid, q in run["_questions"].items()
+        if q["operation_id"] == "strain.gpa" and [f["name"] for f in q["fields"]] == [name]
+    ]
+    require(len(questions) == 1, "gpa_question_does_not_match_run")
+    qid, question = questions[0]
+    returned = [
+        c["response"]["result"]
+        for c in turn["calls"]
+        if c["tool"] in {"submit_analysis", "get_run_status"} and c["response"]["ok"]
+    ]
+    observed(
+        any(
+            data.get("run_id") == run["run_id"]
+            and data.get("status") == "needs_input"
+            and any(
+                q["request_id"] == qid
+                and q["operation_id"] == "strain.gpa"
+                and q["step_id"] == question["step_id"]
+                and q["fields"] == question["fields"]
+                and q["evidence_artifact_ids"] == question["evidence"]
+                for q in data.get("input_requests", [])
+            )
+            for data in returned
+        ),
+        "gpa_question_not_observed_in_its_turn",
+    )
+    roles = {"g_peak_selection", "numbered_g_peaks"} if name == "g_vectors" else {"raw_preview"}
+    candidates = {
+        i
+        for i in question["evidence"]
+        if run["artifacts"][i]["role"] in roles
+        and (name != "g_vectors" or run["artifacts"][i]["step_id"] == question["step_id"])
+    }
+    shown = set()
+    for c in turn["calls"]:
+        if not c["response"]["ok"]:
+            continue
+        data = c["response"]["result"]
+        if c["tool"] == "read_artifact":
+            entries = [data["artifact"]]
+        elif c["tool"] == "list_artifacts" and c["arguments"]["run_id"] == run["run_id"]:
+            entries = data
+        else:
+            continue
+        for a in entries:
+            i = a["artifact_id"]
+            if i in candidates and all(a[k] == run["artifacts"][i][k] for k in ("role", "sha256")):
+                shown.add(i)
+    observed(shown, "gpa_prompt_evidence_not_returned_in_its_turn")
+    return qid, question["step_id"], shown
+
+
+def gpa_reply(turn, parent, child, question, names, excerpts):
+    qid, step, shown = question
+    require(
+        child["parent_run_id"] == parent["run_id"]
+        and child["parameter_diff_present"]
+        and child["source_sha256"] == parent["source_sha256"]
+        and child["_request"]["input_path"] == parent["_request"]["input_path"],
+        "gpa_reply_parent_or_source_mismatch",
+    )
+    rows = [
+        row
+        for row in child["_replies"]
+        if (row["parent_run_id"], row["child_run_id"], row["request_id"])
+        == (parent["run_id"], child["run_id"], qid)
+    ]
+    require(len(rows) == 1, "gpa_reply_link_missing")
+    row = rows[0]
+    saved = unique_json(row["response"])
+    adopted = unique_json(row["adopted_values"])
+    answers = saved["answers"]
+    require(
+        unique_json(row["validation"])["status"] == "accepted"
+        and len(answers) == 1
+        and set(answers) <= names
+        and adopted.keys() == answers.keys()
+        and saved["request_id"] == qid
+        and saved["source"] in {"user", "artifact"}
+        and saved["basis"].strip()
+        and shown.intersection(saved["evidence_artifact_ids"])
+        and set(saved["evidence_artifact_ids"]) <= set(parent["question_evidence"][qid]),
+        "gpa_reply_source_or_evidence_mismatch",
+    )
+    plans = [
+        c["arguments"].get("plan")
+        for c in turn["calls"]
+        if c["tool"] == "submit_analysis"
+        and c["response"]["ok"]
+        and c["response"]["result"]["run_id"] == child["run_id"]
+        and c["arguments"].get("parent_run_id") == parent["run_id"]
+    ]
+    require(
+        any(
+            isinstance(p, dict)
+            and all(
+                p.get("user_input", {}).get("response", {}).get(k) == saved.get(k)
+                for k in (
+                    "request_id",
+                    "answers",
+                    "source",
+                    "basis",
+                    "evidence_artifact_ids",
+                    "raw_reply",
+                )
+            )
+            for p in plans
+        ),
+        "gpa_observed_reply_differs_from_store",
+    )
+    quote = saved.get("raw_reply")
+    if not quote:
+        excerpt = excerpts.get(qid, {})
+        require(excerpt.get("answers") == answers, "gpa_reply_excerpt_answers_mismatch")
+        quote = excerpt.get("quote")
+    observed(quote and quote in turn["prompt"], "gpa_reply_not_from_this_user_turn")
+    applied = next(iter(adopted.values()))
+    params = next(
+        (
+            s["parameters"]
+            for s in child["_request"]["steps"]
+            if s["id"] == step and s["operation_id"] == "strain.gpa"
+        ),
+        {},
+    )
+    require(
+        applied["operation_id"] == "strain.gpa"
+        and applied["step_id"] == step
+        and applied["parameters"]
+        and all(params.get(k) == v for k, v in applied["parameters"].items()),
+        "gpa_reply_not_applied_to_child",
+    )
+    return {
+        "request_id": qid,
+        "parent_run_id": parent["run_id"],
+        "child_run_id": child["run_id"],
+        "answer": next(iter(answers)),
+        "evidence_artifact_ids": sorted(shown),
+        "reply_sha256": text_digest(quote),
+    }
+
+
+def check_gpa_followup(variant, turns, runs, excerpts):
+    expected_turns = {"gpa_answered": 3, "gpa_unanswered": 1, "gpa_invalid_reply": 2}
+    observed(len(turns) == expected_turns[variant], "gpa_followup_turn_count_mismatch")
+    observed(
+        len({t["session"] for t in turns}) == 1
+        and len({t["trace_sha256"] for t in turns}) == len(turns),
+        "gpa_requires_distinct_turns_in_one_session",
+    )
+    parent = gpa_submission(turns[0], runs)
+    require(parent["parent_run_id"] is None, "gpa_first_submission_is_not_root")
+    g_pair = gpa_question(turns[0], parent, "g_vectors")
+    if variant != "gpa_answered":
+        require(not parent["_children"], "reply_started_unexpected_child")
+        if variant == "gpa_invalid_reply":
+            rejected = []
+            for c in turns[1]["calls"]:
+                if c["tool"] not in {"validate_plan", "submit_analysis"}:
+                    continue
+                require(
+                    not c["response"]["ok"] or c["tool"] != "submit_analysis",
+                    "rejected_gpa_reply_submitted",
+                )
+                if c["response"]["ok"]:
+                    continue
+                args, error = c["arguments"], c["response"]["error"]
+                plan = args.get("plan")
+                reply = (
+                    plan.get("user_input", {}).get("response", {}) if isinstance(plan, dict) else {}
+                )
+                answers = reply.get("answers", {})
+                quote = reply.get("raw_reply") or excerpts.get(g_pair[0], {}).get("quote")
+                if (
+                    error["code"] == "INVALID_INPUT_RESPONSE"
+                    and reply.get("request_id") == g_pair[0]
+                    and plan.get("input_path") == parent["_request"]["input_path"]
+                    and any(
+                        s.get("id") == g_pair[1] and s.get("operation_id") == "strain.gpa"
+                        for s in plan.get("steps", [])
+                    )
+                    and quote
+                    and quote in turns[1]["prompt"]
+                    and args.get("parent_run_id", parent["run_id"]) == parent["run_id"]
+                    and (
+                        reply.get("raw_reply")
+                        or excerpts.get(g_pair[0], {}).get("answers") == answers
+                    )
+                    and reply.get("source") in {"user", "artifact"}
+                    and reply.get("basis", "").strip()
+                    and len(answers) == 1
+                    and set(answers) <= {"g_vectors", "g_peak_indices"}
+                    and error.get("details", {}).get("field") in {"g_vectors", "g_peak_indices"}
+                    and g_pair[2].intersection(reply.get("evidence_artifact_ids", []))
+                    and set(reply["evidence_artifact_ids"])
+                    <= set(parent["question_evidence"][g_pair[0]])
+                ):
+                    rejected.append(error["code"])
+            observed(rejected, "missing_linked_rejected_gpa_reply")
+        return {
+            "g_request_id": g_pair[0],
+            "parent_run_id": parent["run_id"],
+            "evidence_artifact_ids": sorted(g_pair[2]),
+            "answered_edges": [],
+        }
+    middle = gpa_submission(turns[1], runs)
+    first = gpa_reply(turns[1], parent, middle, g_pair, {"g_vectors", "g_peak_indices"}, excerpts)
+    roi = gpa_question(turns[1], middle, "reference_region")
+    require(g_pair[0] != roi[0] and g_pair[1] == roi[1], "gpa_questions_mixed")
+    final = gpa_submission(turns[2], runs)
+    second = gpa_reply(turns[2], middle, final, roi, {"reference_region"}, excerpts)
+    middle_params = next(s["parameters"] for s in middle["_request"]["steps"] if s["id"] == roi[1])
+    final_params = next(s["parameters"] for s in final["_request"]["steps"] if s["id"] == roi[1])
+    require(
+        all(middle_params[k] == final_params[k] for k in ("g_vectors", "g_vector_unit")),
+        "gpa_selected_vectors_changed_at_roi_reply",
+    )
+    roles = {
+        a["role"]
+        for a in final["artifacts"].values()
+        if a["execution_usable"] and a["step_id"] == roi[1]
+    }
+    require(
+        final["status"] == "completed"
+        and ROLES["J03"] <= roles
+        and any(s["step_id"] == roi[1] and s["valid_count"] > 0 for s in final["strain_validity"]),
+        "completed_gpa_fields_missing",
+    )
+    observed(
+        any(
+            c["tool"] == "export_report"
+            and c["response"]["ok"]
+            and c["response"]["result"]["run_id"] == final["run_id"]
+            for c in turns[2]["calls"]
+        ),
+        "final_gpa_report_not_returned",
+    )
+    return {
+        "g_request_id": g_pair[0],
+        "roi_request_id": roi[0],
+        "parent_run_id": parent["run_id"],
+        "final_run_id": final["run_id"],
+        "answered_edges": [first, second],
+    }
+
+
 def check_case(case, calls, runs, turns, excerpts, variant=None):
     completed = [r for r in runs.values() if r["status"] == "completed"]
     if variant is not None:
-        require(variant in VARIANTS.get(case, set()), "unknown_case_variant")
+        require(variant in case_variants(case), "unknown_case_variant")
+    if case == "J08" and variant in GPA_VARIANTS:
+        return check_gpa_followup(variant, turns, runs, excerpts)
+    if (
+        case == "J08"
+        and variant == "answered"
+        and len(turns) == 3
+        and {"g_vectors", "reference_region"}
+        <= {
+            f["name"]
+            for run in runs.values()
+            for q in run.get("_questions", {}).values()
+            if q["operation_id"] == "strain.gpa"
+            for f in q["fields"]
+        }
+    ):
+        return check_gpa_followup("gpa_answered", turns, runs, excerpts)
     if case in OPERATIONS and not (case == "J15" and variant not in {None, "executed"}):
         candidates = [
             r
@@ -1063,7 +1352,7 @@ def verify(spec_path, *, bundle=None, root=None, project=None):
     checks = result["checks"]
     try:
         if "variant" in spec:
-            require(spec["variant"] in VARIANTS[spec["case_id"]], "unknown_case_variant")
+            require(spec["variant"] in case_variants(spec["case_id"]), "unknown_case_variant")
             result["variant"] = spec["variant"]
         if bundle:
             manifest = bundle / "release-manifest.json"
@@ -1179,7 +1468,11 @@ def verify(spec_path, *, bundle=None, root=None, project=None):
             variant = mode
         if variant:
             result["variant"] = variant
-        check_case(spec["case_id"], calls, runs, turns, spec.get("followup_excerpts", {}), variant)
+        followup = check_case(
+            spec["case_id"], calls, runs, turns, spec.get("followup_excerpts", {}), variant
+        )
+        if followup:
+            result["gpa_followup"] = followup
         checks["case_execution"] = "passed"
         all_artifacts = {i: a for run in runs.values() for i, a in run["artifacts"].items()}
         returned = set()
@@ -1214,7 +1507,7 @@ def verify(spec_path, *, bundle=None, root=None, project=None):
         diagnostic = (
             spec["case_id"] in {"J10", "J11", "J12", "J13"}
             or spec["case_id"] == "J08"
-            and variant in {"unanswered", "invalid_reply"}
+            and variant in {"unanswered", "invalid_reply", "gpa_unanswered", "gpa_invalid_reply"}
             or spec["case_id"] == "J15"
             and variant not in {None, "executed"}
         )
@@ -1336,6 +1629,7 @@ def main(argv=None):
     new.add_argument("directory", type=Path)
     new.add_argument("--host", required=True, choices=HOSTS)
     new.add_argument("--case", required=True, choices=CASES)
+    new.add_argument("--variant", help="Optional matrix variant or supplementary J08 GPA case")
     check = sub.add_parser("verify")
     check.add_argument("record", type=Path)
     check.add_argument("--release", type=Path)
@@ -1344,6 +1638,8 @@ def main(argv=None):
     check.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
     if args.action == "init":
+        if args.variant is not None and args.variant not in case_variants(args.case):
+            parser.error("Unknown variant for this case")
         args.directory.mkdir(parents=True, exist_ok=True)
         template = {
             "schema_version": "1.0.0",
@@ -1361,6 +1657,8 @@ def main(argv=None):
             "claims": [],
             "host_observations": {},
         }
+        if args.variant is not None:
+            template["variant"] = args.variant
         with (args.directory / "case.json").open("x", encoding="utf-8") as f:
             json.dump(template, f, indent=2)
         return 0

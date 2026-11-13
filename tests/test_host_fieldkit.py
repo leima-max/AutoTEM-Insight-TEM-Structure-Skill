@@ -12,12 +12,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture
-def release_sources(tmp_path):
+def release_sources(tmp_path, request):
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     matrix = kit.HERE / "matrix.json"
     source = bundle / "sources.zip"
     original = {name: (ROOT / name).read_bytes() for name in kit.INPUT_SOURCES}
+    if getattr(request, "param", None) == "gpa":
+        original[kit.GPA_CARD_SOURCE] = (ROOT / kit.GPA_CARD_SOURCE).read_bytes()
     with ZipFile(source, "w") as archive:
         for name, data in original.items():
             archive.writestr(name, data)
@@ -62,6 +64,23 @@ def release_sources(tmp_path):
     index = tmp_path / "release-index.json"
     index.write_bytes(kit.as_json(qualification))
     return bundle, index, matrix
+
+
+@pytest.mark.parametrize("release_sources", ["gpa"], indirect=True)
+def test_optional_gpa_card_is_frozen_without_expanding_required_cards(tmp_path, release_sources):
+    bundle, index, matrix = release_sources
+    destination = tmp_path / "现场验收"
+    spec = kit.prepare(destination, bundle, index, matrix)
+    assert len(spec["cards"]) == 31
+    card = destination / kit.GPA_CARD
+    assert card.read_bytes() == (ROOT / kit.GPA_CARD_SOURCE).read_bytes()
+    assert kit.GPA_CARD in (destination / "README.md").read_text("utf-8")
+    with card.open("ab") as stream:
+        stream.write(b"changed")
+    spec["files_sha256"][kit.GPA_CARD] = kit.file_sha(card)
+    (destination / "index.json").write_bytes(kit.as_json(spec))
+    with pytest.raises(ValueError, match="GPA follow-up card differs from frozen source"):
+        kit.verify(destination, bundle, index, matrix)
 
 
 def test_portable_operator_cards_make_and_verify_only_synthetic_inputs(tmp_path, release_sources):

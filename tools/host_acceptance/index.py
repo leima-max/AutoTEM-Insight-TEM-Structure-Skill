@@ -13,6 +13,7 @@ from pathlib import Path
 MATRIX_FILE = Path(__file__).with_name("matrix.json")
 MATRIX = json.loads(MATRIX_FILE.read_text("utf-8"))
 VERDICTS = ("failed", "blocked", "not_evaluated", "passed")
+GPA_VARIANTS = ("gpa_answered", "gpa_unanswered", "gpa_invalid_reply")
 
 
 def read_json(path):
@@ -57,6 +58,7 @@ def build(
     for report, summary_hash in records:
         host, case = report["host"], report["case_id"]
         variant, verdict = report.get("variant"), report["case_verdict"]
+        supplemental = case == "J08" and variant in GPA_VARIANTS
         if (
             report.get("execution_layer") != "real_host_capture"
             or report.get("schema_version") != "1.0.0"
@@ -66,6 +68,7 @@ def build(
             or report.get("release_ready") is not False
             or variant is not None
             and variant not in MATRIX["cases"][case]
+            and not supplemental
         ):
             raise ValueError("Invalid host verifier summary")
         evidence = report["evidence"]
@@ -123,6 +126,16 @@ def build(
                 )
             ):
                 raise ValueError("Passed observation lacks verified release or host checks")
+            if supplemental:
+                lineage = report.get("gpa_followup", {})
+                edges = lineage.get("answered_edges")
+                if not (
+                    lineage.get("parent_run_id")
+                    and lineage.get("g_request_id")
+                    and isinstance(edges, list)
+                    and len(edges) == (2 if variant == "gpa_answered" else 0)
+                ):
+                    raise ValueError("Supplementary GPA observation lacks its verified lineage")
             if host in fingerprints and fingerprints[host] != runtime["skill_resource_sha256"]:
                 raise ValueError("Mixed deployed Skill or Profile identities")
             fingerprints[host] = runtime["skill_resource_sha256"]
@@ -175,6 +188,11 @@ def build(
             "cases": cases,
             "journey_verdict": aggregate([c["verdict"] for c in cases.values()]),
         }
+        extra = {
+            v: inventory[(host, "J08", v)] for v in GPA_VARIANTS if (host, "J08", v) in inventory
+        }
+        if extra:
+            hosts[host]["j08_gpa_observations"] = extra
         if host in discovery:
             artifact = discovery[host]
             if not artifact.is_file() or not artifact.stat().st_size:

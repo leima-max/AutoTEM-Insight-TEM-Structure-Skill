@@ -52,6 +52,8 @@ FILES = {
 }
 CASE_SOURCE = "autotem/acceptance/cases.py"
 MATRIX_SOURCE = "tools/host_acceptance/matrix.json"
+GPA_CARD_SOURCE = "tools/host_acceptance/field/J08-GPA.zh-CN.md"
+GPA_CARD = "cards/J08-GPA.md"
 SELECTION_SOURCE = "tools/release/contract_probe.py"
 SIM_OPTIONS = "tools/acceptance/operation_variants.json"
 SIM_SOURCE = "tools/acceptance/verify_variants.py"
@@ -181,16 +183,20 @@ def archived_sources(release, matrix):
             archive.read(str(relative(source["inventory_member"]))), object_pairs_hook=unique
         )["files"]
         hashes = {}
-        for name in INPUT_SOURCES:
+        members = list(INPUT_SOURCES)
+        if GPA_CARD_SOURCE in inventory:
+            members.append(GPA_CARD_SOURCE)
+        for name in members:
             hashes[name] = sha(archive.read(name))
             require(hashes[name] == inventory[name], f"Changed frozen source: {name}")
         options = json.loads(archive.read(SIM_OPTIONS))["cases"]["cubic-simulation"]
+        card = archive.read(GPA_CARD_SOURCE) if GPA_CARD_SOURCE in hashes else None
     require(file_sha(matrix) == hashes[MATRIX_SOURCE], "Matrix differs from the release source")
     require(
         file_sha(Path(cases.__file__)) == hashes[CASE_SOURCE],
         "Input generator differs from the one shipped by the release",
     )
-    return hashes, options
+    return hashes, options, card
 
 
 def matrix_variants(matrix):
@@ -421,7 +427,7 @@ def card_text(row):
     return "\n".join(lines).encode("utf-8")
 
 
-def guide(rows, identity):
+def guide(rows, identity, *, gpa_card=False):
     lines = [
         "# AutoTEM 宿主现场验收",
         "",
@@ -442,6 +448,8 @@ def guide(rows, identity):
             f"| [{name[:-3]}](cards/{name}) | {'、'.join(row['profiles'])} | "
             f"{CONDITIONS[row['condition']]} |"
         )
+    if gpa_card:
+        lines += ["", f"[J08 GPA 补充卡]({GPA_CARD})包含选峰和参考区的合法、未答及非法回复观察。"]
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
@@ -508,7 +516,7 @@ def verify(root, release=None, release_index=None, matrix=None):
             require(file_sha(path) == file_sha(bindings[name]), f"Different external {name}")
     src = load(bindings["source-inventory.json"])
     require(
-        set(src) == set(INPUT_SOURCES)
+        set(src) in (set(INPUT_SOURCES), {*INPUT_SOURCES, GPA_CARD_SOURCE})
         and all(check_sha(v) for v in src.values())
         and src[MATRIX_SOURCE] == identity["matrix_sha256"],
         "Invalid source bindings",
@@ -520,7 +528,7 @@ def verify(root, release=None, release_index=None, matrix=None):
             == identity["release_manifest_sha256"],
             "Different external release manifest",
         )
-        originals, settings = archived_sources(release, bindings["matrix.json"])
+        originals, settings, _ = archived_sources(release, bindings["matrix.json"])
         require(originals == src and settings == options, "Different release input sources")
     rows = render_rows(
         load(bindings["matrix.json"]),
@@ -532,10 +540,17 @@ def verify(root, release=None, release_index=None, matrix=None):
         "Field kit case coverage or inputs differ",
     )
     require(
-        safe_file(root, "README.md").read_bytes() == guide(rows, identity),
+        safe_file(root, "README.md").read_bytes()
+        == guide(rows, identity, gpa_card=GPA_CARD_SOURCE in src),
         "Field kit guide differs from its cards",
     )
     expected = {"README.md", *("basis/" + n for n in BINDINGS)}
+    if GPA_CARD_SOURCE in src:
+        require(
+            file_sha(safe_file(root, GPA_CARD)) == src[GPA_CARD_SOURCE],
+            "GPA follow-up card differs from frozen source",
+        )
+        expected.add(GPA_CARD)
     for row in rows:
         name = "cards/" + card_name(row)
         require(
@@ -580,7 +595,7 @@ def prepare(out, release, release_index, matrix, *, templates=HERE / "field"):
     require(all(not linked(p) for p in out.parents if p.exists()), "Linked destination ancestor")
     require(len(relative(out.name).parts) == 1, "Expected a single project-relative kit directory")
     identity = release_identity(safe_file(release, "release-manifest.json"), release_index, matrix)
-    hashes, options = archived_sources(release, matrix)
+    hashes, options, gpa_card = archived_sources(release, matrix)
     sources = {
         "release-manifest.json": safe_file(release, "release-manifest.json").read_bytes(),
         "release-index.json": release_index.read_bytes(),
@@ -630,7 +645,9 @@ def prepare(out, release, release_index, matrix, *, templates=HERE / "field"):
             (root / "basis" / name).write_bytes(data)
         for row in rows:
             (root / "cards" / card_name(row)).write_bytes(card_text(row))
-        (root / "README.md").write_bytes(guide(rows, identity))
+        if gpa_card is not None:
+            (root / GPA_CARD).write_bytes(gpa_card)
+        (root / "README.md").write_bytes(guide(rows, identity, gpa_card=gpa_card is not None))
         details = make_inputs(root / "inputs", options)
         inputs = {}
         for key, detail in details.items():
