@@ -32,7 +32,13 @@ from autotem.services.atomic import (
     region_mask,
 )
 from autotem.strain.atom_strain import compute_atom_strain_fields
-from autotem.strain.gpa import _resolve_g_vectors, _validate_g_vector_pair, compute_gpa_fields
+from autotem.strain.gpa import (
+    InsufficientGPAReference,
+    _resolve_g_vectors,
+    _validate_g_vector_pair,
+    compute_gpa_fields,
+    validate_gpa_references,
+)
 from autotem.strain.gpa_alignment import GPAAlignmentConfig, compare_gpa_configs
 
 LIMITATION = (
@@ -194,7 +200,7 @@ def gpa_arguments(ctx: OperationContext, p: GPAParameters, image: np.ndarray) ->
                 "Physical g vectors require actual pixel size to convert to image frequencies",
             )
     try:
-        vectors, _ = _resolve_g_vectors(
+        vectors, _, _ = _resolve_g_vectors(
             image.shape,
             diffraction_result=arguments.get("diffraction_result"),
             g_vectors=p.g_vectors,
@@ -352,6 +358,16 @@ def emit_strain_montage(ctx, role, result, *, quality_mask=None, coordinates_yx=
     )
 
 
+def ask_gpa_reference(ctx: OperationContext, error: InsufficientGPAReference):
+    ctx.emit_array(
+        "gpa_reference_quality", error.quality_mask, metadata={"scientific_level": "diagnostic"}
+    )
+    field = {"name": "reference_region", "type": "array"}
+    if error.parameter_group:
+        field["parameter_group"] = error.parameter_group
+    raise NeedsInput([field], str(error)) from error
+
+
 def gpa(ctx: OperationContext, params: dict) -> ServiceResult:
     p = parameters(GPAParameters, params)
     image = image_array(ctx, p.image_role)
@@ -359,19 +375,10 @@ def gpa(ctx: OperationContext, params: dict) -> ServiceResult:
     result = checked_call(compute_gpa_fields, image, **arguments)
     if not np.any(result.quality_mask):
         raise HarnessError("NO_VALID_STRAIN", "No image pixels support reliable Bragg phases")
-    for region in result.reference_regions:
-        if region is not None:
-            y0, y1, x0, x1 = region
-            if np.count_nonzero(result.quality_mask[y0:y1, x0:x1]) < 9:
-                ctx.emit_array(
-                    "gpa_reference_quality",
-                    result.quality_mask,
-                    metadata={"scientific_level": "diagnostic"},
-                )
-                raise NeedsInput(
-                    [{"name": "reference_region", "type": "array"}],
-                    "Reference ROI has fewer than nine valid phase pixels; choose a cleaner ROI",
-                )
+    try:
+        validate_gpa_references(result.quality_mask, result.reference_regions)
+    except InsufficientGPAReference as exc:
+        ask_gpa_reference(ctx, exc)
     output = persist_gpa(ctx, result)
     output.provenance["static_map_artifact_id"] = emit_strain_montage(
         ctx, "gpa", result, quality_mask=result.quality_mask
@@ -401,11 +408,17 @@ def gpa_compare(ctx: OperationContext, params: dict) -> ServiceResult:
             )
         arguments.pop("reference_regions", None)
         configs.append(GPAAlignmentConfig(**arguments))
-    result = checked_call(compare_gpa_configs, image, *configs, sample_step=p.sample_step)
+    try:
+        result = checked_call(compare_gpa_configs, image, *configs, sample_step=p.sample_step)
+    except InsufficientGPAReference as exc:
+        ask_gpa_reference(ctx, exc)
     result["scientific_limitation"] = (
         "Parameter comparison is not independent scientific validation"
     )
-    return ServiceResult({"gpa_comparison": clean_json(result)}, [LIMITATION])
+    warnings = [LIMITATION]
+    if reason := result["diagnosis"].get("reason"):
+        warnings.append(reason)
+    return ServiceResult({"gpa_comparison": clean_json(result)}, warnings)
 
 
 def atom_strain(ctx: OperationContext, params: dict) -> ServiceResult:

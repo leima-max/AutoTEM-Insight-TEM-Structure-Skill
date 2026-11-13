@@ -150,7 +150,12 @@ def check_geometry(compiled, record, adopted, parent, store):
         _validate_numbered_atoms(params, table_id, store, target.operation_id)
     if target.operation_id.startswith("strain.gpa"):
         from autotem.services.strain import checked_region
-        from autotem.strain.gpa import _convert_g_vector_units, _validate_g_vector_pair
+        from autotem.strain.gpa import (
+            InsufficientGPAReference,
+            _convert_g_vector_units,
+            _validate_g_vector_pair,
+            validate_gpa_references,
+        )
 
         raw_id = store.role(record["run_id"], "raw")
         shape = tuple(store.artifact(raw_id)["metadata"]["shape"])
@@ -167,6 +172,8 @@ def check_geometry(compiled, record, adopted, parent, store):
             old = next(
                 s["parameters"] for s in parent["request"]["steps"] if s["id"] == record["step_id"]
             )
+            if group:
+                old = old[group]
             references = {"reference_region", "reference_regions", "absolute_reference"}
             if all(old.get(k) == v for k, v in params.items() if k not in references):
                 quality = store.load_array(mask_id)
@@ -174,13 +181,10 @@ def check_geometry(compiled, record, adopted, parent, store):
             if region is not None:
                 try:
                     y0, y1, x0, x1 = checked_region(region, shape)
-                except HarnessError as exc:
+                    if quality is not None:
+                        validate_gpa_references(quality, [(y0, y1, x0, x1)], parameter_group=group)
+                except (HarnessError, InsufficientGPAReference) as exc:
                     raise invalid(str(exc), "reference_region") from exc
-                if quality is not None and np.count_nonzero(quality[y0:y1, x0:x1]) < 9:
-                    raise invalid(
-                        "Choose at least nine valid pixels in the displayed quality mask",
-                        "reference_region",
-                    )
         if fields & {"g_vectors", "g_peak_indices"}:
             vectors = np.asarray(params["g_vectors"], dtype=float)
             if vectors.shape != (2, 2) or np.linalg.matrix_rank(vectors) != 2:

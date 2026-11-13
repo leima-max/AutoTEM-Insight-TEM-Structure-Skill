@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,41 @@ ReferenceRegions = tuple[ReferenceRegion | None, ReferenceRegion | None]
 _TWO_PI = 2.0 * np.pi
 DEFAULT_GPA_MASK_SIGMA_PX = 2.5
 _SUPPORTED_GPA_METHODS = {"gpa", "gpa_b3"}
+
+
+class InsufficientGPAReference(RuntimeError):
+    """A proposed reference ROI lacks phase support on this image."""
+
+    def __init__(
+        self,
+        quality_mask: np.ndarray,
+        region: ReferenceRegion,
+        valid_pixels: int,
+        parameter_group: str | None,
+    ):
+        self.quality_mask = quality_mask
+        self.parameter_group = parameter_group
+        scope = parameter_group or "GPA"
+        super().__init__(
+            f"{scope} reference ROI {list(region)} contains {valid_pixels} valid phase pixels. "
+            "Choose a reference ROI with at least nine valid phase pixels."
+        )
+
+
+def validate_gpa_references(
+    quality_mask: np.ndarray,
+    regions: Iterable[ReferenceRegion | None],
+    *,
+    parameter_group: str | None = None,
+) -> None:
+    """Require nine phase-supported pixels in each supplied reference ROI."""
+    for region in regions:
+        if region is None:
+            continue
+        y0, y1, x0, x1 = region
+        valid_pixels = int(np.count_nonzero(quality_mask[y0:y1, x0:x1]))
+        if valid_pixels < 9:
+            raise InsufficientGPAReference(quality_mask, region, valid_pixels, parameter_group)
 
 
 @dataclass(slots=True)
@@ -240,7 +276,7 @@ def compute_gpa_fields(
     warnings = warnings if warnings is not None else []
     arr = _prepare_image(image)
     h, w = arr.shape
-    g_cycles, g_source = _resolve_g_vectors(
+    g_cycles, g_source, peak_indices = _resolve_g_vectors(
         arr.shape,
         diffraction_result=diffraction_result,
         g_vectors=g_vectors,
@@ -292,7 +328,7 @@ def compute_gpa_fields(
     )
 
     g_vector_models = [
-        _gvector_model(g[0], g[1], source_peak_index=i if g_source == "diffraction_peaks" else None)
+        _gvector_model(g[0], g[1], source_peak_index=peak_indices[i] if peak_indices else None)
         for i, g in enumerate(g_refined)
     ]
     _append_field_sanity_warnings(
@@ -408,17 +444,18 @@ def _resolve_g_vectors(
     g_vector_unit: str,
     pixel_size_nm: float | None,
     warnings: list[str],
-) -> tuple[np.ndarray, str]:
+) -> tuple[np.ndarray, str, tuple[int, int] | None]:
     if g_vectors is not None:
         raw = np.asarray(g_vectors, dtype=np.float64)
         if raw.shape != (2, 2):
             raise ValueError("g_vectors must contain exactly two (gx, gy) entries.")
-        return _convert_g_vector_units(
+        converted = _convert_g_vector_units(
             raw,
             unit=g_vector_unit,
             pixel_size_nm=pixel_size_nm,
             image_shape=image_shape,
-        ), "manual"
+        )
+        return converted, "manual", None
 
     if diffraction_result is not None and len(diffraction_result.g_vectors) >= 2:
         raw_units = [
@@ -438,7 +475,7 @@ def _resolve_g_vectors(
             )[0]
             for gx, gy, unit in raw_units
         ]
-        return np.asarray(converted, dtype=np.float64), "diffraction_g_vectors"
+        return np.asarray(converted, dtype=np.float64), "diffraction_g_vectors", None
 
     if diffraction_result is not None and len(diffraction_result.peaks) >= 2:
         center = diffraction_result.center
@@ -447,11 +484,12 @@ def _resolve_g_vectors(
             warnings.append(
                 "DiffractionResult.center missing; using image center for GPA peak vectors."
             )
-        return _select_g_vectors_from_peaks(
+        vectors, indices = _select_g_vectors_from_peaks(
             peaks=diffraction_result.peaks,
             center_xy=(float(center[0]), float(center[1])),
             image_shape=image_shape,
-        ), "diffraction_peaks"
+        )
+        return vectors, "diffraction_peaks", indices
 
     raise ValueError(
         "GPA requires two manual g_vectors or a DiffractionResult with g-vectors/peaks."
@@ -495,25 +533,26 @@ def _select_g_vectors_from_peaks(
     peaks: list[DiffractionPeak],
     center_xy: tuple[float, float],
     image_shape: tuple[int, int],
-) -> np.ndarray:
-    candidates: list[tuple[float, float, float]] = []
+) -> tuple[np.ndarray, tuple[int, int]]:
+    candidates: list[tuple[float, float, float, int]] = []
     cx, cy = center_xy
-    for peak in peaks:
+    for index, peak in enumerate(peaks):
         dx = float(peak.x) - cx
         dy = float(peak.y) - cy
         radius = float(np.hypot(dx, dy))
         if radius < 2.0:
             continue
         score = float(peak.intensity) if peak.intensity is not None else radius
-        candidates.append((score, dx / image_shape[1], dy / image_shape[0]))
+        candidates.append((score, dx / image_shape[1], dy / image_shape[0], index))
     if len(candidates) < 2:
         raise ValueError("Diffraction peaks do not contain two usable non-center g-vectors.")
     candidates.sort(reverse=True, key=lambda item: item[0])
-    first = np.asarray(candidates[0][1:], dtype=np.float64)
-    for _, gx, gy in candidates[1:]:
+    _, gx, gy, first_index = candidates[0]
+    first = np.asarray([gx, gy], dtype=np.float64)
+    for _, gx, gy, index in candidates[1:]:
         second = np.asarray([gx, gy], dtype=np.float64)
         if abs(float(np.linalg.det(np.vstack([first, second])))) > 1e-5:
-            return np.vstack([first, second])
+            return np.vstack([first, second]), (first_index, index)
     raise ValueError("Could not select two non-collinear g-vectors from diffraction peaks.")
 
 

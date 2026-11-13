@@ -486,6 +486,64 @@ def test_gpa_preview_uses_the_mask_from_the_same_step(tmp_path):
         h.read_artifact(stored["artifact_id"])
 
 
+def test_gpa_comparison_replies_and_report_for_empty_overlap(tmp_path):
+    from autotem.acceptance.cases import write_fixture
+
+    source, _ = write_fixture("J03", tmp_path)
+    h = Harness(tmp_path / "h")
+    good = {"g_vectors": [[0.125, 0], [0, 0.125]], "reference_region": [16, 48, 16, 48]}
+    parameters = {
+        "reference_config": good,
+        "candidate_config": {**good, "reference_region": [0, 4, 0, 4]},
+        "sample_step": 100,
+    }
+    plan = {
+        "input_path": str(source),
+        "modality": "HRTEM",
+        "steps": [
+            {"id": "load", "operation_id": "input.load"},
+            {"id": "compare", "operation_id": "strain.gpa_compare", "parameters": parameters},
+        ],
+    }
+    parent = call(h, "submit_analysis", plan=plan, asynchronous=False)
+    assert parent["status"] == "needs_input"
+    (request,) = parent["input_requests"]
+    (field,) = request["fields"]
+    assert (field["name"], field["parameter_group"]) == ("reference_region", "candidate_config")
+    mask = h.store.load_array(field["evidence"]["quality_mask_artifact_id"])
+    assert mask[0:4, 0:4].sum() == 0
+    assert mask[16:48, 16:48].all()
+    assert h.store.role(parent["run_id"], "gpa_comparison") is None
+    invalid = answer_plan(plan, request, reference_region={"value": [0, 4, 0, 4], "unit": "pixel"})
+    with pytest.raises(HarnessError, match="0 valid phase pixels"):
+        h.validate_plan(invalid)
+
+    reply = answer_plan(
+        plan, request, reference_region={"value": good["reference_region"], "unit": "pixel"}
+    )
+    final = call(
+        h,
+        "submit_analysis",
+        plan=reply,
+        parent_run_id=parent["run_id"],
+        idempotency_key="clean-candidate-reference",
+        asynchronous=False,
+    )
+    assert final["status"] == "completed"
+    reports = call(h, "export_report", run_id=final["run_id"], formats=["json", "html"])
+    files = {a["role"]: Path(a["path"]) for a in reports["artifacts"]}
+    manifest = json.loads(files["report_manifest"].read_bytes())
+    claim = next(c for c in manifest["claim_evidence"] if c["step_id"] == "compare")
+    (artifact_id,) = claim["artifacts_by_role"]["gpa_comparison"]
+    comparison = call(h, "read_artifact", artifact_id=artifact_id)["value"]
+    assert comparison["quality"]["intersection_fraction"] == 0
+    assert comparison["diagnosis"]["configs_aligned"] is None
+    reason = comparison["diagnosis"]["reason"]
+    assert reason in claim["warnings"]
+    assert reason in files["report_html"].read_text("utf-8")
+    assert h.get_run_status(parent["run_id"])["status"] == "needs_input"
+
+
 def test_numbered_atom_replies_verify_indices_geometry_and_evidence(tmp_path):
     h = Harness(tmp_path / "h")
     yy, xx = np.mgrid[:72, :80]

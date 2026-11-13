@@ -1,9 +1,16 @@
+import html
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 
-from autotem.core import DiffractionResult, GVector, Measurement
+from autotem.acceptance.cases import write_fixture
+from autotem.core import AnalysisReport, DiffractionPeak, DiffractionResult, GVector, Measurement
+from autotem.reporting import export_html_report, export_json_bundle
 from autotem.strain import run_gpa
 from autotem.strain.gpa import (
+    InsufficientGPAReference,
     _diffraction_g_vector_unit_for_gpa,
     _displacement_from_phases,
     _strain_from_displacement,
@@ -123,6 +130,69 @@ def test_gpa_alignment_diagnostic_detects_parameter_drift() -> None:
 
     assert parameter["diagnosis"]["configs_aligned"] is False
     assert parameter["diagnosis"]["max_strain_mae_percent"] > 0.1
+
+
+def test_gpa_alignment_requires_joint_samples_and_usable_reference(tmp_path):
+    path, _ = write_fixture("J03", tmp_path)
+    image = np.load(path, allow_pickle=False)
+    settings = dict(g_vectors=((0.125, 0), (0, 0.125)), hann_window=True, apply_quality_mask=True)
+    good = GPAAlignmentConfig(**settings, reference_region=(16, 48, 16, 48))
+    bad = GPAAlignmentConfig(**settings, reference_region=(0, 4, 0, 4))
+    for first, second, group in (
+        (bad, good, "reference_config"), (good, bad, "candidate_config")
+    ):
+        with pytest.raises(InsufficientGPAReference, match="0 valid phase pixels") as error:
+            compare_gpa_configs(image, first, second)
+        assert error.value.parameter_group == group
+
+    coarse = compare_gpa_configs(image, good, good, sample_step=100)
+    assert coarse["quality"]["intersection_fraction"] == 0
+    assert coarse["quality"]["iou"] is None
+    assert coarse["diagnosis"]["configs_aligned"] is None
+    assert coarse["diagnosis"]["max_strain_mae_percent"] is None
+    assert coarse["diagnosis"]["min_strain_corr"] is None
+    assert coarse["fields"] == {}
+    json.dumps(coarse, allow_nan=False)
+    full = compare_gpa_configs(image, good, good)
+    assert full["quality"]["intersection_fraction"] == 3176 / image.size
+    assert full["diagnosis"]["configs_aligned"] is True
+    assert full["fields"]["exx"]["diff"]["mae"] == 0
+
+
+def test_gpa_peak_fallback_preserves_original_rows(tmp_path):
+    path, _ = write_fixture("J03", tmp_path)
+    diffraction = DiffractionResult(
+        center=(40, 32),
+        peaks=[
+            DiffractionPeak(x=40, y=32, intensity=1000),
+            DiffractionPeak(x=30, y=32, intensity=90),
+            DiffractionPeak(x=40, y=40, intensity=70),
+            DiffractionPeak(x=50, y=32, intensity=98),
+        ],
+    )
+    result = run_gpa(
+        path,
+        diffraction_result=diffraction,
+        reference_region=(16, 48, 16, 48),
+        refine_reference=False,
+    )
+    assert result.provenance["g_vector_source"] == "diffraction_peaks"
+    assert [g.source_peak_index for g in result.g_vectors] == [3, 2]
+    for g in result.g_vectors:
+        peak = diffraction.peaks[g.source_peak_index]
+        assert (g.gx.value, g.gy.value) == ((peak.x - 40) / 80, (peak.y - 32) / 64)
+    report = AnalysisReport(
+        strain=result,
+        diffraction=diffraction,
+        workflow={"steps": [{"name": "run_gpa", "status": "done"}]},
+    )
+    export_json_bundle(report, tmp_path)
+    rows = json.loads((tmp_path / "json" / "strain.json").read_bytes())["g_vectors"]
+    assert [row["source_peak_index"] for row in rows] == [3, 2]
+    page = Path(export_html_report(report, tmp_path).uri)
+    displayed = html.unescape(page.read_text("utf-8"))
+    for index in (3, 2):
+        assert f'"source_peak_index": {index}' in displayed
 
 
 def test_gpa_export_writes_data_and_rgb_tiffs(tmp_path) -> None:
