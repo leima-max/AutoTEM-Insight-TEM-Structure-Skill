@@ -116,6 +116,8 @@ SQLite 的登记记录与对应科学文件需要一起保留。
 解析运行依赖。普通用户安装时使用自带解释器和 `--require-hashes --no-index`。
 发布者签名与再分发许可有独立状态。[构建说明](../tools/release/README.md)
 
+离线复跑 Windows CI 构建时，向 `tools/release/build_windows_ci.ps1` 传 `-OfflineInputs`。该目录根部存放策略指定的 `python.3.12.10.nupkg`，`pools/<构建输入锁的 SHA-256>/` 存放对应锁列出的原始 wheel。锁的摘要取自当前 Git 检出中的文件，目录名使用小写十六进制。标准 Windows CI 从 NuGet 和 PyPI 取得相同的锁定输入。两种方式均重新构建启动器、wheel 和三个发行档，逐一校验解释器及依赖哈希。重建旧版用于升级验证时可再次传入同一 `-OfflineInputs`。
+
 Windows CI 在源码外的空项目调用相同启动器，再由安装后的解释器执行磁盘用例。
 验收驱动保存运行 ID、科学产物、哈希、运行时指纹和逐操作矩阵。另存的
 `first-slice.json` 将安装、运行锁、发行 manifest 和科学证据绑定到同一个构建版本。

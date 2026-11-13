@@ -2,10 +2,12 @@
 param(
     [Parameter(Mandatory)] [string] $Root,
     [Parameter(Mandatory, ParameterSetName = 'Candidates')] [string] $ReleaseId,
-    [Parameter(Mandatory, ParameterSetName = 'Previous')] [switch] $PreparePrevious
+    [Parameter(Mandatory, ParameterSetName = 'Previous')] [switch] $PreparePrevious,
+    [string] $OfflineInputs
 )
 $ErrorActionPreference = 'Stop'
 $Root = [IO.Path]::GetFullPath($Root)
+if ($OfflineInputs) { $OfflineInputs = (Resolve-Path -LiteralPath $OfflineInputs).Path }
 Set-Location (Resolve-Path (Join-Path $PSScriptRoot '../..'))
 $corePolicy = Get-Content 'configs/release/traditional-core-mcp.json' -Raw | ConvertFrom-Json
 $seed = Join-Path $Root $corePolicy.python_nupkg.filename
@@ -25,6 +27,8 @@ if ($PreparePrevious) {
         $stage = 'pinned_historical_wheel_pool'
         if ($old.build_inputs_sha256 -eq (Get-FileHash -LiteralPath $corePolicy.build_inputs_lock).Hash) {
             $pool = Join-Path $Root 'core-pool'
+        } elseif ($OfflineInputs) {
+            $pool = Join-Path $OfflineInputs "pools/$($old.build_inputs_sha256)"
         } else {
             $pool = Join-Path $Root 'previous-pool'
             & $py -I -m pip download --disable-pip-version-check --no-cache-dir --only-binary=:all: --require-hashes --dest $pool -r $lock
@@ -44,7 +48,11 @@ if ($PreparePrevious) {
 if (Test-Path -LiteralPath $Root) { throw "A new CI workspace is required: $Root" }
 $null = New-Item -ItemType Directory -Path $Root
 $null = New-Item -ItemType Directory -Path (Join-Path $Root 'archives')
-Invoke-WebRequest -Uri $corePolicy.python_nupkg.url -OutFile $seed
+if ($OfflineInputs) {
+    Copy-Item -LiteralPath (Join-Path $OfflineInputs $corePolicy.python_nupkg.filename) -Destination $seed
+} else {
+    Invoke-WebRequest -Uri $corePolicy.python_nupkg.url -OutFile $seed
+}
 if ((Get-FileHash -LiteralPath $seed -Algorithm SHA256).Hash -ne $corePolicy.python_nupkg.sha256) {
     throw 'PSF package hash mismatch'
 }
@@ -60,10 +68,14 @@ foreach ($edition in $editions.Keys) {
     $short = $editions[$edition]
     $policy = Get-Content "configs/release/$edition.json" -Raw | ConvertFrom-Json
     if ($policy.python_nupkg.sha256 -ne $corePolicy.python_nupkg.sha256) { throw "Different PSF pin for $edition" }
-    $hash = (Get-FileHash -LiteralPath $policy.build_inputs_lock -Algorithm SHA256).Hash
+    $hash = (Get-FileHash -LiteralPath $policy.build_inputs_lock -Algorithm SHA256).Hash.ToLowerInvariant()
     if (-not $pools.ContainsKey($hash)) {
         $pool = Join-Path $Root "$short-pool"
-        & $py -I -m pip download --disable-pip-version-check --no-cache-dir --only-binary=:all: --require-hashes --dest $pool -r $policy.build_inputs_lock
+        $poolSource = @()
+        if ($OfflineInputs) {
+            $poolSource = @('--no-index', '--find-links', (Resolve-Path -LiteralPath (Join-Path $OfflineInputs "pools/$hash")).Path)
+        }
+        & $py -I -m pip download --disable-pip-version-check --no-cache-dir --only-binary=:all: --require-hashes @poolSource --dest $pool -r $policy.build_inputs_lock
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
         $pools[$hash] = $pool
     }
