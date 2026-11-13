@@ -16,10 +16,37 @@ from autotem.harness import HarnessError
 from autotem.harness.hosts import install_host
 from autotem.harness.runtime_binding import selected_runtime
 from autotem.harness.store import Store
-from autotem.installation import managed
+from autotem.installation import host_entry, managed
 from autotem.installation.release import PROFILE, VerifiedRelease
 
 pytestmark = pytest.mark.smoke
+
+
+@pytest.mark.parametrize("command", ["mcp", "stdio", "inspect"])
+def test_managed_host_transports_resolve_inputs_from_project(tmp_path, monkeypatch, command):
+    project = tmp_path / "selected project"
+    client = tmp_path / "host application"
+    control = project / ".autotem"
+    control.mkdir(parents=True)
+    client.mkdir()
+    for directory, contents in ((project, "project input"), (client, "client input")):
+        (directory / "image.npy").write_text(contents, encoding="utf-8")
+    (client / "client-only.npy").touch()
+    monkeypatch.chdir(client)
+    monkeypatch.setattr(host_entry, "__file__", str(control / "host-entry.py"))
+    monkeypatch.setattr(sys, "argv", ["host-entry.py", command])
+    monkeypatch.setattr(host_entry, "active_python", lambda *_: Path(sys.executable))
+
+    def launch(args, *, cwd=None):
+        base = Path.cwd() if cwd is None else Path(cwd)
+        assert args[-3:] == ["--root", str(control / "runs"), command]
+        expected = "client input" if command == "inspect" else "project input"
+        assert (base / "image.npy").read_text(encoding="utf-8") == expected
+        assert (base / "client-only.npy").exists() == (command == "inspect")
+        return 0
+
+    monkeypatch.setattr(host_entry.subprocess, "call", launch)
+    assert host_entry.main() == 0
 
 
 @pytest.fixture

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import csv
 import hashlib
 import io
@@ -55,6 +56,101 @@ def file_hash(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _array_hash(array: np.ndarray) -> str:
+    """Hash the original dtype's C-order bytes without materializing the entire array."""
+    digest = hashlib.sha256()
+    if array.nbytes:
+        if array.flags.c_contiguous:
+            digest.update(array.reshape(-1).view(np.uint8))
+        else:
+            # Structured element copies can omit their padding. Traverse complete records
+            # as fixed-width bytes so even strided or Fortran inputs preserve those bits.
+            if array.dtype.fields is not None:
+                array = array.view(np.dtype((np.void, array.dtype.itemsize)))
+            elements = max(1, (1024 * 1024) // array.dtype.itemsize)
+            for chunk in np.nditer(
+                array, flags=["buffered", "external_loop"], order="C", buffersize=elements
+            ):
+                digest.update(chunk.tobytes())
+    return digest.hexdigest()
+
+
+def _aligned_records(dtype):
+    """Record aligned struct nodes; the NPY header already stores every offset and size."""
+    if dtype.subdtype is not None:
+        return _aligned_records(dtype.subdtype[0])
+    paths = [()] if dtype.isalignedstruct else []
+    for name in dtype.names or ():
+        paths.extend((name, *p) for p in _aligned_records(dtype.fields[name][0]))
+    return paths
+
+
+def _record_dtype(dtype, description, alignments, path=()):
+    """Restore alignment flags using the exact layout read from the NPY header."""
+    if dtype.subdtype is not None:
+        base, shape = dtype.subdtype
+        if isinstance(description, tuple):  # subarray format in an explicit-offset dtype
+            description = description[0]
+        return np.dtype((_record_dtype(base, description, alignments, path), shape))
+    if dtype.names is None:
+        return dtype
+    descriptions = (
+        description["formats"] if isinstance(description, dict) else [f[1] for f in description]
+    )
+    fields = [dtype.fields[n] for n in dtype.names]
+    formats = [
+        _record_dtype(f[0], d, alignments, (*path, n))
+        for n, f, d in zip(dtype.names, fields, descriptions, strict=True)
+    ]
+    offsets = [f[1] for f in fields]
+    if alignments is not None:
+        aligned = path in alignments
+    elif isinstance(description, dict):
+        aligned = description.get("aligned", False)
+    else:
+        # A legacy nested record could print as a list with implicit alignment. Its
+        # header disambiguates this from a packed record whenever the offsets differ.
+        packed = np.dtype(list(zip(dtype.names, formats, strict=True)))
+        packed_offsets = [packed.fields[n][1] for n in dtype.names]
+        aligned = packed.itemsize != dtype.itemsize or packed_offsets != offsets
+    return np.dtype({
+        "names": dtype.names, "formats": formats, "offsets": offsets, "itemsize": dtype.itemsize,
+        "titles": [f[2] if len(f) > 2 else None for f in fields], "aligned": aligned,
+    })
+
+
+def _verified_npy(path, array, expected, role):
+    """Verify the temp file's header and exact values, returning its complete file hash."""
+    stored = np.load(path, mmap_mode="r", allow_pickle=False)
+    try:
+        fortran = array.flags.f_contiguous and not array.flags.c_contiguous
+        if (
+            stored.shape != array.shape
+            or stored.dtype != array.dtype
+            or (not stored.flags.c_contiguous) != fortran
+            or stored.offset + stored.nbytes != path.stat().st_size
+        ):
+            raise HarnessError("ARRAY_VALIDATION_FAILED", role)
+        if fortran:
+            observed = _array_hash(stored)
+            digest = file_hash(path)
+        else:
+            # One pass over the actual payload feeds both hashes for ordinary C-order files.
+            with path.open("rb") as stream:
+                whole = hashlib.sha256(stream.read(stored.offset))
+                payload = hashlib.sha256()
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    payload.update(block)
+                    whole.update(block)
+            observed, digest = payload.hexdigest(), whole.hexdigest()
+        if observed != expected:
+            raise HarnessError("ARRAY_VALIDATION_FAILED", role)
+        return digest
+    finally:
+        # Release the read-only mapping before Windows replaces or removes the file.
+        del stored
 
 
 def owns_preparation(db, run_id, job_id):
@@ -506,6 +602,17 @@ class Store:
     def _publish(
         self, run_id, step_id, role, kind, suffix, content: bytes, metadata, *, preparing_job=None
     ):
+        with self._stage_artifact(
+            run_id, step_id, role, kind, suffix, metadata, preparing_job=preparing_job
+        ) as (stream, artifact_id):
+            stream.write(content)
+        return self.artifact(artifact_id)
+
+    @contextmanager
+    def _stage_artifact(
+        self, run_id, step_id, role, kind, suffix, metadata, *,
+        preparing_job=None, checksum=None,
+    ):
         self.get_run(run_id)
         if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,120}", role):
             raise HarnessError("INVALID_ARTIFACT_ROLE", role)
@@ -515,12 +622,15 @@ class Store:
         # Roles belong in metadata. Short opaque names keep nested Windows runs usable.
         target = directory / f"{artifact_id}{suffix}"
         temporary = target.with_suffix(target.suffix + ".tmp")
+        published = False
+        stream = temporary.open("xb")
         try:
-            with temporary.open("xb") as stream:
-                stream.write(content)
+            with stream:
+                yield stream, artifact_id
                 stream.flush()
                 os.fsync(stream.fileno())
-            digest = file_hash(temporary)
+            size = temporary.stat().st_size
+            digest = file_hash(temporary) if checksum is None else checksum(temporary)
             with self.connect() as db:
                 if preparing_job is not None:
                     db.execute("BEGIN IMMEDIATE")
@@ -529,6 +639,7 @@ class Store:
                             "PREPARATION_CLOSED", "Initial submission is no longer active"
                         )
                 os.replace(temporary, target)
+                published = True
                 db.execute(
                     "INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?,?,?,1)",
                     (
@@ -539,7 +650,7 @@ class Store:
                         kind,
                         str(target),
                         digest,
-                        len(content),
+                        size,
                         encode(metadata or {}),
                         time.time(),
                     ),
@@ -547,10 +658,9 @@ class Store:
         except BaseException:
             # Unregistered or incomplete files never become evidence.
             temporary.unlink(missing_ok=True)
-            target.unlink(missing_ok=True)
+            if published:
+                target.unlink(missing_ok=True)
             raise
-        # Registration has committed. A failed response lookup must leave its file intact.
-        return self.artifact(artifact_id)
 
     def commit_step(self, run_id: str, step_id: str, result: dict):
         with self.connect() as db:
@@ -592,19 +702,22 @@ class Store:
         array = np.asarray(value)
         if array.dtype.hasobject:
             raise HarnessError("UNSAFE_ARRAY", "Object arrays are not supported")
-        stream = io.BytesIO()
-        np.save(stream, array, allow_pickle=False)
-        stored = np.load(io.BytesIO(stream.getvalue()), allow_pickle=False)
-        if stored.shape != array.shape or stored.dtype != array.dtype:
-            raise HarnessError("ARRAY_VALIDATION_FAILED", role)
+        expected = _array_hash(array)
         meta = {
             **(metadata or {}),
             "shape": list(array.shape),
             "dtype": str(array.dtype),
-            "array_sha256": hashlib.sha256(array.tobytes(order="C")).hexdigest(),
+            "array_sha256": expected,
             "preview_is_full_array": False,
         }
-        return self._publish(run_id, step_id, role, "array", ".npy", stream.getvalue(), meta)
+        if array.dtype.names is not None:
+            meta["npy_aligned_records"] = _aligned_records(array.dtype)
+        with self._stage_artifact(
+            run_id, step_id, role, "array", ".npy", meta,
+            checksum=lambda path: _verified_npy(path, array, expected, role),
+        ) as (stream, aid):
+            np.save(stream, array, allow_pickle=False)
+        return self.artifact(aid)
 
     def write_json(self, run_id, step_id, role, value, metadata=None, *, preparing_job=None):
         content = encode(value).encode("utf-8")
@@ -659,7 +772,21 @@ class Store:
             raise HarnessError("ARTIFACT_TYPE_MISMATCH", "Expected an array")
         array = np.load(artifact["path"], allow_pickle=False)
         metadata = artifact["metadata"]
-        if list(array.shape) != metadata["shape"] or str(array.dtype) != metadata["dtype"]:
+        stored_dtype = metadata["dtype"]
+        dtype_matches = str(array.dtype) == stored_dtype
+        flags = metadata.get("npy_aligned_records")
+        if array.dtype.names is not None and (not dtype_matches or flags):
+            try:
+                paths = None if flags is None else {tuple(p) for p in flags}
+                original = _record_dtype(array.dtype, ast.literal_eval(stored_dtype), paths)
+                dtype_matches = original == array.dtype and str(original) == stored_dtype
+                if paths is not None:
+                    dtype_matches = dtype_matches and set(_aligned_records(original)) == paths
+                if dtype_matches:
+                    array = array.view(original)
+            except (SyntaxError, ValueError, TypeError, KeyError, IndexError):
+                dtype_matches = False
+        if list(array.shape) != metadata["shape"] or not dtype_matches:
             raise HarnessError("ARRAY_VALIDATION_FAILED", artifact_id)
         return array
 

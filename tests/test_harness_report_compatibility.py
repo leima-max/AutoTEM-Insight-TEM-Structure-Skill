@@ -287,6 +287,62 @@ def test_legacy_selection_reloads_the_requested_pixels(tmp_path, capsys, kind):
         assert {"IMAGE_MULTIFRAME_TIFF", "IMAGE_RGB_TO_GRAYSCALE"} <= codes
 
 
+@pytest.mark.parametrize("kind", ["rgb", "archive"])
+def test_legacy_atom_report_uses_its_selected_plane(tmp_path, capsys, kind):
+    from autotem.atomic.atom_detection import detect_atoms
+
+    y, x = np.indices((60, 82))
+    other = np.exp(-((y - 52) ** 2 + (x - 72) ** 2) / 4)
+    target = np.exp(-((y - 23) ** 2 + (x - 36) ** 2) / 4)
+    target += np.exp(-((y - 33) ** 2 + (x - 45) ** 2) / 4)
+    other, target = (np.rint(image * 240).astype(np.uint8) for image in (other, target))
+    if kind == "rgb":
+        source = tmp_path / "channels.tif"
+        Image.fromarray(np.stack((other, other, target), axis=-1)).save(source)
+        selection = {"channel": 2}
+    else:
+        source = tmp_path / "survey.npz"
+        np.savez(source, overview=other, scan=np.stack((other, target)))
+        selection = {"dataset_path": "scan", "frame": 1}
+    selection["roi"] = [12, 47, 20, 60]
+    recipe = write_recipe(
+        tmp_path / "atoms.yaml",
+        {
+            "workflow": {
+                "steps": ["load", "detect_atoms", "report"],
+                "parameters": {"load": selection},
+            },
+            "outputs": {"formats": ["json", "csv"], "save_intermediates": kind == "rgb"},
+        },
+    )
+    out = tmp_path / "out"
+    if kind == "rgb":
+        assert (
+            main(["analyze", str(source), "--workflow", str(recipe), "--output", str(out)])
+            == EXIT_OK
+        )
+        capsys.readouterr()
+    else:
+        assert TEMAnalysisSkill().run(source, recipe, out)["execution_status"] == "completed"
+    report = AnalysisReport.model_validate_json((out / "analysis_report.json").read_bytes())
+    plane = target[12:47, 20:60]
+    np.testing.assert_array_equal(np.load(report.dataset.data.uri, allow_pickle=False), plane)
+    expected = detect_atoms(plane)
+    assert len(expected.coordinates) >= 2
+    lattice = report.atom_lattice
+    assert lattice.coordinate_unit == "pixel"
+    assert lattice.provenance["selection"]["roi_origin_yx"] == [12, 20]
+    assert (
+        lattice.provenance["selected_npy_sha256"]
+        == report.dataset.provenance["selected_npy_sha256"]
+    )
+    assert lattice.provenance["detector_provenance"]["input_shape"] == list(plane.shape)
+    np.testing.assert_array_equal([[a.y, a.x] for a in lattice.atoms], expected.coordinates)
+    np.testing.assert_array_equal([a.intensity.value for a in lattice.atoms], expected.intensities)
+    table = next(t for t in report.tables if t.table_type == "atom_coordinates")
+    np.testing.assert_array_equal([[r["y"], r["x"]] for r in table.rows], expected.coordinates)
+
+
 @pytest.mark.parametrize("bare", [False, True], ids=["load-report", "no-yaml"])
 def test_legacy_workflow_asks_for_the_real_frame_before_science(tmp_path, capsys, bare):
     source = tmp_path / "two-pages.tif"

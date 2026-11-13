@@ -47,6 +47,7 @@ class Context:
         self.values = {}
         self.arrays = {}
         self.images = {}
+        self.image_metadata = {}
         self.tables = {}
         self.array_metadata = {}
 
@@ -85,6 +86,7 @@ class Context:
 
     def emit_image(self, role, image, metadata=None):
         self.images[role] = image
+        self.image_metadata[role] = metadata
         return role
 
     def accept(self, result):
@@ -215,6 +217,74 @@ def test_detection_and_raw_refinement_match_direct_api(context):
     for role in ("atom_candidates_overlay", "refined_atoms_overlay"):
         with Image.open(context.images[role]) as overlay:
             overlay.verify()
+
+
+def test_registered_refinement_overlay_distinguishes_retained_positions(tmp_path, monkeypatch):
+    from PIL import Image, ImageDraw
+
+    ctx = Context(tmp_path)
+    raw = np.zeros((42, 56), dtype=np.uint16)
+    raw[10, 15], raw[28, 45] = 100, 80
+    coords = [(1, 40), (10, 15), (26, 14), (28, 43)]
+    expected = ["out_of_bounds", "accepted", "fit_failed", "max_shift_rejected"]
+    ctx.arrays["raw"] = raw
+    ctx.values["atoms"] = AtomLattice(
+        atoms=[AtomSite(y=y, x=x) for y, x in coords], coordinate_unit="pixel"
+    )
+    ctx.values["atomic_intensity"] = {"trusted_atom_mask": [True, False, True, True]}
+    labels = []
+    write_text = ImageDraw.ImageDraw.text
+
+    def record_text(draw, xy, text, *args, **kwargs):
+        labels.append(text)
+        return write_text(draw, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", record_text)
+    result = OPERATIONS["atomic.refine"].handler(ctx, {"method": "com"})
+    assert result.outputs["atomic_refinement"]["provenance"]["point_status"] == expected
+    role = result.outputs["refined_atoms"].provenance["overlay_artifact_id"]
+    meta = ctx.image_metadata[role]
+    assert meta["refinement_counts"] == {"total": 4, "accepted": 1, "retained": 3}
+    assert meta["refinement_status_source"] == "atomic_refinement.provenance.point_status"
+    assert labels[-3:] == [
+        "Raw-image refinement (4 total)",
+        "Accepted refinement (1)",
+        "Input position retained (3)",
+    ]
+    with Image.open(ctx.images[role]) as img:
+        scale = meta["display_scale"]
+        for (y, x), state in zip(coords, expected, strict=True):
+            x, y = x * scale, y * scale
+            if state == "accepted":
+                assert img.getpixel((x, y)) == (255, 255, 255)  # center visible in the ring
+                assert img.getpixel((x, y - 3)) == (86, 180, 233)
+            else:
+                assert img.getpixel((x, y)) == img.getpixel((x - 2, y - 2)) == (255, 191, 71)
+                assert img.getpixel((x, y - 3)) != (255, 191, 71)
+        footer = np.asarray(img)[raw.shape[0] * scale :]
+        assert (footer == [86, 180, 233]).all(axis=-1).any()
+        assert (footer == [255, 191, 71]).all(axis=-1).any()
+        assert (footer[:, 26:] == 255).all(axis=-1).any()  # visible legend text
+
+
+@pytest.mark.parametrize("statuses", [None, [], ["accepted", "fit_failed"], ["unknown_status"]])
+def test_refinement_overlay_without_aligned_states_preserves_legacy_image(tmp_path, statuses):
+    from PIL import Image
+
+    from autotem.services.atomic_overlay import save_refinement_overlay
+
+    path = tmp_path / "legacy.png"
+    raw = np.zeros((16, 24))
+    display = save_refinement_overlay(raw, np.array([[4.0, 8.0]]), path, statuses)
+    assert display == {"display_scale": 4, "labels_shown": 1}
+    with Image.open(path) as img:
+        assert img.size == (96, 64)
+        assert img.getpixel((32, 14)) == (40, 255, 100)
+
+    display = save_refinement_overlay(raw, np.empty((0, 2)), path, [])
+    assert display == {"display_scale": 4, "labels_shown": 0}
+    with Image.open(path) as img:
+        assert img.size == (96, 64) and img.getbbox() is None
 
 
 def test_distance_units_convert_actual_numbers_and_keep_pixel_coordinates(context):

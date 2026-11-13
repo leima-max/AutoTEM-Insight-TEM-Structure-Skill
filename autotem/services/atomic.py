@@ -416,23 +416,12 @@ def refine(ctx: OperationContext, params: dict) -> ServiceResult:
     payload = save_dataclass(
         ctx, "atomic_refinement", result, metadata={"unit": "pixel", "image_role": "raw"}
     )
-    from PIL import Image, ImageDraw
+    from autotem.services.atomic_overlay import save_refinement_overlay
 
-    low, high = np.percentile(raw, [1, 99])
-    pixels = np.uint8(np.clip((raw - low) / max(float(high - low), 1e-12), 0, 1) * 255)
-    scale = max(1, min(4, 800 // max(raw.shape)))
-    canvas = Image.fromarray(pixels).convert("RGB")
-    canvas = canvas.resize((raw.shape[1] * scale, raw.shape[0] * scale), Image.Resampling.NEAREST)
-    draw = ImageDraw.Draw(canvas)
-    for i, (y, x) in enumerate(result.coordinates_refined):
-        x_display, y_display = float(x) * scale, float(y) * scale
-        draw.ellipse(
-            (x_display - 2, y_display - 2, x_display + 2, y_display + 2), outline=(40, 255, 100)
-        )
-        if i < 200:
-            draw.text((x_display + 3, y_display + 3), str(i), fill=(255, 120, 40))
     overlay_path = ctx.output_dir / "raw-refined-atoms.png"
-    canvas.save(overlay_path)
+    display = save_refinement_overlay(
+        raw, result.coordinates_refined, overlay_path, result.provenance.get("point_status")
+    )
     refined = updated_lattice(lattice, result.coordinates_refined, result, "raw_refinement")
     refined.overlay = None
     refined.provenance["overlay_artifact_id"] = ctx.emit_image(
@@ -441,8 +430,7 @@ def refine(ctx: OperationContext, params: dict) -> ServiceResult:
         metadata={
             "image_role": "raw",
             "coordinates_sha256": refined.provenance["coordinates_sha256"],
-            "display_scale": scale,
-            "labels_shown": min(len(coords), 200),
+            **display,
             "display_only": True,
         },
     )

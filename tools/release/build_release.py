@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import ensurepip
 import hashlib
 import json
@@ -79,7 +80,12 @@ def check_resource_mirror(hashes: dict) -> None:
 
 def snapshot(root: Path, destination: Path) -> dict:
     """Capture all current build inputs, including uncommitted/untracked package sources."""
-    head = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"], cwd=root)
+    head = subprocess.check_output(
+        ["git", "rev-parse", "--verify", "HEAD"], cwd=root, encoding="ascii"
+    ).strip()
+    committed = set(subprocess.check_output(
+        ["git", "ls-tree", "-r", "-z", "--name-only", head, "--", *SOURCE_PATHS], cwd=root,
+    ).decode("utf-8").split("\0")) - {""}
     names = subprocess.check_output(
         ["git", "ls-files", "-z", "-co", "--exclude-standard", "--", *SOURCE_PATHS], cwd=root,
     ).decode("utf-8").split("\0")
@@ -92,14 +98,21 @@ def snapshot(root: Path, destination: Path) -> dict:
                 raise ValueError("Case-insensitive duplicate in source")
             seen.add(name.casefold())
             source = root / name
-            if not source.exists():  # A deletion in the working tree belongs in the snapshot.
+            if not source.exists():
                 continue
             plain_path(source)
+            if source.is_dir():  # A tracked file can become a directory in the working tree.
+                continue
             data = source.read_bytes()
             hashes[name] = hashlib.sha256(data).hexdigest()
             _member(archive, name, data)
         check_resource_mirror(hashes)
-        index = {"schema_version": SCHEMA, "git_commit": head.decode().strip(), "files": hashes}
+        index = {"schema_version": SCHEMA, "git_commit": head, "files": hashes}
+        # The support checkout also supplies files outside the archive. Only these
+        # absent build inputs must disappear when overlaying the archived tree.
+        deleted = sorted(committed - hashes.keys())
+        if deleted:
+            index["deleted_from_commit"] = deleted
         _member(archive, SNAPSHOT_INDEX, json.dumps(index, sort_keys=True).encode("ascii"))
     return index
 
@@ -184,21 +197,81 @@ def collect_wheels(
     return directory
 
 
+# Source headers were checked at these exact upstream paths. Do not scan every .py
+# or treat its contents as a distribution-wide license declaration.
+EMBEDDED_NOTICE_PATHS = {"ply": {"ply/lex.py", "ply/yacc.py"}}
+NOTICE_PREFIX_BYTES = 8192
+
+
+def _redistribution_notice(wheel: zipfile.ZipFile, info: zipfile.ZipInfo, package: str) -> bool:
+    filename = info.filename.rsplit("/", 1)[-1].lower()
+    stem, dot, extension = filename.rpartition(".")
+    if not dot:
+        stem, extension = filename, ""
+    embedded = info.filename in EMBEDDED_NOTICE_PATHS.get(package, ())
+    if not embedded and not (
+        extension in {"", "txt", "md", "rst"}
+        and (stem == "readme" or re.search(r"[-_.](?:licen[cs]e|copying|notice)$", stem))
+    ):
+        return False
+    with wheel.open(info) as stream:
+        prefix = stream.read(NOTICE_PREFIX_BYTES)
+    if b"\x00" in prefix:
+        return False
+    try:
+        # A bounded sample can end inside a valid code point. At the actual EOF an
+        # incomplete sequence, like an invalid byte anywhere in the sample, is an error.
+        decoder = codecs.getincrementaldecoder("utf-8-sig")()
+        lines = decoder.decode(prefix, final=len(prefix) == info.file_size).splitlines()
+    except UnicodeDecodeError:
+        return False
+    if embedded:
+        # Ignore examples, comments after executable code, and strings inside the module.
+        header = []
+        for line in lines:
+            if line.strip() and not line.startswith("#"):
+                break
+            header.append(line.lstrip("#"))
+        lines = header
+    text = " ".join(" ".join(lines).lower().split())
+    return "copyright" in text and any(
+        clause in text for clause in (
+            "redistribution and use in source and binary forms",
+            "permission is hereby granted",
+            "permission to use, copy, modify, and distribute",
+            "may be used, copied, and distributed",
+        )
+    )
+
+
 def license_record(path: Path, name: str, version: str) -> dict:
     with zipfile.ZipFile(path) as wheel:
         meta, = [p for p in wheel.namelist() if re.fullmatch(r"[^/]+\.dist-info/METADATA", p)]
         metadata = BytesParser().parsebytes(wheel.read(meta), headersonly=True)
+        dist_info = meta.rsplit("/", 1)[0]
+        declared_paths = set()
+        for header in metadata.get_all("License-File", []):
+            relative = portable_path(str(header).strip())
+            # PEP 639 places files under licenses/. Older builders used .dist-info
+            # directly. Other archive members sharing the name need their own evidence.
+            declared_paths.update((f"{dist_info}/licenses/{relative}", f"{dist_info}/{relative}"))
         texts = []
         for info in wheel.infolist():
             parts = info.filename.split("/")
             if info.is_dir() or not (
                 (parts[0].endswith(".dist-info") and "licenses" in parts[1:-1])
                 or re.match(r"^(?:licen[cs]e|copying|notice)(?:\b|[-_.])", parts[-1], re.I)
+                or info.filename in declared_paths
+                or _redistribution_notice(wheel, info, name)
             ):
                 continue
+            digest = hashlib.sha256()
+            with wheel.open(info) as stream:
+                for chunk in iter(lambda: stream.read(65536), b""):
+                    digest.update(chunk)
             texts.append({
                 "wheel_member": info.filename,
-                "sha256": hashlib.sha256(wheel.read(info)).hexdigest(),
+                "sha256": digest.hexdigest(),
             })
         declared = metadata.get("License-Expression") or metadata.get("License")
         classifiers = [

@@ -242,10 +242,10 @@ def _estimate_contamination_risk(image: np.ndarray) -> float:
     return _clip01(0.7 * spike + 0.3 * min(1.0, bright_fraction * 400.0))
 
 
-def _estimate_astigmatism_risk(image: np.ndarray) -> float:
-    fft_mag = np.log1p(np.abs(np.fft.fftshift(np.fft.fft2(image))))
-    threshold = float(np.quantile(fft_mag, 0.985))
-    mask = fft_mag >= threshold
+def _estimate_astigmatism_risk(fft_magnitude: np.ndarray) -> float:
+    log_magnitude = np.log1p(fft_magnitude)
+    threshold = float(np.quantile(log_magnitude, 0.985))
+    mask = log_magnitude >= threshold
     ys, xs = np.where(mask)
     if len(xs) < 16:
         return 0.5
@@ -259,8 +259,7 @@ def _estimate_astigmatism_risk(image: np.ndarray) -> float:
     return _clip01(anisotropy / 2.5)
 
 
-def _estimate_high_freq_ratio(image: np.ndarray) -> float:
-    fft_mag = np.abs(np.fft.fftshift(np.fft.fft2(image)))
+def _estimate_high_freq_ratio(fft_mag: np.ndarray) -> float:
     h, w = fft_mag.shape
     yy, xx = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
     cy = (h - 1) / 2.0
@@ -450,7 +449,9 @@ def assess_image_quality(
     drift_px = _estimate_drift_px(arr)
     blur_risk = _estimate_blur_risk(arr)
     contamination_risk = _estimate_contamination_risk(arr)
-    astigmatism_risk = _estimate_astigmatism_risk(arr)
+    fft_magnitude = np.abs(np.fft.fftshift(np.fft.fft2(arr)))
+    astigmatism_risk = _estimate_astigmatism_risk(fft_magnitude)
+    hf_ratio = _estimate_high_freq_ratio(fft_magnitude)
 
     pixel_size_nm = None
     if dataset.pixel_size is not None:
@@ -459,7 +460,6 @@ def assess_image_quality(
     if pixel_size_nm is None and isinstance(metadata, dict):
         pixel_size_nm = _to_float(metadata.get("pixel_size_nm"))
 
-    hf_ratio = _estimate_high_freq_ratio(arr)
     hf_risk = _clip01((hf_ratio - 0.12) / 0.35)
     if pixel_size_nm is None or pixel_size_nm <= 0:
         undersampling_risk = hf_risk

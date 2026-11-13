@@ -55,10 +55,14 @@ class CollectionInventory:
             print(json.dumps(selection, indent=2), file=stream)
 
 
-def checked_sources(checkout, files):
+def checked_sources(checkout, files, deleted=()):
     for name, expected in files.items():
         if hashlib.sha256((checkout / name).read_bytes()).hexdigest() != expected:
             raise ValueError(f"Source differs from archive: {name}")
+    frozen_names = {os.path.normcase(n) for n in files} if deleted else set()
+    for name in deleted:
+        if os.path.normcase(name) not in frozen_names and (checkout / name).is_file():
+            raise ValueError(f"Removed source file is still present: {name}")
     for directory in ("autotem", "tests"):
         extra = [
             p
@@ -105,12 +109,26 @@ def stage_checkout(bundle, source, checkout, support_repo, verifier):
     actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, encoding="ascii")
     if actual.strip() != commit:
         raise ValueError("Detached source checkout does not match the frozen Git commit")
+    deleted = index.get("deleted_from_commit", [])
+    if deleted:
+        tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=checkout)
+        if not set(deleted) <= set(tracked.decode("utf-8").split("\0")):
+            raise ValueError("Removed source file is absent from the support commit")
+        parents = set()
+        for name in deleted:
+            path = checkout / name
+            verifier.plain_path(path)
+            path.unlink()
+            parents.update(p for p in path.parents if p != checkout and p.is_relative_to(checkout))
+        for parent in sorted(parents, key=lambda p: len(p.parts), reverse=True):
+            if not any(parent.iterdir()):
+                parent.rmdir()
     with zipfile.ZipFile(archive) as z:
         for name in index["files"]:
             path = checkout / verifier.portable_path(name)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(z.read(name))
-    checked_sources(checkout, index["files"])
+    checked_sources(checkout, index["files"], deleted)
     return index
 
 
@@ -174,7 +192,7 @@ def run(
             stdout=log,
             stderr=subprocess.STDOUT,
         )
-    count = checked_sources(checkout, index["files"])
+    count = checked_sources(checkout, index["files"], index.get("deleted_from_commit", []))
     selection = json.loads(inventory.read_bytes())
     cases = ET.parse(junit).getroot().findall(".//testcase")
     totals = Counter()

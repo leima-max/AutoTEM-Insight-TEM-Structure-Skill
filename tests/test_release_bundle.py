@@ -28,6 +28,118 @@ def wheel(directory, name, *, requirement="", body=b"# source\n"):
     return path
 
 
+def test_declared_license_paths_use_distribution_root_and_legacy_layout(tmp_path):
+    metadata = (
+        "Metadata-Version: 2.4\nLicense-Expression: MIT\nClassifier: License :: Example\n"
+        "License-File: people/AUTHORS\nLicense-File: AUTHORS.rst\n"
+        "License-File: MISSING\nLicense-File: people/AUTHORS\n"
+    )
+    path = wheel(tmp_path, "example", requirement=metadata)
+    files = {
+        "example-1.0.dist-info/licenses/people/AUTHORS": b"Named contributor\r\n",
+        "example-1.0.dist-info/AUTHORS.rst": b"Legacy attribution\n",
+        "example-1.0.dist-info/licenses/NOTICE": b"A notice",
+        "vendor/COPYING.txt": b"An existing notice",
+    }
+    with zipfile.ZipFile(path, "a") as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+        archive.writestr("example/people/AUTHORS", b"Unrelated users with the same basename")
+        archive.writestr("example-1.0.dist-info/unrelated/AUTHORS", b"Not the declared path")
+        archive.writestr("example/MISSING", b"A different path")
+    assert builder.license_record(path, "example", "1.0") == {
+        "name": "example", "version": "1.0", "wheel": path.name, "declaration": "MIT",
+        "license_classifiers": ["License :: Example"], "review_status": "requires_review",
+        "texts_in_distributed_wheel": [
+            {"wheel_member": name, "sha256": hashlib.sha256(content).hexdigest()}
+            for name, content in files.items()
+        ],
+    }
+
+
+@pytest.mark.parametrize("header", ["../AUTHORS", "/AUTHORS", "C:\\AUTHORS"])
+def test_license_file_must_be_a_relative_wheel_member(tmp_path, header):
+    path = wheel(tmp_path, "example", requirement=f"License-File: {header}\n")
+    with pytest.raises(ValueError, match="path"):
+        builder.license_record(path, "example", "1.0")
+
+
+def test_supplementary_notices_require_bounded_text_evidence(tmp_path, monkeypatch):
+    path = wheel(tmp_path, "example", requirement="License-File: missing/OWNERS\n")
+    clause = b"Copyright Example\r\nRedistribution and use in source and binary forms"
+    padded = clause.ljust(builder.NOTICE_PREFIX_BYTES - 1, b" ")
+    accepted = {
+        "library/array/NUMPY_LICENSE.txt": clause,
+        "library/Scintilla-License.txt": b"Copyright N\nPermission to use, copy, modify, "
+        b"and distribute the software",
+        "library/MAPIStubLibrary-License.txt": b"Copyright Example\nPermission is hereby granted",
+        "library/fonts/readme.txt": b"These metrics may be used, copied, \r\nand distributed "
+        b"provided that all copyright notices are retained.",
+        "library/unicode/readme.md": padded + "界".encode(),
+    }
+    with zipfile.ZipFile(path, "a") as archive:
+        for name, content in accepted.items():
+            archive.writestr(name, content)
+        archive.writestr("docs/README.md", b"Copyright Example. See the license for reuse.")
+        archive.writestr("docs/USAGE.txt", clause)
+        archive.writestr("docs/README.rst", b"x" * builder.NOTICE_PREFIX_BYTES + clause)
+        archive.writestr("docs/sample-license.txt", b"\0" + clause)
+        archive.writestr("docs/invalid-license.txt", clause + b"\xff" + padded)
+        archive.writestr("docs/incomplete-license.txt", padded + b"\xe7")
+        archive.writestr("docs/title-notice.txt", b"The Copyright Act is of interest.")
+        archive.writestr("library/binary.dll", clause)
+        archive.writestr("library/version.py", b"# " + clause)
+    reads = []
+    read = zipfile.ZipExtFile.read
+
+    def record_read(stream, size=-1):
+        reads.append((stream.name, size))
+        return read(stream, size)
+
+    monkeypatch.setattr(zipfile.ZipExtFile, "read", record_read)
+    result = builder.license_record(path, "example", "1.0")
+    assert result["declaration"] is None and result["review_status"] == "requires_review"
+    assert result["texts_in_distributed_wheel"] == [
+        {"wheel_member": k, "sha256": hashlib.sha256(v).hexdigest()} for k, v in accepted.items()
+    ]
+    assert not any(n in {"library/binary.dll", "library/version.py"} for n, _ in reads)
+    assert [size for n, size in reads if n == "docs/README.rst"] == [builder.NOTICE_PREFIX_BYTES]
+
+
+def test_ply_embedded_evidence_preserves_entire_member_hash_without_declaring_license(tmp_path):
+    path = wheel(tmp_path, "ply")
+    grant = (
+        b"# Copyright (C) Example\r\n# Redistribution and use in source and binary forms\r\n"
+        b"# are permitted under the following conditions.\r\n"
+    )
+    body = b"answer = 42\n" * 10000
+    expected = {"ply/lex.py": grant + body, "ply/yacc.py": grant + b"from . import lex\n"}
+    with zipfile.ZipFile(path, "a") as archive:
+        for name, content in expected.items():
+            archive.writestr(name, content)
+        archive.writestr("ply/other.py", grant + body)
+    row = builder.license_record(path, "ply", "1.0")
+    assert row["texts_in_distributed_wheel"] == [
+        {"wheel_member": k, "sha256": hashlib.sha256(v).hexdigest()} for k, v in expected.items()
+    ]
+    assert row["review_status"] == "requires_review"
+    assert row["declaration"] is None and row["license_classifiers"] == []
+    assert builder.license_record(path, "other", "1.0")["texts_in_distributed_wheel"] == []
+
+
+def test_ply_ordinary_source_and_missing_project_license_stay_missing(tmp_path):
+    path = wheel(tmp_path, "ply", requirement="License-File: absent/OWNERS\n")
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr(
+            "ply/lex.py", b"print('example')\n# Copyright; Permission is hereby granted"
+        )
+        archive.writestr("ply/yacc.py", b"# Copyright the project authors\npass\n")
+    for name in ("ply", release.APP):
+        row = builder.license_record(path, name, "1.0")
+        assert row["texts_in_distributed_wheel"] == [] and row["declaration"] is None
+        assert row["review_status"] == "missing"
+
+
 @pytest.fixture
 def miniature(tmp_path, monkeypatch, request):
     # Build a tiny local release to exercise the schema. Pip resolution is tested on Windows CI.

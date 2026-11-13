@@ -9,7 +9,7 @@ import zipfile
 import pytest
 
 from autotem.installation import release
-from tools.release import qualify_release, run_source_tests
+from tools.release import build_release, qualify_release, run_source_tests
 from tools.release import source_test_environment as env
 
 
@@ -35,6 +35,75 @@ def git(root, *args, input_text=None, check=True):
         encoding="utf-8",
         check=check,
     )
+
+
+def test_replay_uses_frozen_removals_and_preserves_git_support_files(tmp_path):
+    repo = tmp_path / "源 worktree"
+    repo.mkdir()
+    git(repo, "init", "--quiet")
+    initial = {
+        "skills/autotem/SKILL.md": b"fixture\n",
+        "autotem/harness/resources/skill/SKILL.md": b"fixture\n",
+        "autotem/__init__.py": b"# fixture\n",
+        "tests/test_retired.py": b"def test_retired(): pass\n",
+        "configs/harness/obsolete.json": b"{}\n",
+        "configs/harness/catalog/nested/entry.txt": b"previous\n",
+        "configs/harness/single": b"previous\n",
+        "support.txt": b"from the support commit\n",
+    }
+    for name, content in initial.items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    git(repo, "-c", "core.autocrlf=false", "add", ".")
+    git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "-c", "commit.gpgSign=false", "commit", "-qm", "frozen support")
+    removed = [
+        "tests/test_retired.py", "configs/harness/obsolete.json",
+        "configs/harness/catalog/nested/entry.txt", "configs/harness/single",
+    ]
+    git(repo, "rm", "--quiet", "--", removed[1])
+    for name in (removed[0], *removed[2:]):
+        (repo / name).unlink()
+    (repo / "configs/harness/catalog/nested").rmdir()
+    (repo / "configs/harness/catalog").rmdir()
+    (repo / "configs/harness/catalog").write_bytes(b"flat catalog\n")
+    (repo / "configs/harness/single").mkdir()
+    (repo / "configs/harness/single/child.txt").write_bytes(b"child\n")
+    (repo / "tests/test_new.py").write_bytes(b"def test_new(): pass\n")
+    (repo / "support.txt").write_bytes(b"uncommitted support\n")
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    frozen = bundle / "source.zip"
+    index = build_release.snapshot(repo, frozen)
+    assert index["deleted_from_commit"] == sorted(removed)
+    source = {
+        "git_commit": index["git_commit"], "archive": frozen.name,
+        "archive_sha256": release.sha256(frozen), "inventory_member": build_release.SNAPSHOT_INDEX,
+        "file_count": len(index["files"]),
+    }
+    checkout = tmp_path / "checkout"
+    assert run_source_tests.stage_checkout(bundle, source, checkout, repo, release) == index
+    assert (checkout / "support.txt").read_text(encoding="utf-8") == "from the support commit\n"
+    for name in removed:
+        assert not (checkout / name).is_file()
+    for name in index["files"]:
+        assert (checkout / name).read_bytes() == (repo / name).read_bytes()
+    restored = checkout / removed[1]
+    restored.write_bytes(b"stale\n")
+    with pytest.raises(ValueError, match="Removed source file is still present"):
+        run_source_tests.checked_sources(checkout, index["files"], index["deleted_from_commit"])
+
+
+@pytest.mark.parametrize("deleted", ["bad", ["../invalid"], [".git/config"], ["kept"], ["x", "x"]])
+def test_removals_are_unique_relative_files_outside_archive(tmp_path, deleted):
+    path = tmp_path / "snapshot.zip"
+    index = {"schema_version": release.SCHEMA, "git_commit": "a" * 40,
+             "files": {"kept": hashlib.sha256(b"keep").hexdigest()}, "deleted_from_commit": deleted}
+    archive(path, {"index.json": json.dumps(index), "kept": b"keep"})
+    with zipfile.ZipFile(path) as frozen, pytest.raises(ValueError):
+        release.verify_snapshot(frozen, "index.json")
 
 
 @pytest.mark.parametrize("shallow", [False, True])

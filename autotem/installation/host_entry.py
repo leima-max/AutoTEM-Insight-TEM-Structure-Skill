@@ -74,7 +74,9 @@ def main():
                 "--root",
                 str(control / "runs"),
                 *sys.argv[1:],
-            ]
+            ],
+            # Host clients choose their own launch directory. Tool requests address this project.
+            cwd=control.parent if sys.argv[1] in {"mcp", "stdio"} else None,
         )
     except (OSError, ValueError, TypeError, AttributeError) as exc:
         print(f"AutoTEM host setup required: {exc}", file=sys.stderr)

@@ -58,7 +58,7 @@ See the [release plan](../../docs/HARNESS_RELEASE_TECHNICAL_DEVELOPMENT_PLAN.md)
 
 ### Frozen Windows source regression
 
-Use the issued PSF CPython 3.12.10 and matching core and simulation bundles. Supply three new, short paths on the test runner. From the local Git worktree the runner fetches the exact support commit recorded in the source ZIP with a depth of one. This provides files such as the tested Streamlit app. The runner verifies the detached commit, overlays the archived source files before testing and checks their bytes again after pytest.
+Use the issued PSF CPython 3.12.10 and matching core and simulation bundles. Supply three new, short paths on the test runner. From the local Git worktree the runner fetches the exact support commit recorded in the source ZIP with a depth of one. The support commit supplies files outside the archive. The runner verifies the detached commit, removes tracked build inputs listed in the archive's optional `deleted_from_commit` field, and overlays the archived files. It checks their hashes and the recorded deletions again after pytest. A clean snapshot and historical archives with no recorded deletions use the existing inventory format.
 
 ```powershell
 & $TargetPython -I -B "$VerifierRoot/tools/release/run_source_tests.py" `

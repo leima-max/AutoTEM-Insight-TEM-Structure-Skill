@@ -1028,8 +1028,16 @@ class TEMAnalysisSkill:
                         if isinstance(expected_outputs, list):
                             step_record.outputs = [str(item) for item in expected_outputs]
                         try:
+                            plane_hash = (
+                                dataset.provenance.get("selected_npy_sha256") if dataset else None
+                            )
+                            detector_input = input_path
+                            if plane_hash:
+                                import numpy as np
+
+                                detector_input = np.load(dataset.data.uri, allow_pickle=False)
                             detection_result = detect_atoms(
-                                input_path,
+                                detector_input,
                                 **dict(atom_detection_options or {}),
                             )
                             atom_lattice = detection_result.to_atom_lattice(
@@ -1037,6 +1045,9 @@ class TEMAnalysisSkill:
                                     (atom_detection_options or {}).get("coordinate_unit", "pixel")
                                 )
                             )
+                            if plane_hash:
+                                atom_lattice.provenance["selected_npy_sha256"] = plane_hash
+                                atom_lattice.provenance["selection"] = dataset.metadata["selection"]
                             step_record.status = "warning" if detection_result.warnings else "done"
                             step_record.warnings.extend(list(detection_result.warnings))
                             step_record.outputs.extend(["AtomLattice", "atom_coordinates.csv"])

@@ -202,6 +202,15 @@ def verify_snapshot(archive: zipfile.ZipFile, index_name: str) -> dict:
     index = unique_json(archive.read(index_name))
     if index["schema_version"] != SCHEMA or set(members) != {*index["files"], index_name}:
         raise ValueError("Source archive differs from its inventory")
+    deleted = index.get("deleted_from_commit", [])
+    if not isinstance(deleted, list):
+        raise ValueError("Invalid list of removed source files")
+    removed = set()
+    for name in deleted:
+        portable_path(name)
+        if name in removed or name in members or ".git" in name.casefold().split("/"):
+            raise ValueError(f"Invalid removed source file: {name}")
+        removed.add(name)
     for name, digest in index["files"].items():
         portable_path(name)
         if hashlib.sha256(archive.read(name)).hexdigest() != digest:
