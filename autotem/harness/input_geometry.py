@@ -134,6 +134,18 @@ def check_geometry(compiled, record, adopted, parent, store):
     params = target.parameters
     if group := first.get("parameter_group"):
         params = params[group]
+    if "g_peak_indices" in fields:
+        parent_params = next(
+            step["parameters"]
+            for step in parent["request"]["steps"]
+            if step["id"] == record["step_id"]
+        )
+        if group:
+            parent_params = parent_params[group]
+        if params.get("image_role", "raw") != parent_params.get("image_role", "raw"):
+            raise invalid(
+                "Choose numbered peaks from the same image role as the displayed FFT", "image_role"
+            )
     if table_id:
         _validate_numbered_atoms(params, table_id, store, target.operation_id)
     if target.operation_id.startswith("strain.gpa"):

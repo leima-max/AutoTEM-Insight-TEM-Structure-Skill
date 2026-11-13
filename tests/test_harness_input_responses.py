@@ -369,6 +369,7 @@ def test_gpa_questions_use_actual_fft_and_transform_source_roi(tmp_path):
         "selection": {"roi": [8, 72, 16, 96]},
         "steps": [
             {"id": "load", "operation_id": "input.load"},
+            {"id": "prep", "operation_id": "preprocessing.apply"},
             {"id": "strain", "operation_id": "strain.gpa"},
         ],
     }
@@ -393,6 +394,10 @@ def test_gpa_questions_use_actual_fft_and_transform_source_roi(tmp_path):
             )
         )
     by_index = answer_plan(initial, question, g_peak_indices={"value": [0, partner]})
+    changed_image = copy.deepcopy(by_index)
+    changed_image["steps"][-1]["parameters"] = {"image_role": "processed"}
+    with pytest.raises(HarnessError, match="image role"):
+        h.validate_plan(changed_image)
     choice = h.submit_analysis(
         by_index, parent_run_id=state["run_id"], idempotency_key="g-pair", asynchronous=False
     )
@@ -416,6 +421,69 @@ def test_gpa_questions_use_actual_fft_and_transform_source_roi(tmp_path):
     )
     assert final["status"] == "completed", final
     assert h.store.role(final["run_id"], "gpa")
+
+    exported = h.export_report(final["run_id"], ["json", "html"])
+    files = {a["role"]: Path(a["path"]) for a in exported["artifacts"]}
+    manifest = json.loads(files["report_manifest"].read_bytes())
+    peak_answer, roi_answer = manifest["input_response_history"]
+    assert [
+        peak_answer["parent_run_id"],
+        peak_answer["child_run_id"],
+        roi_answer["child_run_id"],
+    ] == [state["run_id"], choice["run_id"], final["run_id"]]
+    assert roi_answer["parent_run_id"] == choice["run_id"]
+    assert peak_answer["request_id"] == question["request_id"]
+    assert peak_answer["source"] == "user" and peak_answer["basis"] == "Acquisition log"
+    assert peak_answer["requested_fields"][0]["evidence"] == field["evidence"]
+    assert peak_answer["answers"]["g_peak_indices"]["value"] == [0, partner]
+    np.testing.assert_allclose(
+        peak_answer["adopted_values"]["g_peak_indices"]["parameters"]["g_vectors"],
+        vectors[[0, partner]],
+    )
+    assert roi_answer["answers"]["reference_region"] == {"value": [24, 56, 32, 72], "unit": "pixel"}
+    assert roi_answer["adopted_values"]["reference_region"]["parameters"]["reference_region"] == [
+        16,
+        48,
+        16,
+        56,
+    ]
+    page = files["report_html"].read_text(encoding="utf-8")
+    assert all(row["request_id"] in page for row in (peak_answer, roi_answer))
+
+
+def test_gpa_preview_uses_the_mask_from_the_same_step(tmp_path):
+    h = Harness(tmp_path / "h")
+    path = tmp_path / "field.npy"
+    np.save(path, np.ones((8, 8)))
+    run = h.submit_analysis(
+        {"input_path": str(path), "steps": [{"id": "load", "operation_id": "input.load"}]},
+        asynchronous=False,
+    )
+    rid = run["run_id"]
+    field = np.array([[0.0, 0.0, 2.0], [3.0, 4.0, 5.0]])
+    valid = np.array([[False, True, True], [False, True, True]])
+    role = "gpa.quality_mask"
+    mask = h.store.write_array(rid, "gpa1", role, valid)
+    h.store.write_array(rid, "gpa2", role, ~valid)
+    stored = h.store.write_array(
+        rid,
+        "gpa1",
+        "gpa.strain_xx",
+        field,
+        {
+            "validity_role": role,
+            "validity_sha256": mask["metadata"]["array_sha256"],
+        },
+    )
+    preview = h.read_artifact(stored["artifact_id"], offset=0, limit=4)
+    assert preview["values"] == [None, 0.0, 2.0, None]
+    assert preview["validity_mask_artifact_id"] == mask["artifact_id"]
+    assert h.read_artifact(stored["artifact_id"], offset=3, limit=10)["values"] == [None, 4.0, 5.0]
+    assert h.read_artifact(mask["artifact_id"])["values"] == valid.ravel().tolist()
+    np.testing.assert_array_equal(h.store.load_array(stored["artifact_id"]), field)
+    Path(mask["path"]).write_bytes(b"damaged")
+    with pytest.raises(HarnessError):
+        h.read_artifact(stored["artifact_id"])
 
 
 def test_numbered_atom_replies_verify_indices_geometry_and_evidence(tmp_path):

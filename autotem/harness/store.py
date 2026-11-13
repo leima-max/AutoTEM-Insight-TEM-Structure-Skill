@@ -531,6 +531,52 @@ class Store:
             decoded.append(values)
         return requests, decoded
 
+    def input_response_history(self, run_id):
+        """Return accepted answers on this run's parent chain, in the order they were given."""
+        history = []
+        visited = set()
+        with self.connect() as db:
+            while run_id:
+                if run_id in visited:
+                    raise HarnessError("INVALID_RUN_HISTORY", "Cycle in report input history")
+                visited.add(run_id)
+                row = db.execute(
+                    "SELECT r.parent_run_id, a.response_id, a.request_id, a.response, "
+                    "a.adopted_values, q.operation_id, q.step_id, q.fields, "
+                    "q.evidence_artifact_ids FROM runs r "
+                    "LEFT JOIN input_responses a ON a.child_run_id=r.run_id "
+                    "AND a.parent_run_id=r.parent_run_id "
+                    "LEFT JOIN input_requests q ON q.request_id=a.request_id "
+                    "AND q.run_id=r.parent_run_id "
+                    "WHERE r.run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    break  # Older runs can reference a parent whose records are unavailable.
+                if row["response_id"] and row["operation_id"]:
+                    reply = json.loads(row["response"])
+                    history.append(
+                        {
+                            "parent_run_id": row["parent_run_id"],
+                            "child_run_id": run_id,
+                            "request_id": row["request_id"],
+                            "response_id": row["response_id"],
+                            "operation_id": row["operation_id"],
+                            "step_id": row["step_id"],
+                            "requested_fields": json.loads(row["fields"]),
+                            "request_evidence_artifact_ids": json.loads(
+                                row["evidence_artifact_ids"]
+                            ),
+                            "source": reply["source"],
+                            "basis": reply["basis"],
+                            "answers": reply["answers"],
+                            "cited_artifact_ids": reply.get("evidence_artifact_ids", []),
+                            "adopted_values": json.loads(row["adopted_values"]),
+                        }
+                    )
+                run_id = row["parent_run_id"]
+        return history[::-1]
+
     @staticmethod
     def record_input_response(
         db, record, response, adopted, child_run_id, validation, *, retry_key=None

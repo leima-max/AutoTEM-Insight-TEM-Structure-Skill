@@ -910,6 +910,36 @@ class Harness:
             result["is_preview"] = True
             if np.iscomplexobj(array):
                 result["values"] = [{"real": float(v.real), "imag": float(v.imag)} for v in flat]
+            if (
+                artifact["metadata"].get("validity_role") == "gpa.quality_mask"
+                and artifact["role"] != "gpa.quality_mask"
+            ):
+                masks = [
+                    a
+                    for a in self.store.artifacts(artifact["run_id"], step_id=artifact["step_id"])
+                    if a["role"] == "gpa.quality_mask"
+                    and a["kind"] == "array"
+                    and a["metadata"].get("array_sha256")
+                    == artifact["metadata"].get("validity_sha256")
+                ]
+                if not masks:
+                    raise HarnessError(
+                        "MISSING_ARTIFACT",
+                        "The GPA field has no matching quality mask in this step",
+                    )
+                mask_id = masks[0]["artifact_id"]
+                valid = self.store.load_array(mask_id)
+                if valid.dtype != np.bool_ or valid.shape != array.shape:
+                    raise HarnessError(
+                        "ARRAY_VALIDATION_FAILED", "GPA field and quality mask do not match"
+                    )
+                result["validity_mask_artifact_id"] = mask_id
+                result["values"] = [
+                    value if ok else None
+                    for value, ok in zip(
+                        result["values"], valid.ravel()[offset : offset + limit], strict=True
+                    )
+                ]
         elif artifact["kind"] == "json":
             if artifact["size"] <= 256_000:
                 result["value"] = self.store.load_json(artifact_id)
@@ -966,6 +996,7 @@ class Harness:
                 and counts["required_complete"] and counts["delivered_steps"])
             else "diagnostic",
             "request": run["request"],
+            "input_response_history": self.store.input_response_history(run_id),
             "artifacts": evidence,
             "scientific_accuracy": "not_evaluated",
             "result_index": latest,

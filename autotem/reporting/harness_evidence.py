@@ -175,4 +175,16 @@ def claim_html(manifest: dict, evidence: list[dict]) -> str:
             + html.escape(json.dumps(claim, ensure_ascii=False, indent=2))
             + "</pre></section>"
         )
+    history = manifest.get("input_response_history", [])
+    if history:
+        parts.append("<section><h2>Scientific input history</h2><ol>")
+        for entry in history:
+            parts.append(
+                f"<li><strong>{html.escape(entry['step_id'])} "
+                f"({html.escape(entry['operation_id'])})</strong>"
+                f"<p>{html.escape(entry['source'])} · {html.escape(entry['basis'])}</p><pre>"
+                + html.escape(json.dumps(entry, ensure_ascii=False, indent=2))
+                + "</pre></li>"
+            )
+        parts.append("</ol></section>")
     return "".join(parts)
