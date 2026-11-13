@@ -214,10 +214,10 @@ def _legacy_atom_options(
     # These file-output and input-reader options belonged to the Python call before
     # YAML mapping was supported. They are not registered scientific parameters.
     api_options = {
-        key: options.pop(key) for key in ("overlay_path", "slice_index") if key in options
+        key: options.pop(key)
+        for key in ("overlay_path", "return_overlay_array", "slice_index")
+        if key in options
     }
-    if "return_overlay_array" in options and options.pop("return_overlay_array") is not False:
-        raise ValueError("return_overlay_array is unimplemented. Use overlay_path to save a PNG.")
     if options.pop("coordinate_unit", "pixel") != "pixel":
         raise ValueError(
             "detect_atoms returns pixel coordinates. Convert them before changing units."
@@ -229,8 +229,6 @@ def _legacy_atom_options(
         raise ValueError(
             "Legacy detect_atoms reads raw. Use a registered workflow for image_role=processed."
         )
-    if effective["threshold_rel"] == 0:
-        raise ValueError("detect_atoms threshold_rel must be in (0, 1].")
     if supplied or overrides:
         for name in supplied:
             del workflow.parameters[name]

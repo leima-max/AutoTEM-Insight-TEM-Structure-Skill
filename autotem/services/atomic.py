@@ -58,7 +58,7 @@ class DetectParameters(CParameters):
     mode: Literal["auto", "log", "dog"] = "auto"
     gaussian_sigma: float | None = Field(default=None, ge=0, le=100)
     min_distance: int = Field(default=4, ge=1, le=10000)
-    threshold_rel: float = Field(default=0.25, ge=0, le=1)
+    threshold_rel: float = Field(default=0.25, gt=0, le=1)
     max_atoms: int = Field(default=5000, ge=1, le=50000)
 
 

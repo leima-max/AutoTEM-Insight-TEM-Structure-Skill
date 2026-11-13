@@ -350,7 +350,7 @@
       "output_roles": [
         "atoms"
       ],
-      "contract_sha256": "7557958bd630c55903c09ede8df6bd4412d29dd71cdc96d6e48d85870aa8726c",
+      "contract_sha256": "e548e6e9e17af984351693bb581fd7d5aab2ed6580c9ba8a10df4d263d401414",
       "role_schemas_sha256": "b8c544484044118153b4c8ec7e8e230bd4193df3709042d1d1fb113287b562fd"
     },
     "atomic.displacement": {
