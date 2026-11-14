@@ -85,6 +85,57 @@ def install_stubs(
     return calls
 
 
+@pytest.mark.parametrize(
+    "observed,code",
+    [
+        ("match", "PROJECT_MCP_REGISTRATION_MATCHES"),
+        ("old-project", "PROJECT_MCP_ROUTE_MISMATCH"),
+        ("old-command", "PROJECT_MCP_ROUTE_MISMATCH"),
+        ("disabled", "PROJECT_MCP_SERVER_DISABLED"),
+        ("missing", "PROJECT_MCP_SERVER_NOT_DISCOVERED"),
+        ("unsupported", "PROCESS_FAILED"),
+        ("invalid", "HOST_REGISTRATION_INVALID"),
+    ],
+)
+def test_doctor_checks_effective_codex_route_in_selected_project(
+    monkeypatch, tmp_path, observed, code
+):
+    project = tmp_path / "项目 with spaces"
+    adapter = project / "autotem-host/codex/adapter.json"
+    adapter.parent.mkdir(parents=True)
+    expected = {"command": "project-python", "args": ["-I", "host-entry.py", "mcp"]}
+    adapter.write_text(json.dumps({"mcp": {"mcpServers": {"autotem": expected}}}), "utf-8")
+    route = {**expected, "cwd": str(project), "type": "stdio", "env": {"PRIVATE": "secret-value"}}
+    if observed == "old-project":
+        route["cwd"] = str(tmp_path)
+    if observed == "old-command":
+        route["args"] = ["old-entry.py"]
+    reply = {"name": "autotem", "transport": route, "enabled": observed != "disabled"}
+    run = readiness._run
+    calls = []
+
+    def lookup(arguments, timeout, *, cwd=None):
+        if arguments[1:] != ["mcp", "get", "autotem", "--json"]:
+            return run(arguments, timeout, cwd=cwd)
+        calls.append(cwd)
+        if observed == "missing":
+            return {"code": "PROCESS_FAILED", "stderr": "No MCP server named 'autotem' found."}
+        if observed == "unsupported":
+            return {"code": "PROCESS_FAILED", "stderr": "unsupported command secret-value"}
+        return {"code": "OK", "stdout": "invalid" if observed == "invalid" else json.dumps(reply)}
+
+    install_stubs(monkeypatch)
+    monkeypatch.setattr(readiness, "_run", lookup)
+    result = readiness.inspect_readiness(project, "codex")
+    assert calls == [project]
+    assert result["host_project_registration"]["code"] == code
+    assert result["ok"] is (observed == "match")
+    assert result["host_mcp_connection"] == result["host_llm_e2e"] == "not_evaluated"
+    assert "secret-value" not in json.dumps(result)
+    if not result["ok"]:
+        assert code in {row["code"] for row in result["next_actions"]}
+
+
 def test_ready_local_probes_do_not_claim_host_permissions_or_analysis(monkeypatch, tmp_path):
     monkeypatch.delenv("PIP_NO_INDEX", raising=False)
     calls = install_stubs(monkeypatch)

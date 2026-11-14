@@ -4,6 +4,8 @@
 
 ## 1. 真实支持与验证边界
 
+安装了项目 Codex MCP 适配器后，可运行其 `readiness_command`。诊断会在所选工程目录内运行 `codex mcp get autotem --json`，比较启用状态、启动命令、参数和工作目录，并在 `host_project_registration` 中返回结果。若返回 `PROJECT_MCP_SERVER_NOT_DISCOVERED`，请在 Codex 中打开该工程，检查项目授信和项目级 MCP 配置，重新加载后复查。登记匹配以后，还需在真实会话中授权工具并调用 `list_capabilities`。
+
 | 宿主 | 交付资源 | 本机只读检查 | 本文未据此确认的能力 |
 |---|---|---|---|
 | Codex CLI / Desktop | 项目 `.agents/skills/autotem`；可选项目 MCP 表；native TOML 模板；顺序 fallback | 外部 CLI `0.143.0` 读取 Skill 后执行被策略拒绝；当前 Desktop 协作 API 的三 Profile 已真实完成合成输入闭环 | `.codex/agents` 模板安装/加载未验收；外部 CLI 分析 E2E 仍被阻断；不推断其他 Codex 客户端 |

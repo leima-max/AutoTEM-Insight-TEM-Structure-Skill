@@ -81,9 +81,9 @@ def _options(timeout: float) -> dict:
     return options
 
 
-def _run(arguments: list[str], timeout: float) -> dict:
+def _run(arguments: list[str], timeout: float, *, cwd: Path | None = None) -> dict:
     try:
-        process = subprocess.run(arguments, **_options(timeout))
+        process = subprocess.run(arguments, cwd=cwd, **_options(timeout))
     except subprocess.TimeoutExpired:
         return {"code": "PROBE_TIMEOUT", "returncode": None}
     except (OSError, ValueError):
@@ -520,6 +520,52 @@ def _host_cli(host: str, timeout: float) -> tuple[dict, str | None]:
     return result, executable
 
 
+def _codex_registration(project: Path, executable: str | None, timeout: float) -> dict:
+    """Compare Codex's effective stdio route with the selected project's installed adapter."""
+    path = project / "autotem-host/codex/adapter.json"
+    try:
+        adapter = json.loads(path.read_bytes())
+        if adapter.get("preferred_transport") == "jsonl" and "mcp" not in adapter:
+            return {"status": "not_applicable", "code": "PROJECT_JSONL_TRANSPORT"}
+        expected = adapter["mcp"]["mcpServers"]["autotem"]
+        if (
+            not isinstance(expected["command"], str)
+            or not expected["command"]
+            or not isinstance(expected["args"], list)
+            or not all(isinstance(arg, str) for arg in expected["args"])
+        ):
+            raise ValueError("Invalid project stdio entry")
+    except FileNotFoundError:
+        return {"status": "not_evaluated", "code": "PROJECT_ADAPTER_NOT_INSTALLED"}
+    except (OSError, ValueError, KeyError, AttributeError, TypeError, RecursionError):
+        return {"status": "blocked", "code": "PROJECT_ADAPTER_UNREADABLE"}
+    if executable is None:
+        return {"status": "not_evaluated", "code": "HOST_CLI_NOT_FOUND"}
+    probe = _run([executable, "mcp", "get", "autotem", "--json"], timeout, cwd=project)
+    if probe["code"] != "OK":
+        code = probe["code"]
+        if code == "PROCESS_FAILED" and "No MCP server named 'autotem' found" in probe["stderr"]:
+            code = "PROJECT_MCP_SERVER_NOT_DISCOVERED"
+        return {"status": "blocked", "code": code}
+    entry = _json_object(probe) or {}
+    route = entry.get("transport")
+    if entry.get("name") != "autotem" or not isinstance(route, dict):
+        return {"status": "blocked", "code": "HOST_REGISTRATION_INVALID"}
+    if entry.get("enabled") is False:
+        return {"status": "blocked", "code": "PROJECT_MCP_SERVER_DISABLED"}
+    if not (
+        entry.get("enabled") is True
+        and route.get("type") == "stdio"
+        and isinstance(route.get("command"), str)
+        and Path(route["command"]) == Path(expected["command"])
+        and route.get("args") == expected["args"]
+        and isinstance(route.get("cwd"), str)
+        and Path(route["cwd"]) == project
+    ):
+        return {"status": "blocked", "code": "PROJECT_MCP_ROUTE_MISMATCH"}
+    return {"status": "ready", "code": "PROJECT_MCP_REGISTRATION_MATCHES"}
+
+
 def _gateway(executable: str | None, timeout: float) -> dict:
     if executable is None:
         return {"status": "not_evaluated", "code": "HOST_CLI_NOT_FOUND"}
@@ -608,6 +654,11 @@ def inspect_readiness(
     python = str(Path(selected).absolute()) if Path(selected).is_file() else shutil.which(selected)
     runtime = _runtime(python, timeout, root)
     host_cli, host_executable = _host_cli(host, timeout)
+    registration = (
+        _codex_registration(root, host_executable, timeout)
+        if host == "codex"
+        else {"status": "not_evaluated"}
+    )
     gateway = (
         _gateway(host_executable, timeout)
         if host == "openclaw"
@@ -684,6 +735,18 @@ def inspect_readiness(
                 ),
             }
         )
+    if registration["status"] == "blocked":
+        actions.append(
+            {
+                "code": registration["code"],
+                "owner": "user_or_host_admin",
+                "instruction": (
+                    "Open this project in Codex, review project trust and the enabled AutoTEM "
+                    "entry, then run 'codex mcp get autotem --json' from the project directory. "
+                    "Compare the command and arguments with autotem-host/codex/adapter.json."
+                ),
+            }
+        )
     actions.append(
         {
             "code": "HOST_TOOL_APPROVAL_AND_E2E_REQUIRED",
@@ -698,6 +761,7 @@ def inspect_readiness(
         runtime["status"] != "ready"
         or host_cli["status"] not in {"ready", "gui_not_evaluated"}
         or gateway["status"] == "blocked"
+        or registration["status"] == "blocked"
         or (host == "openclaw" and gateway["status"] != "ready")
     )
     return {
@@ -708,6 +772,7 @@ def inspect_readiness(
         "scope": "local_installation_probes_only",
         "runtime": runtime,
         "host_cli": host_cli,
+        "host_project_registration": registration,
         "gateway": gateway,
         "package_index": {"pip_no_index_active": no_index, "configuration_changed": False},
         "host_policy": {"status": "not_evaluated", "code": "HOST_APPROVAL_NOT_PROBED"},
