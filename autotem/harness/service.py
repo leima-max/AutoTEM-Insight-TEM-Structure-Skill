@@ -19,6 +19,8 @@ from pathlib import Path
 
 import numpy as np
 
+from autotem._paths import io_path
+
 from .compiler import compile_plan, validate_graph
 from .contracts import HarnessError
 from .input_requests import apply_response, parse_response, reject_credentials, rejected_response
@@ -283,9 +285,10 @@ class Harness:
             source = Path(parent["input_path"])
         elif parent and parent["request"]["input_mode"] == "reference":
             source = Path(parent["input_path"])
-        if not source.is_file():
+        source_io = io_path(source)
+        if not source_io.is_file():
             raise HarnessError("INPUT_NOT_FOUND", str(source))
-        source_digest = file_hash(source)
+        source_digest = file_hash(source_io)
         if parent and source_digest != parent["source_hash"]:
             raise HarnessError("INPUT_CHANGED", "Source changed since parent run")
         now = time.time()
@@ -412,7 +415,7 @@ class Harness:
                 preparing_job=job_id,
             )
             if request["input_mode"] == "snapshot":
-                if source.stat().st_size > request["budgets"]["max_snapshot_bytes"]:
+                if source_io.stat().st_size > request["budgets"]["max_snapshot_bytes"]:
                     raise HarnessError(
                         "SNAPSHOT_QUOTA", "Snapshot quota exceeded; select reference mode"
                     )
@@ -420,10 +423,10 @@ class Harness:
                 raw_directory.mkdir()
                 input_path = raw_directory / source.name
                 staged_snapshot = directory / f".snapshot-{job_id}.tmp"
-                shutil.copyfile(source, staged_snapshot)
+                shutil.copyfile(source_io, staged_snapshot)
                 if (
                     file_hash(staged_snapshot) != source_digest
-                    or file_hash(source) != source_digest
+                    or file_hash(source_io) != source_digest
                 ):
                     raise HarnessError("INPUT_CHANGED", "Input changed during snapshot")
             with self.store.connect() as db:
@@ -448,7 +451,7 @@ class Harness:
                         (run_id, encode(submitted), stamp),
                     )
                     if staged_snapshot is not None:
-                        os.replace(staged_snapshot, input_path)
+                        os.replace(staged_snapshot, io_path(input_path))
             queued = preparing
         except Exception as exc:
             error = (

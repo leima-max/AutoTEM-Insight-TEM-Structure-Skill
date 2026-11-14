@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 import time
 import uuid
@@ -176,6 +178,44 @@ def test_missing_and_ambiguous_inputs_fail_closed(tmp_path):
     assert resolved["status"] == "completed", resolved
     raw = next(a for a in resolved["artifacts"] if a["role"] == "raw")
     assert raw["metadata"]["shape"] == [16, 20]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 extended input paths")
+def test_long_source_can_be_inspected_and_referenced_without_changing_public_paths(tmp_path):
+    # Create the real input independently of the application's spelling helper. A long basename
+    # also forces the run-local raw snapshot over MAX_PATH within an otherwise short store.
+    folder = tmp_path / "package"
+    while len(str(folder / "input.npy").encode("utf-16-le")) // 2 < 271:
+        folder /= "数据 archive 0123456789"
+    basename = "原始_" + "列" * 192 + ".npy"
+    source = folder / basename
+    physical = Path("\\\\?\\" + str(source))
+    physical.parent.mkdir(parents=True)
+    pixels = np.arange(64, dtype=np.uint16).reshape(8, 8)
+    with physical.open("wb") as handle:
+        np.save(handle, pixels, allow_pickle=False)
+    digest = hashlib.sha256(physical.read_bytes()).hexdigest()
+    h = Harness(tmp_path / "store")
+    inspection = h.inspect_input(str(source), modality="HRTEM")
+    assert inspection["status"] == "completed", inspection
+    reference = h.submit_analysis(dict(plan(source), input_mode="reference"), asynchronous=False)
+    assert reference["status"] == "completed", reference
+    for state in (inspection, reference):
+        rid = state["run_id"]
+        saved = h.store.get_run(rid)
+        assert saved["request"]["input_path"] == str(source) and saved["source_hash"] == digest
+        pinned = source if state is reference else h.store.run_dir(rid) / "raw" / basename
+        assert saved["input_path"] == str(pinned)
+        assert hashlib.sha256(Path("\\\\?\\" + str(pinned)).read_bytes()).hexdigest() == digest
+        dataset = h.store.load_json(h.store.role(rid, "dataset"))
+        assert dataset["source_path"] == str(pinned)
+        np.testing.assert_array_equal(h.store.load_array(h.store.role(rid, "raw")), pixels)
+    physical.unlink()
+    with pytest.raises(HarnessError) as missing:
+        h.inspect_input(str(source))
+    assert missing.value.code == "INPUT_NOT_FOUND"
+    with h.store.connect() as db:
+        assert db.execute("select count(*) from runs").fetchone()[0] == 2
 
 
 def test_cancel_timeout_and_concurrent_submit_are_isolated(tmp_path):

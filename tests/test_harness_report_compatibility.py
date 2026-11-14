@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +23,32 @@ from autotem.preprocessing.quality import load_dataset_array
 from autotem.reporting.harness_evidence import delivery_index
 
 pytestmark = pytest.mark.smoke
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 extended input paths")
+def test_long_tiff_keeps_ordinary_path_pixels_and_input_fingerprint(tmp_path):
+    folder = tmp_path / "原始报告数据"
+    while len(str(folder / "detector.tif").encode("utf-16-le")) // 2 < 270:
+        folder /= "制样 0123456789"
+    path = folder / "detector.tif"
+    native = Path("\\\\?\\" + str(path))
+    native.parent.mkdir(parents=True)
+    pixels = np.arange(70, dtype=np.uint16).reshape(7, 10)
+    with native.open("wb") as stream:
+        Image.fromarray(pixels).save(stream, format="TIFF")
+    direct = TEMAnalysisSkill().load_data(path)
+    assert direct.source_path == str(path)
+    np.testing.assert_array_equal(load_dataset_array(direct), pixels)
+    recipe = write_recipe(tmp_path / "read.yaml", {"workflow": {"steps": ["load", "report"]}})
+    out = tmp_path / "out"
+    assert main(["analyze", str(path), "--workflow", str(recipe), "--output", str(out)]) == EXIT_OK
+    report = AnalysisReport.model_validate_json((out / "analysis_report.json").read_bytes())
+    assert report.schema_version == "0.1.0" and report.dataset.source_path == str(path)
+    assert report.provenance["input_fingerprint"] == {
+        "path": str(path), "exists": True, "size_bytes": native.stat().st_size,
+        "sha256": hashlib.sha256(native.read_bytes()).hexdigest(),
+    }
+    np.testing.assert_array_equal(load_dataset_array(report.dataset), pixels)
 
 
 def write_recipe(path, value):

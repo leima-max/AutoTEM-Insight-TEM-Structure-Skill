@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from importlib.util import find_spec
@@ -11,6 +10,8 @@ from typing import Any
 
 import numpy as np
 from PIL import Image, TiffTags
+
+from autotem._paths import io_path
 
 from .metadata import normalize_metadata
 
@@ -206,7 +207,7 @@ def require_spatial_indices(shape: tuple[int, ...]) -> None:
 
 
 def _read_standard_image(path: Path, *, require_plane: bool = False) -> ReadResult:
-    with Image.open(path) as img:
+    with Image.open(io_path(path)) as img:
         if require_plane:
             select_image_page(img, frame=None, channel=None)
         metadata_raw: dict[str, Any] = _to_jsonable(dict(img.info))
@@ -260,26 +261,12 @@ def _read_standard_image(path: Path, *, require_plane: bool = False) -> ReadResu
         )
 
 
-def _npy_io_path(path: Path) -> Path:
-    """Use a Win32 extended name for long NPY I/O, leaving public paths unchanged."""
-    if os.name != "nt":
-        return path
-    absolute = os.path.abspath(path)
-    if absolute.startswith(("\\\\?\\", "\\\\.\\")):
-        return path
-    # Win32 MAX_PATH includes the trailing NUL and counts UTF-16 code units.
-    if len(absolute.encode("utf-16-le", "surrogatepass")) // 2 < 260:
-        return path
-    if absolute.startswith("\\\\"):
-        return Path("\\\\?\\UNC\\" + absolute[2:])
-    return Path("\\\\?\\" + absolute)
-
-
 def read_numeric_file(path: Path, *, mmap_mode: str | None = None) -> np.ndarray:
     """Read original NPY pixels or a whitespace- or comma-delimited numeric table."""
+    path = io_path(path)
     suffix = path.suffix.lower()
     if suffix == ".npy":
-        return np.load(_npy_io_path(path), allow_pickle=False, mmap_mode=mmap_mode)
+        return np.load(path, allow_pickle=False, mmap_mode=mmap_mode)
     if suffix == ".txt":
         return np.loadtxt(path)
     if suffix == ".csv":
@@ -326,7 +313,7 @@ def _read_dm(path: Path) -> ReadResult:
     except ImportError as exc:
         raise RuntimeError("Reading DM3/DM4 requires `ncempy`. Please install ncempy.") from exc
 
-    with dm.fileDM(str(path), on_memory=True) as dm_file:
+    with dm.fileDM(str(io_path(path)), on_memory=True) as dm_file:
         payload = dm_file.getDataset(0)
         array = np.asarray(payload.get("data"))
         metadata_raw = _to_jsonable(dict(payload))
@@ -381,7 +368,7 @@ def _read_mrc(path: Path) -> ReadResult:
     except ImportError as exc:
         raise RuntimeError("Reading MRC requires `mrcfile`. Please install mrcfile.") from exc
 
-    with mrcfile.open(str(path), permissive=True) as mrc:
+    with mrcfile.open(str(io_path(path)), permissive=True) as mrc:
         array = np.asarray(mrc.data)
         voxel = mrc.voxel_size
         metadata_raw = {
@@ -420,7 +407,7 @@ def _read_hdf5_emd(path: Path) -> ReadResult:
     except ImportError as exc:
         raise RuntimeError("Reading HDF5/EMD requires `h5py`. Please install h5py.") from exc
 
-    with h5py.File(path, "r") as h5f:
+    with h5py.File(io_path(path), "r") as h5f:
         array = _first_numeric_dataset(h5f)
         if array is None:
             raise ValueError(f"No numeric dataset found in {path.name}.")
@@ -442,7 +429,7 @@ def _read_ser(path: Path) -> ReadResult:
     except ImportError as exc:
         raise RuntimeError("Reading SER requires `ncempy`. Please install ncempy.") from exc
 
-    with ser.fileSER(str(path)) as handle:
+    with ser.fileSER(str(io_path(path))) as handle:
         array, metadata = handle.getDataset(0)
     metadata_raw = _to_jsonable(dict(metadata or {}))
     metadata_norm, warnings = normalize_metadata(metadata_raw, source_format=path.suffix)

@@ -9,6 +9,7 @@ import numpy as np
 from PIL import Image
 from pydantic import ConfigDict, Field, ValidationError, model_validator
 
+from autotem._paths import io_path
 from autotem.calibration.basic import calibrate_dataset
 from autotem.calibration.pixel_calibration import infer_pixel_size_from_scalebar
 from autotem.core import ArrayReference, Measurement, TEMDataset
@@ -391,10 +392,11 @@ def read_selected_input(
 ) -> tuple[np.ndarray, TEMDataset]:
     """Read one explicit 2D selection. The caller assigns its persisted array reference."""
     p = validated(InputParameters, params)
-    if not path.is_file():
+    io_source = io_path(path)
+    if not io_source.is_file():
         raise HarnessError("INPUT_NOT_FOUND", "Input snapshot is not a regular file")
     try:
-        array, metadata, selection = _read_selected(path, p)
+        array, metadata, selection = _read_selected(io_source, p)
     except HarnessError:
         raise
     except (ValueError, OSError, KeyError, TypeError) as exc:
@@ -640,7 +642,8 @@ def preprocess(ctx: OperationContext, params: dict) -> ServiceResult:
     )
     if result.image is None:
         raise HarnessError(
-            "PREPROCESSING_FAILED", "Preprocessing did not produce an image", {"warnings": result.warnings}
+            "PREPROCESSING_FAILED", "Preprocessing did not produce an image",
+            {"warnings": result.warnings},
         )
     try:
         processed = load_dataset_array(dataset.model_copy(update={"data": result.image}))
@@ -651,7 +654,8 @@ def preprocess(ctx: OperationContext, params: dict) -> ServiceResult:
         ) from exc
     if processed is None:
         raise HarnessError(
-            "PREPROCESSING_FAILED", "Full processed array is unavailable", {"warnings": result.warnings}
+            "PREPROCESSING_FAILED", "Full processed array is unavailable",
+            {"warnings": result.warnings},
         )
     result.image = ctx.emit_array(
         "processed", image_array(processed, "processed"), {"parameters": result.parameters}

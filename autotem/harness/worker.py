@@ -9,6 +9,8 @@ import sys
 import time
 from pathlib import Path
 
+from autotem._paths import io_path
+
 from .compiler import required_roles
 from .contracts import HarnessError, NeedsInput, OperationContext, ServiceResult
 from .process_tree import ProcessTree
@@ -179,7 +181,7 @@ def _execute(store, run_id, job_id=None):
             fail_remaining(store, run_id, step_id, error)
             return
         try:
-            input_file = Path(store.get_run(run_id)["input_path"])
+            input_file = io_path(Path(store.get_run(run_id)["input_path"]))
             if not input_file.is_file():
                 raise HarnessError("INPUT_UNAVAILABLE", "Pinned source file or snapshot is missing")
             if file_hash(input_file) != run["source_hash"]:

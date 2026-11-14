@@ -9,8 +9,9 @@ from typing import Any
 import numpy as np
 from scipy import ndimage as ndi
 
+from autotem._paths import io_path
 from autotem.core import Measurement, QualityAssessment, TEMDataset
-from autotem.io.readers import _npy_io_path, read_numeric_file
+from autotem.io.readers import read_numeric_file
 
 try:
     from skimage.measure import blur_effect as _skimage_blur_effect
@@ -128,7 +129,7 @@ def _load_from_uri(uri: str | None) -> np.ndarray | None:
         return None
     path = Path(uri)
     suffix = path.suffix.lower()
-    file_path = _npy_io_path(path) if suffix == ".npy" else path
+    file_path = io_path(path)
     if not file_path.is_file():
         return None
     if suffix in {".npy", ".txt", ".csv"}:
@@ -139,7 +140,7 @@ def _load_from_uri(uri: str | None) -> np.ndarray | None:
             from PIL import Image
         except ImportError:
             return None
-        with Image.open(path) as handle:
+        with Image.open(file_path) as handle:
             image = np.asarray(handle)
         if image.ndim == 3:
             image = image.mean(axis=2)

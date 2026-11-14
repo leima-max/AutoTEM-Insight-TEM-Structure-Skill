@@ -14,6 +14,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
 
+from autotem._paths import io_path
 from autotem.atomic.atom_detection import detect_atoms
 from autotem.calibration import calibrate_dataset
 from autotem.core import (
@@ -252,7 +253,8 @@ def _ensure_forced_step(workflow: WorkflowConfig, step_name: str) -> None:
 
 
 def _sha256_of_file(path: Path) -> str | None:
-    if not path.exists() or not path.is_file():
+    path = io_path(path)
+    if not path.is_file():
         return None
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -627,13 +629,14 @@ def _evaluate_quality_gates(
 
 
 def _input_fingerprint(input_path: Path) -> dict[str, object]:
-    if not input_path.exists() or not input_path.is_file():
+    physical = io_path(input_path)
+    if not physical.is_file():
         return {"path": str(input_path), "exists": False, "sha256": None, "size_bytes": None}
     return {
         "path": str(input_path),
         "exists": True,
-        "sha256": _sha256_of_file(input_path),
-        "size_bytes": input_path.stat().st_size,
+        "sha256": _sha256_of_file(physical),
+        "size_bytes": physical.stat().st_size,
     }
 
 
@@ -687,7 +690,7 @@ class TEMAnalysisSkill:
     """Facade that coordinates load, calibration, analysis, and reporting steps."""
 
     def load_data(self, path: str | Path, metadata: dict[str, object] | None = None) -> TEMDataset:
-        if not Path(path).is_file():
+        if not io_path(Path(path)).is_file():
             raise FileNotFoundError(f"Input file does not exist: {path}")
         dataset = load_tem_dataset(path)
         if metadata:
@@ -907,7 +910,7 @@ class TEMAnalysisSkill:
                     if not isinstance(load_options, dict):
                         raise ValueError("workflow.parameters.load must be a mapping.")
                     source = Path(input_path)
-                    if not source.is_file():
+                    if not io_path(source).is_file():
                         raise FileNotFoundError(f"Input file does not exist: {source}")
                     if load_options or source.suffix.lower() == ".npz":
                         directory = output_dir / (
