@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 
 from autotem.core import ArrayReference, PreprocessingResult, QualityAssessment, TEMDataset
+from autotem.io.readers import _npy_io_path
 from autotem.preprocessing.background import subtract_background
 from autotem.preprocessing.denoise import apply_denoise
 from autotem.preprocessing.quality import assess_image_quality, load_dataset_array
@@ -139,7 +140,7 @@ def _build_output_uri(
     if not source_path:
         return None
     source = Path(source_path)
-    if source.exists() and source.is_file():
+    if _npy_io_path(source).is_file():
         return source.with_name(f"{source.stem}_preprocessed.npy")
     return None
 
@@ -263,8 +264,9 @@ def preprocess_dataset(
     output_uri = _build_output_uri(dataset, output_dir)
     if output_uri is not None:
         try:
-            output_uri.parent.mkdir(parents=True, exist_ok=True)
-            np.save(output_uri, processed)
+            target = _npy_io_path(output_uri)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            np.save(target, processed)
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"Failed to persist preprocessed array to '{output_uri}': {exc}")
             output_uri = None

@@ -639,10 +639,20 @@ def preprocess(ctx: OperationContext, params: dict) -> ServiceResult:
         dataset, recipe=p.recipe, parameters=values, output_dir=ctx.output_dir / "intermediates"
     )
     if result.image is None:
-        raise HarnessError("PREPROCESSING_FAILED", "Preprocessing did not produce an image")
-    processed = load_dataset_array(dataset.model_copy(update={"data": result.image}))
+        raise HarnessError(
+            "PREPROCESSING_FAILED", "Preprocessing did not produce an image", {"warnings": result.warnings}
+        )
+    try:
+        processed = load_dataset_array(dataset.model_copy(update={"data": result.image}))
+    except (OSError, ValueError) as exc:
+        raise HarnessError(
+            "PREPROCESSING_FAILED", "Could not read the full processed array",
+            {"reason": str(exc), "warnings": result.warnings},
+        ) from exc
     if processed is None:
-        raise HarnessError("PREPROCESSING_FAILED", "Full processed array is unavailable")
+        raise HarnessError(
+            "PREPROCESSING_FAILED", "Full processed array is unavailable", {"warnings": result.warnings}
+        )
     result.image = ctx.emit_array(
         "processed", image_array(processed, "processed"), {"parameters": result.parameters}
     )

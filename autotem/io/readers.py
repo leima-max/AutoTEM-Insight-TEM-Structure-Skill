@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from importlib.util import find_spec
@@ -259,11 +260,26 @@ def _read_standard_image(path: Path, *, require_plane: bool = False) -> ReadResu
         )
 
 
+def _npy_io_path(path: Path) -> Path:
+    """Use a Win32 extended name for long NPY I/O, leaving public paths unchanged."""
+    if os.name != "nt":
+        return path
+    absolute = os.path.abspath(path)
+    if absolute.startswith(("\\\\?\\", "\\\\.\\")):
+        return path
+    # Win32 MAX_PATH includes the trailing NUL and counts UTF-16 code units.
+    if len(absolute.encode("utf-16-le", "surrogatepass")) // 2 < 260:
+        return path
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
 def read_numeric_file(path: Path, *, mmap_mode: str | None = None) -> np.ndarray:
     """Read original NPY pixels or a whitespace- or comma-delimited numeric table."""
     suffix = path.suffix.lower()
     if suffix == ".npy":
-        return np.load(path, allow_pickle=False, mmap_mode=mmap_mode)
+        return np.load(_npy_io_path(path), allow_pickle=False, mmap_mode=mmap_mode)
     if suffix == ".txt":
         return np.loadtxt(path)
     if suffix == ".csv":

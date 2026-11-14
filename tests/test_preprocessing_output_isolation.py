@@ -1,13 +1,19 @@
 """Run-scoped preprocessing must preserve raw data and previous run evidence."""
 
 import hashlib
+import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from autotem.core import ArrayReference, TEMDataset
+from autotem.harness.contracts import HarnessError
+from autotem.io.readers import read_numeric_file
 from autotem.preprocessing.basic import preprocess_dataset
+from autotem.preprocessing.quality import load_dataset_array
+from autotem.services.data_quality import preprocess
 
 pytestmark = pytest.mark.smoke
 
@@ -96,3 +102,48 @@ def test_preprocessing_legacy_direct_api_storage_remains_compatible(tmp_path: Pa
     expected = Path(dataset.source_path).with_name("raw_preprocessed.npy")
     assert Path(result.image.uri) == expected
     assert expected.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 MAX_PATH and extended path handling")
+def test_long_processed_array_reloads_through_ordinary_uri(tmp_path: Path) -> None:
+    dataset = _raw_dataset(tmp_path)
+    raw_hash = _hash(Path(dataset.source_path))
+    folder = tmp_path / "图像"
+    # Cross the Win32 threshold even in a short CI scratch directory.
+    while len(str(folder / "preprocessed_image.npy").encode("utf-16-le")) // 2 <= 260:
+        folder /= "intermediates_0123456789"
+    output = folder / "preprocessed_image.npy"
+    result = preprocess_dataset(dataset, parameters={"denoise_method": "none"}, output_dir=folder)
+    assert result.image.uri == str(output) and result.image.inline is None
+    reference = dataset.model_copy(update={"data": result.image})
+    image = read_numeric_file(output, mmap_mode="r")
+    assert isinstance(image, np.memmap) and image.dtype == np.float32 and image.shape == (96, 96)
+    np.testing.assert_array_equal(load_dataset_array(reference), image)
+    assert float(image.min()) == 0 and float(image.max()) == 1
+    assert not any("Failed to persist" in warning for warning in result.warnings)
+    assert _hash(Path(dataset.source_path)) == raw_hash
+
+
+def test_harness_preserves_failed_processed_array_write(tmp_path: Path, monkeypatch) -> None:
+    dataset = _raw_dataset(tmp_path)
+    raw = read_numeric_file(Path(dataset.source_path))
+    context = SimpleNamespace(
+        output_dir=tmp_path / "op", array=lambda role: raw, model=lambda role, model_type: dataset
+    )
+
+    def deny_write(*args, **kwargs):
+        raise PermissionError("read-only destination for this run")
+
+    monkeypatch.setattr(np, "save", deny_write)
+    with pytest.raises(HarnessError) as error:
+        preprocess(context, {"denoise_method": "none"})
+    assert error.value.code == "PREPROCESSING_FAILED"
+    assert any("read-only destination for this run" in message for message in error.value.details["warnings"])
+
+
+@pytest.mark.parametrize("suffix", [".npy", ".txt", ".csv"])
+def test_dataset_uri_requires_a_regular_numeric_file(tmp_path: Path, suffix: str) -> None:
+    folder = tmp_path / ("folder" + suffix)
+    folder.mkdir()
+    dataset = TEMDataset(data=ArrayReference(shape=(2, 2), dtype="float32", uri=str(folder)))
+    assert load_dataset_array(dataset) is None
