@@ -524,6 +524,20 @@ def metrics(ctx: OperationContext, params: dict) -> ServiceResult:
         warnings=warnings,
     )
     ctx.emit_table("g_vector_table", [v.model_dump(mode="json") for v in result.g_vectors])
+    spacing_rows = [
+        {
+            "source_peak_index": i,
+            "value": spacing.value,
+            "unit": spacing.unit,
+            "uncertainty": spacing.uncertainty,
+            "method": spacing.method,
+            "confidence": spacing.confidence,
+        }
+        for i, spacing in enumerate(measured.d_by_peak)
+        if spacing is not None
+    ]
+    if spacing_rows:
+        ctx.emit_table("d_spacing_table", spacing_rows, metadata=scale_record)
     return ServiceResult(
         outputs={"diffraction": result},
         warnings=warnings,

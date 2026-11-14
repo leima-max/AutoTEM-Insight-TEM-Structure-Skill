@@ -488,8 +488,10 @@ def test_common_scale_uncertainty_is_correlated_across_axes(tmp_path):
 
 def test_direct_pattern_metrics_use_detector_not_real_space_scale(tmp_path):
     ctx = metric_context(tmp_path, direct=True)
+    ctx.values["peaks"].insert(1, {"x": 64.0, "y": 32.0})
     result = ctx.call(df.metrics).outputs["diffraction"]
     assert [v.value for v in result.d_spacings] == pytest.approx([0.4, 0.8])
+    assert [row["source_peak_index"] for row in ctx.value("d_spacing_table")] == [0, 2]
 
 
 def test_uncalibrated_metrics_are_diagnostic_and_cannot_index(tmp_path):
@@ -499,6 +501,7 @@ def test_uncalibrated_metrics_are_diagnostic_and_cannot_index(tmp_path):
     diffraction = result.outputs["diffraction"]
     assert [v.value for v in diffraction.d_spacings] == pytest.approx([12.8, 12.8])
     assert all(v.unit == "pixel" for v in diffraction.d_spacings)
+    assert all(row["unit"] == "pixel" for row in ctx.value("d_spacing_table"))
     assert all(v.magnitude.unit == "1/pixel" for v in diffraction.g_vectors)
     with pytest.raises(NeedsInput):
         ctx.call(df.index)
@@ -513,6 +516,7 @@ def test_uncalibrated_detector_reports_offsets_and_withholds_d_spacing(tmp_path)
     diffraction = result.outputs["diffraction"]
     assert result.scientific_level == "diagnostic"
     assert diffraction.d_spacings == [] and diffraction.provenance["d_by_peak"] == [None, None]
+    assert "d_spacing_table" not in ctx.values
     assert diffraction.provenance["coordinate_space"] == "diffraction_detector"
     offset, center = diffraction.g_vectors
     assert [offset.gx.value, offset.gy.value, offset.magnitude.value] == [-3.0, 4.0, 5.0]

@@ -75,6 +75,19 @@ def test_disk_reciprocal_chain_preserves_units_arrays_and_report(tmp_path, modal
     diffraction = harness.store.load_json(harness.store.role(state["run_id"], "diffraction"))
     assert diffraction["g_vectors"]
     assert all(g["magnitude"]["unit"] == "1/nm" for g in diffraction["g_vectors"])
+    spacing_table = next(a for a in artifacts if a["role"] == "d_spacing_table")
+    assert spacing_table["kind"] == "table" and spacing_table["execution_usable"]
+    rows = harness.read_artifact(spacing_table["artifact_id"])["rows"]
+    by_peak = diffraction["provenance"]["d_by_peak"]
+    assert [int(r["source_peak_index"]) for r in rows] == [
+        i for i, measurement in enumerate(by_peak) if measurement is not None
+    ]
+    for row in rows:
+        measured = by_peak[int(row["source_peak_index"])]
+        assert float(row["value"]) == measured["value"]
+        assert row["unit"] == measured["unit"] == "nm"
+        assert row["method"] == measured["method"]
+        assert row["uncertainty"] == ""  # Calibration uncertainty was not supplied.
     snapshot = next(a for a in artifacts if a["role"] == "raw")
     np.testing.assert_array_equal(harness.store.load_array(snapshot["artifact_id"]), raw)
     report = harness.export_report(state["run_id"])
