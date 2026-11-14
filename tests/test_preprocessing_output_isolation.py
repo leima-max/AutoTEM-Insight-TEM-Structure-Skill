@@ -138,7 +138,10 @@ def test_harness_preserves_failed_processed_array_write(tmp_path: Path, monkeypa
     with pytest.raises(HarnessError) as error:
         preprocess(context, {"denoise_method": "none"})
     assert error.value.code == "PREPROCESSING_FAILED"
-    assert any("read-only destination for this run" in message for message in error.value.details["warnings"])
+    assert any(
+        "read-only destination for this run" in message
+        for message in error.value.details["warnings"]
+    )
 
 
 @pytest.mark.parametrize("suffix", [".npy", ".txt", ".csv"])
