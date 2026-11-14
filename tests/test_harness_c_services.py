@@ -242,6 +242,14 @@ def test_registered_refinement_overlay_distinguishes_retained_positions(tmp_path
     monkeypatch.setattr(ImageDraw.ImageDraw, "text", record_text)
     result = OPERATIONS["atomic.refine"].handler(ctx, {"method": "com"})
     assert result.outputs["atomic_refinement"]["provenance"]["point_status"] == expected
+    table = ctx.tables[result.outputs["refined_atoms"].provenance["table_artifact_id"]]
+    assert [row["atom_index"] for row in table] == list(range(len(coords)))
+    assert [row["refinement_status"] for row in table] == expected
+    assert [(row["input_y_px"], row["input_x_px"]) for row in table] == coords
+    np.testing.assert_array_equal(
+        [(row["y_px"], row["x_px"]) for row in table],
+        result.outputs["atomic_refinement"]["coordinates_refined"],
+    )
     role = result.outputs["refined_atoms"].provenance["overlay_artifact_id"]
     meta = ctx.image_metadata[role]
     assert meta["refinement_counts"] == {"total": 4, "accepted": 1, "retained": 3}
@@ -420,6 +428,11 @@ def test_intensity_is_from_raw_and_rejects_unsafe_group_members(context):
     assert context.array_metadata["atomic_intensity.saturation_flag"]["unit"] == "boolean"
     assert any(output["saturation_flag"])
     assert not any(output["trusted_atom_mask"])
+    rows = context.tables[output["table_artifact_id"]]
+    assert [r["atom_index"] for r in rows] == list(range(len(direct.raw_sum)))
+    np.testing.assert_allclose([r["raw_sum_au"] for r in rows], direct.raw_sum)
+    assert [r["saturated"] for r in rows] == direct.saturation_flag.tolist()
+    assert [r["trusted"] for r in rows] == output["trusted_atom_mask"]
     grouped = atomic.intensity_groups(context, {}).outputs["intensity_groups"]
     assert all(label == -1 for label in grouped["labels"])
 

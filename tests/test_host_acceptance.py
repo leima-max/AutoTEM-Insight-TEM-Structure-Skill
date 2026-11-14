@@ -14,6 +14,62 @@ def write_json(path, data):
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
+def test_j02_requires_same_raw_refinement_and_physical_distances(tmp_path):
+    products = [
+        ("input.load", "raw", {}),
+        ("atomic.detect", "atoms", {"raw": "raw"}),
+        ("atomic.refine", "refined_atoms", {"raw": "raw", "atoms": "atoms"}),
+        ("atomic.distances", "atom_distances", {"refined_atoms": "refined_atoms"}),
+        ("atomic.intensity", "atomic_intensity", {"raw": "raw", "refined_atoms": "refined_atoms"}),
+    ]
+    steps = [
+        {"step_id": op, "operation_id": op, "status": "completed", "consumed_artifacts": used}
+        for op, _, used in products
+    ]
+    artifacts = {
+        role: {"step_id": op, "role": role, "file": role, "execution_usable": True}
+        for op, role, _ in products
+    }
+    lattice = {
+        "atoms": [{"y": 1, "x": 1}],
+        "provenance": {"raw_refinement": {"point_status": ["accepted"]}},
+    }
+    write_json(tmp_path / "refined_atoms", lattice)
+    measurement = {"artifact_id": "atom_distances", "units": ["nm"]}
+    run = {
+        "status": "completed",
+        "error_code": None,
+        "modality": "HAADF-STEM",
+        "_directory": tmp_path,
+        "steps": steps,
+        "artifacts": artifacts,
+        "physical_measurements": [measurement],
+    }
+
+    def check():
+        verifier.check_case("J02", [], {"r": run}, [], {})
+
+    check()
+    for step, role in [
+        (steps[2], "atoms"),
+        (steps[3], "refined_atoms"),
+        (steps[4], "raw"),
+        (steps[4], "refined_atoms"),
+    ]:
+        step["consumed_artifacts"][role] = "unrelated"
+        with pytest.raises(verifier.EvidenceError, match="raw_refined_physical"):
+            check()
+        step["consumed_artifacts"][role] = role
+    run["physical_measurements"] = []
+    with pytest.raises(verifier.EvidenceError, match="raw_refined_physical"):
+        check()
+    run["physical_measurements"] = [measurement]
+    lattice["provenance"]["raw_refinement"]["point_status"] = []
+    write_json(tmp_path / "refined_atoms", lattice)
+    with pytest.raises(verifier.EvidenceError, match="raw_refined_physical"):
+        check()
+
+
 @pytest.mark.parametrize("separate_run", [False, True])
 def test_j03_requires_repeat_of_measured_fields(tmp_path, separate_run):
     config = {"g_vectors": [[0.125, 0], [0, 0.125]], "reference_region": [16, 48, 16, 48]}

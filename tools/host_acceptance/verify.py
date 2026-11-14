@@ -882,6 +882,55 @@ def has_matching_gpa_repeat(measurements, completed):
     return False
 
 
+def has_raw_refined_atomic_measurements(run):
+    """Trace the reported geometry and intensity to the same raw-image refinement."""
+    successful = {s["step_id"]: s for s in run["steps"] if s["status"] == "completed"}
+
+    def outputs(operation, role):
+        for artifact_id, artifact in run["artifacts"].items():
+            step = successful.get(artifact["step_id"])
+            if artifact["role"] == role and artifact["execution_usable"] and step:
+                if step["operation_id"] == operation:
+                    yield artifact_id, artifact, step["consumed_artifacts"]
+
+    detected = {aid for aid, _, _ in outputs("atomic.detect", "atoms")}
+    physical = {m["artifact_id"] for m in run["physical_measurements"] if m["units"]}
+    measured = {
+        used.get("refined_atoms")
+        for aid, _, used in outputs("atomic.distances", "atom_distances")
+        if aid in physical
+    }
+    intensity = {
+        (used.get("refined_atoms"), used.get("raw"))
+        for _, _, used in outputs("atomic.intensity", "atomic_intensity")
+    }
+    for aid, artifact, used in outputs("atomic.refine", "refined_atoms"):
+        raw_id = used.get("raw")
+        raw = run["artifacts"].get(raw_id, {})
+        if (
+            aid not in measured
+            or (aid, raw_id) not in intensity
+            or used.get("atoms") not in detected
+            or raw.get("role") != "raw"
+            or not raw.get("execution_usable")
+        ):
+            continue
+        lattice = unique_json((run["_directory"] / artifact["file"]).read_text("utf-8"))
+        atoms = lattice.get("atoms", [])
+        status = lattice.get("provenance", {}).get("raw_refinement", {}).get("point_status")
+        if (
+            atoms
+            and isinstance(status, list)
+            and len(status) == len(atoms)
+            and all(
+                s in ("accepted", "out_of_bounds", "max_shift_rejected", "fit_failed")
+                for s in status
+            )
+        ):
+            return True
+    return False
+
+
 def check_case(case, calls, runs, turns, excerpts, variant=None):
     completed = [r for r in runs.values() if r["status"] == "completed"]
     if variant is not None:
@@ -924,6 +973,15 @@ def check_case(case, calls, runs, turns, excerpts, variant=None):
             )
         if case in {"J01", "J05"}:
             require(any(r["physical_measurements"] for r in candidates), "physical_spacing_missing")
+        if case == "J02":
+            require(
+                any(
+                    has_raw_refined_atomic_measurements(r)
+                    for r in candidates
+                    if r["modality"] == "HAADF-STEM"
+                ),
+                "raw_refined_physical_geometry_or_intensity_missing",
+            )
         if case == "J05":
             if variant:
                 require(

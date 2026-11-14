@@ -424,6 +424,31 @@ def refine(ctx: OperationContext, params: dict) -> ServiceResult:
     )
     refined = updated_lattice(lattice, result.coordinates_refined, result, "raw_refinement")
     refined.overlay = None
+    refined.provenance["table_artifact_id"] = ctx.emit_table(
+        "atom_refinement_table",
+        [
+            {
+                "atom_index": i,
+                "input_y_px": initial[0],
+                "input_x_px": initial[1],
+                "y_px": final[0],
+                "x_px": final[1],
+                "refinement_status": status,
+            }
+            for i, (initial, final, status) in enumerate(
+                zip(
+                    result.coordinates_input,
+                    result.coordinates_refined,
+                    result.provenance["point_status"],
+                    strict=True,
+                )
+            )
+        ],
+        metadata={
+            "image_role": "raw",
+            "coordinates_sha256": refined.provenance["coordinates_sha256"],
+        },
+    )
     refined.provenance["overlay_artifact_id"] = ctx.emit_image(
         "refined_atoms_overlay",
         overlay_path,
@@ -727,6 +752,37 @@ def intensity(ctx: OperationContext, params: dict) -> ServiceResult:
     )
     payload["trusted_atom_mask"] = trusted.tolist()
     ctx.emit_array("atomic_intensity.trusted_atom_mask", trusted)
+    payload["table_artifact_id"] = ctx.emit_table(
+        "atom_intensity_table",
+        clean_json(
+            [
+                {
+                    "atom_index": i,
+                    "y_px": y,
+                    "x_px": x,
+                    "raw_sum_au": result.raw_sum[i],
+                    "background_subtracted_sum_au": result.background_subtracted_sum[i],
+                    "normalized_intensity": result.normalized_intensity[i],
+                    "snr": result.snr[i],
+                    "valid": result.valid_atom_mask[i],
+                    "edge": result.edge_flag[i],
+                    "overlap": result.overlap_flag[i],
+                    "saturated": result.saturation_flag[i],
+                    "trusted": trusted[i],
+                }
+                for i, (y, x) in enumerate(result.coordinates_yx)
+            ]
+        ),
+        metadata={
+            "image_role": "raw",
+            "coordinate_role": p.coordinate_role,
+            "coordinates_sha256": payload["metadata"]["coordinates_sha256"],
+            "normalization": p.normalization,
+            "interpretation": (
+                "Relative column intensity. Quantitative Z and composition unverified."
+            ),
+        },
+    )
     return ServiceResult(
         {"atomic_intensity": payload},
         [
