@@ -247,6 +247,17 @@ def _planned_files(
         host_note["instruction"] = (
             "Use cli_command with a Harness subcommand or send JSONL using jsonl_command."
         )
+    if host == "openclaw":
+        from .openclaw import PLUGIN_DIR, gateway_files
+
+        files.update(gateway_files(root, host_note["jsonl_command"], python_executable,
+                                   (root / harness_root).resolve(), managed=managed))
+        host_note["gateway_plugin"] = {
+            "directory": PLUGIN_DIR,
+            "config_example": "autotem-host/openclaw/gateway-config.example.json",
+            "activation": "operator_opt_in",
+            "transport": "harness_jsonl",
+        }
     files[f"autotem-host/{host}/adapter.json"] = (
         json.dumps(host_note, indent=2, ensure_ascii=False) + "\n"
     ).encode("utf-8")

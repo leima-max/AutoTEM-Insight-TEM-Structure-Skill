@@ -39,7 +39,13 @@ python -m autotem.harness.cli --root outputs/harness install-host codex --projec
 
 对 Codex，可加 `--with-mcp` 将经过解析校验的 `[mcp_servers.autotem]` 追加到**项目** `.codex/config.toml`，保留无关表和注释。相同表无需修改；不同同名表或无法安全追加的 inline 配置拒绝合并。不会修改用户 `~/.codex/config.toml`，也不调用全局 `codex mcp add`。启动的 Python 路径取安装器当前解释器，项目空间路径通过参数数组传递，无 shell 拼接。
 
-OpenClaw 安装示例将 host 换为 `openclaw`，只复制 workspace Skill 与提议资源，不修改全局 `openclaw.json`。WorkBuddy 换为 `workbuddy`，生成 `autotem-host/workbuddy/autotem-skill.zip` 与 `adapter.json`，下一步明确要求实际 GUI 导入。两者当前不支持 `--with-mcp` 自动配置合并。
+OpenClaw 安装示例将宿主换为 `openclaw`。安装器部署工作区 Skill、会话级 MCP 连接说明，以及 `autotem-host/openclaw/gateway-plugin`。要经网关使用工具，选择指向本项目的工作区，在对应的 OpenClaw 配置中合并 `autotem-host/openclaw/gateway-config.example.json` 所列的插件目录、启用项和需要允许的工具名。如果配置中已有 `plugins.allow`，将 `autotem-harness` 加入原清单。重载后查阅 `tools.catalog`。用 `POST /tools/invoke` 调用 `autotem__list_capabilities` 可检查网关与项目私有 Harness 的连接。使用会话级 MCP 的客户端可继续使用原有登记方式。每处工作区选择一种工具接入方式。[OpenClaw 原生工具插件](https://docs.openclaw.ai/plugins/building-plugins) · [网关调用 API](https://docs.openclaw.ai/gateway/tools-invoke-http-api)
+
+九个工具均为按名称授权的可选工具。插件仅工作在安装时绑定的工程。启用 `tools.fs.workspaceOnly` 时，可检查项目内输入、提交快照或引用、补充父作业参数、向已有作业追加步骤，按 ID 读回登记结果。插件核对原图、SER 配套 EMI、已有作业的来源和 CIF 项目路径。科学进程读取 HDF5/EMD 时，仅接收存储在容器内部的普通数值数据集。如数据依赖外部存储、虚拟数据集或链接，请先导出成一个自含 HDF5 数据集或 NPY。第三方扩展操作需要单独审查和配置的服务。容器沙盒中的会话应在容器内安装运行时并使用该容器内的连接方式。
+
+在工具调用被中止或达到等待预算时，插件释放本次 JSONL 子进程。已登记的科学作业仍由 Harness 调度，按 run ID 查询 `autotem__get_run_status` 或通过 `autotem__cancel_run` 显式取消。长分析默认异步提交，建议附上稳定的 `idempotency_key`，便于断线后重试。同步提交可使用计划的 `budgets.run_seconds` 指定预算。正常工具错误通过 Harness 返回，其余进程错误只向宿主报告错误类别。
+
+WorkBuddy 换为 `workbuddy`，生成 `autotem-host/workbuddy/autotem-skill.zip` 与 `adapter.json`，下一步由操作者实际 GUI 导入。以上安装步骤均由操作者在宿主中启用对应资源。
 
 应用时写 `.autotem/host-installations/<installation_id>/manifest.json` 与修改前备份，记录前后 hash、动作和安装状态。安装失败只回退本次已写且内容仍相符的文件。重复相同安装不创建新变更。升级资源与既有内容不同会拒绝；先检查旧版本回滚，再安装新版，避免覆盖用户修订。
 

@@ -28,6 +28,7 @@ from .input_requests import apply_response, parse_response, reject_credentials, 
 from .registry import default_registry
 from .runtime_binding import record_job_runtime
 from .store import Store, encode, file_hash, owns_preparation
+from .workspace import record_workspace, workspace_file
 
 TERMINAL = {"completed", "failed", "needs_input", "cancelled", "timed_out", "interrupted"}
 
@@ -51,12 +52,17 @@ def _finish_unclaimed(db, run_id, job_id, status, step_status, error, ended):
 
 
 class Harness:
-    def __init__(self, root: str | Path = "outputs/harness", *, queue_limit: int = 32):
+    def __init__(
+        self, root: str | Path = "outputs/harness", *, queue_limit: int = 32,
+        workspace: Path | None = None,
+    ):
         self.store = Store(root)
         self.root = self.store.root
         self.queue_limit = queue_limit
+        self.workspace = workspace.resolve(strict=True) if workspace is not None else None
 
     def list_capabilities(self, enabled_plugins: list[str] | None = None) -> dict:
+        self._check_workspace_plugins(enabled_plugins)
         return {
             "envelope_version": "1.0.0",
             "operations": default_registry(enabled_plugins).capabilities(),
@@ -75,6 +81,7 @@ class Harness:
 
     def validate_plan(self, plan, run_id: str | None = None) -> dict:
         compiled = compile_plan(plan)
+        self._check_workspace_plugins(compiled.enabled_plugins)
         reply = parse_response(compiled.user_input)
         response_validation = None
         if reply:
@@ -128,6 +135,12 @@ class Harness:
             "scientific_accuracy": "not_evaluated",
             **({"input_response_validation": response_validation} if reply else {}),
         }
+
+    def _check_workspace_plugins(self, enabled_plugins):
+        if self.workspace is not None and enabled_plugins:
+            raise HarnessError(
+                "WORKSPACE_INPUT_RESTRICTED", "Additional operation plugins require a reviewed service."
+            )
 
     def inspect_input(self, path: str, **selection) -> dict:
         modality = selection.pop("modality", "unknown")
@@ -199,6 +212,7 @@ class Harness:
                 ).fetchone()
             if prior:
                 compiled = compile_plan(plan)
+                self._check_workspace_plugins(compiled.enabled_plugins)
                 registry = default_registry(compiled.enabled_plugins)
                 for step in compiled.steps:
                     step.operation_version = registry.get(step.operation_id).version
@@ -286,7 +300,7 @@ class Harness:
             source = Path(parent["input_path"])
         elif parent and parent["request"]["input_mode"] == "reference":
             source = Path(parent["input_path"])
-        source_io = io_path(source)
+        source_io = io_path(workspace_file(source, self.workspace))
         if not source_io.is_file():
             raise HarnessError("INPUT_NOT_FOUND", str(source))
         source_digest = file_hash(source_io)
@@ -366,6 +380,7 @@ class Harness:
                 (job_id, run_id, now),
             )
             record_job_runtime(db, self.root, run_id, job_id, encode(request), request)
+            record_workspace(db, run_id, job_id, self.workspace)
             if response_validation:
                 self.store.record_input_response(
                     db,
@@ -565,6 +580,7 @@ class Harness:
                 (job_id, run_id, time.time()),
             )
             record_job_runtime(db, self.root, run_id, job_id, encode(combined), combined)
+            record_workspace(db, run_id, job_id, self.workspace)
             db.execute(
                 "INSERT INTO events(run_id,kind,payload,created) "
                 "VALUES(?,'work_package_submitted',?,?)",

@@ -17,6 +17,7 @@ from .process_tree import ProcessTree
 from .registry import default_registry
 from .runtime_binding import selected_runtime
 from .store import Store, encode, file_hash
+from .workspace import job_workspace, workspace_file
 
 # A child that never received ownership can signal only its supervisor, never change a run.
 OWNERSHIP_EXIT = 73
@@ -135,6 +136,7 @@ def _execute(store, run_id, job_id=None):
         return OWNERSHIP_EXIT
     run = store.get_run(run_id)
     request = run["request"]
+    workspace = job_workspace(store, run_id, run["job_id"])
     try:
         registry = default_registry(request["enabled_plugins"])
     except Exception as exc:
@@ -181,7 +183,8 @@ def _execute(store, run_id, job_id=None):
             fail_remaining(store, run_id, step_id, error)
             return
         try:
-            input_file = io_path(Path(store.get_run(run_id)["input_path"]))
+            source = workspace_file(Path(store.get_run(run_id)["input_path"]), workspace)
+            input_file = io_path(source)
             if not input_file.is_file():
                 raise HarnessError("INPUT_UNAVAILABLE", "Pinned source file or snapshot is missing")
             if file_hash(input_file) != run["source_hash"]:
@@ -191,7 +194,8 @@ def _execute(store, run_id, job_id=None):
                 raise HarnessError(
                     availability["state"].upper(), operation.operation_id, availability
                 )
-            context = OperationContext(store, run_id, step_id, request, step["inputs"])
+            context = OperationContext(store, run_id, step_id, request, step["inputs"],
+                                       workspace=workspace)
             effective_roles = required_roles(operation, step["parameters"])
             for role in effective_roles:
                 context._artifact(role)

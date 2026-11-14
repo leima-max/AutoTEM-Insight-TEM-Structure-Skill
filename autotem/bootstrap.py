@@ -34,10 +34,13 @@ def host_install_next_action(host: str, *, mcp_available: bool, codex_configured
     """Describe the selected project's installed entry points after a successful apply."""
     adapter = f"autotem-host/{host}/adapter.json"
     if not mcp_available:
-        return (
+        action = (
             f"打开本项目的 {adapter}。按 cli_command 中的参数顺序运行，末尾加 capabilities "
             "可查看可用能力。也可运行 jsonl_command，逐行发送 UTF-8 JSON 请求。"
         )
+        if host == "openclaw":
+            action += "若要经 OpenClaw 网关调用，按本项目 autotem-host/openclaw/gateway-config.example.json 启用所需工具。"
+        return action
     if host == "workbuddy":
         action = (
             "若尚未导入此项目的 Skill，请在 WorkBuddy 中导入 "
@@ -46,10 +49,11 @@ def host_install_next_action(host: str, *, mcp_available: bool, codex_configured
             "mcp.mcpServers.autotem 配置连接。"
         )
     elif host == "openclaw":
-        action = (
-            "在 OpenClaw 中将所选项目设为工作区，并确认网关运行正常。"
-            f"按 OpenClaw 支持的接入方式，使用本项目 {adapter} 中的 "
-            "mcp.mcpServers.autotem 配置连接。"
+        return (
+            "在 OpenClaw 中将所选项目设为工作区，并确认网关运行正常。要经网关调用，请查看项目中的 "
+            "autotem-host/openclaw/gateway-config.example.json。由操作者在该工作区对应的 "
+            "OpenClaw 配置中启用插件及所需工具，授权后调用 autotem__list_capabilities。"
+            f"使用会话级 MCP 的客户端可按 {adapter} 中的 mcp.mcpServers.autotem 配置连接。"
         )
     elif host == "codex":
         action = "在 Codex 中打开所选项目。确认项目可信并完成项目信任后，"
