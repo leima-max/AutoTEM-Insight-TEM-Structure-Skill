@@ -216,6 +216,52 @@ def sample(tmp_path):
     return record, spec, trace, events
 
 
+@pytest.mark.parametrize(
+    "order,reason",
+    [
+        ((0, 1, 4, 2, 3), "host_item_outside_turn"),
+        ((0, 2, 1, 3, 4), "host_item_outside_turn"),
+        ((1, 0, 2, 3, 4), "host_turn_event_out_of_order"),
+        ((0, 1, 2, 2, 3, 4), "duplicate_host_item_completion"),
+    ],
+)
+def test_codex_discards_out_of_turn_or_repeated_events(tmp_path, order, reason):
+    record, _, trace, events = sample(tmp_path)
+    trace.write_text("\n".join(json.dumps(events[i]) for i in order), encoding="utf-8")
+    report = verifier.verify(record, root=tmp_path)
+    assert (report["case_verdict"], report["reason"]) == ("failed", reason)
+
+
+@pytest.mark.parametrize("key", ["structuredContent", "structured_content"])
+def test_visible_harness_response_copies_agree(key):
+    response = {
+        "tool": "read_artifact",
+        "schema_version": "1.0.0",
+        "ok": True,
+        "result": {"rows": [[True, 2]]},
+        "error": None,
+    }
+    payload = {key: response}
+    assert verifier.envelope("read_artifact", payload) == response
+    displayed = {**response, "result": {"rows": [[True, 2.0]]}}
+    payload["content"] = [{"type": "text", "text": json.dumps(displayed, sort_keys=True)}]
+    assert verifier.envelope("read_artifact", payload) == response
+    displayed["result"]["rows"][0][0] = 1
+    payload["content"][0]["text"] = json.dumps(displayed)
+    with pytest.raises(verifier.EvidenceError, match="conflicting_harness_response_copies"):
+        verifier.envelope("read_artifact", payload)
+
+
+def test_distinct_codex_polls_can_repeat_the_same_call(tmp_path):
+    record, _, trace, events = sample(tmp_path)
+    repeated = {**events[2], "item": {**events[2]["item"], "id": "item_2"}}
+    events.insert(3, repeated)
+    events.insert(1, {"type": "item.completed", "item": {"id": "startup", "type": "error"}})
+    trace.write_text("\n".join(map(json.dumps, events)), encoding="utf-8")
+    report = verifier.verify(record, root=tmp_path)
+    assert report["checks"]["case_execution"] == "passed"
+
+
 def test_unattempted_blocked_and_missing_proof_distinct(tmp_path):
     record, spec, _, _ = sample(tmp_path)
     partial = verifier.verify(record, root=tmp_path)

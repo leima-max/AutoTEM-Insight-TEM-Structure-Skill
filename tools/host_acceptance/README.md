@@ -20,6 +20,8 @@ $python = Join-Path $project ".autotem/runtimes/$($active.runtime_id)/Scripts/py
 
 初始化产生 `observation=not_evaluated` 的 `case.json`。按下表保存实际用户请求、会话中的 Skill 加载、工具返回和最终回答。J01 的测量结论应引用真实返回的 `artifact_id`。对于 Codex 桌面会话，可用 `observed-host-export` 绑定会话导出或界面原件。CLI 的逐轮 JSONL 使用 `codex-exec-jsonl`。用真实记录补齐模板，保留带时区的开始与结束时间，然后单独运行核验。
 
+每份 Codex CLI 原件记录一个完整回合。工具调用和回答都应位于 `turn.started` 与 `turn.completed` 之间。宿主也可能在回合开始前记录启动诊断。同一工具调用条目 ID 只能完成一次，多次查询同一作业可以有各自的条目 ID。若宿主同时保留了 AutoTEM 的文本 JSON 和结构化返回，两份内容必须一致。截断的尾部需要重新取得完整导出，回合外的工具调用或回答、重复完成或返回矛盾会导致核验失败。
+
 ```powershell
 $sample = Join-Path $project '现场验收/inputs/J01 合成 HRTEM.npy'
 & $python -I -B -X utf8 $field --project $project --release $bundle verify (Join-Path $capture 'case.json') --expected-input $sample --out (Join-Path $capture 'summary.json')

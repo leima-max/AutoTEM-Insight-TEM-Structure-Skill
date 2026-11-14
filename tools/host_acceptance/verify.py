@@ -144,16 +144,36 @@ def capture_file(base, name):
     return path
 
 
+def same_json(left, right):
+    """Compare JSON values with numeric equality while keeping booleans distinct."""
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(same_json(left[k], right[k]) for k in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            same_json(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return left == right and isinstance(left, bool) == isinstance(right, bool)
+
+
 def envelope(tool, payload):
     if isinstance(payload, dict) and payload.get("tool") == tool:
         result = payload
     else:
         payload = payload or {}
-        result = payload.get("structuredContent") or payload.get("structured_content")
-        if result is None:
-            contents = [c for c in payload.get("content", []) if c.get("type") == "text"]
+        copies = [
+            payload[key]
+            for key in ("structuredContent", "structured_content")
+            if payload.get(key) is not None
+        ]
+        contents = [c for c in payload.get("content", []) if c.get("type") == "text"]
+        if contents or not copies:
             observed(len(contents) == 1, "actual_harness_response_not_visible")
-            result = unique_json(contents[0]["text"])
+            copies.append(unique_json(contents[0]["text"]))
+        result = copies[0]
+        require(
+            all(same_json(result, other) for other in copies[1:]),
+            "conflicting_harness_response_copies",
+        )
     require(
         isinstance(result, dict)
         and result.get("tool") == tool
@@ -178,7 +198,8 @@ def read_turn(base, turn, host, capture_format, server):
     skill_opened = False
     if capture_format == "codex-exec-jsonl":
         require(host == "codex", "capture_format_host_mismatch")
-        started = ended = 0
+        phase = "before_thread"
+        completed_ids = set()
         with trace_file.open(encoding="utf-8-sig") as stream:
             for line_no, line in enumerate(stream, 1):
                 if not line.strip():
@@ -186,15 +207,29 @@ def read_turn(base, turn, host, capture_format, server):
                 event = unique_json(line)
                 kind = event.get("type")
                 if kind == "thread.started":
+                    require(phase == "before_thread", "host_turn_event_out_of_order")
                     sessions.append(event["thread_id"])
+                    phase = "before_turn"
                 elif kind == "turn.started":
-                    started += 1
+                    require(phase == "before_turn", "host_turn_event_out_of_order")
+                    phase = "active"
                 elif kind == "turn.completed":
-                    ended += 1
+                    require(phase == "active", "host_turn_event_out_of_order")
+                    phase = "completed"
                 elif kind == "turn.failed":
                     raise NotEvaluated("host_turn_failed")
-                elif kind == "item.completed":
+                elif kind in {"item.started", "item.completed"}:
                     item = event["item"]
+                    # Codex can emit startup diagnostics before turn.started.
+                    if item["type"] == "error":
+                        continue
+                    require(phase == "active", "host_item_outside_turn")
+                    if kind == "item.started":
+                        continue
+                    item_id = item.get("id")
+                    if item_id is not None:
+                        require(item_id not in completed_ids, "duplicate_host_item_completion")
+                        completed_ids.add(item_id)
                     if item["type"] == "agent_message":
                         messages.append((line_no, item["text"]))
                     if item["type"] == "command_execution" and item.get("exit_code") == 0:
@@ -222,7 +257,7 @@ def read_turn(base, turn, host, capture_format, server):
                                 "line": line_no,
                             }
                         )
-        observed(started == ended == 1 and len(sessions) == 1, "incomplete_host_turn")
+        observed(phase == "completed", "incomplete_host_turn")
     else:
         require(capture_format == "observed-host-export", "unsupported_capture_format")
         raw = unique_json(trace_file.read_text("utf-8-sig"))
