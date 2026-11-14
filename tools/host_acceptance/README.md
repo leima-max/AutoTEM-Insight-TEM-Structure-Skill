@@ -66,6 +66,8 @@ python tools/host_acceptance/verify.py init D:/AutoTEM-evidence/J06-codex --host
 | `host_observations` | `discovery/authorization/skill_discovery` 可分别指向实际宿主的工具枚举、授权动作和会话 Skill 加载记录。文本导出直接填写相对路径。图形界面原件填写 `{"session_id":"…","original_evidence":"…","observed_text":"实际显示的内容"}` |
 | `variant` | J05 用 `saed/nbed`，J07 用 `dataset/frame/channel`，J08 用 `answered/unanswered/invalid_reply`，J09 用 `snapshot/reference`，J11 用 `invalid_file/missing_dependency/broken_dependency/numerical_failure/timeout`，J12 用 `queued_cancel/running_cancel/interrupted`，J14 用 `sequential/native`，J15 用 `executed/missing_dependency/broken_dependency/timeout`。每个变体一次记录 |
 
+J01 核验会把回答里注明单位的晶面间距与同一 HRTEM 作业的磁盘原件逐值比对。可直接引用逐峰 d 表、物理衍射结果、标定的倒易矢量表，或实际链接到这些数据的 JSON/HTML 报告。允许换算长度单位及按展示位数舍入。每条直接填写的间距结论应关联能支持该数值的产物 ID。若同时给出数值不确定度，原结果须有对应数值。受支持的写法包括“晶面间距约 160 pm”、`d = 1.60 Å`，以及列名含间距和单位的表格。无法辨认间距和单位时保留待评。收据的 `spacing_answer` 给出所核对的数字、单位和涉及的原件指纹。导出的 ZIP 可以携带原表与报告，核验依据仍为其中可追溯至本次作业的产物。相身份、其他自然语解释、实验科学准确度仍由对应证据和审阅人判定。
+
 WorkBuddy 和 OpenClaw 的手工观察格式用于补充本机可导出的原始证据，记录者应保留每次出现参数和返回的真实截图、日志或宿主导出。单轮 trace JSON 如下，括号内提示需替换成此次真实内容。
 
 ```json

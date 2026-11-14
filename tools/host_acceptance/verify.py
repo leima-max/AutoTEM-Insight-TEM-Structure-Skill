@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import csv
 import hashlib
 import json
 import math
@@ -10,6 +12,7 @@ import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 MATRIX = json.loads(Path(__file__).with_name("matrix.json").read_text("utf-8"))
@@ -589,6 +592,259 @@ def positive_distance_units(role, result):
             and value > 0
         }
     )
+
+
+# This verifier also runs as a stand-alone file extracted with matrix.json on the host.
+_LENGTH = {
+    "nm": 1.0,
+    "nanometre": 1.0,
+    "nanometer": 1.0,
+    "纳米": 1.0,
+    "pm": 0.001,
+    "picometre": 0.001,
+    "picometer": 0.001,
+    "皮米": 0.001,
+    "å": 0.1,
+    "angstrom": 0.1,
+    "埃": 0.1,
+    "um": 1000.0,
+    "µm": 1000.0,
+    "μm": 1000.0,
+    "micrometre": 1000.0,
+    "micrometer": 1000.0,
+    "微米": 1000.0,
+}
+_NUMBER = r"[+-]?(?:\d+(?:[.,]\d+)?|[.,]\d+)(?:[eE][+-]?\d+)?"
+_UNIT = "(?:" + "|".join(_LENGTH) + r")(?:s)?(?![a-zA-Z⁻−/²³^]|\s*(?:/|per\s+pixel|每像素))"
+_QUANTITY = re.compile(
+    rf"(?<![a-zA-Z0-9_./])(?P<values>{_NUMBER}(?:\s*(?:,\s*(?:and\s+)?|、|\band\b|和|与)\s*{_NUMBER})*)"
+    rf"(?:\s*(?:±|\+/-)\s*(?P<uncertainty>{_NUMBER}))?\s*(?P<unit>{_UNIT})",
+    re.I,
+)
+_DISTANCE_LABEL = re.compile(
+    r"间距|面距|晶格条纹周期|\b(?:d[\s-]*)?spacings?\b|lattice (?:fringe )?(?:spacing|period)|"
+    r"interplanar distance|espacement|espaciado|Netzebenenabstand|"
+    r"(?<![\w])d(?:[_₀-₉]?\d+)?\s*(?:[=≈≃:：]|[([])",
+    re.I,
+)
+_UNCERTAINTY_LABEL = re.compile(
+    r"不确定度|不确定性|uncertaint|incertidumbre|incertitude|Unsicherheit", re.I
+)
+_ID = re.compile(r"(?<![a-zA-Z0-9])[0-9a-f]{32}(?![a-zA-Z0-9])")
+
+
+def length_scale(unit):
+    return _LENGTH.get(unit.casefold().removesuffix("s").replace("μ", "µ"))
+
+
+def spacing_statements(final):
+    """Read d-spacing statements, labelled table columns and numerical uncertainties."""
+    column = None
+    for line in final.splitlines():
+        line = line.replace("**", "").replace("`", "")
+        if line.count("|") >= 2:
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            for n, cell in enumerate(cells):
+                unit = re.search(rf"[(\[/]\s*({_UNIT})\s*[])]?", cell, re.I)
+                if _DISTANCE_LABEL.search(cell) and unit:
+                    column = (n, unit[1])
+                    break
+            else:
+                if column and column[0] < len(cells):
+                    value = cells[column[0]].lstrip("≈~ ")
+                    if re.fullmatch(_NUMBER, value):
+                        yield value, column[1], False
+                    elif re.match(r"[0-9+.\-]", value):
+                        for match in _QUANTITY.finditer(value + " " + column[1]):
+                            for val in re.findall(_NUMBER, match["values"]):
+                                yield val, match["unit"], False
+                            if match["uncertainty"] is not None:
+                                yield match["uncertainty"], match["unit"], True
+            continue
+        column = None
+        for sentence in re.split(r"[。；;!?！？]|(?<=\.)\s+", line):
+            # Crystal parameters and per-pixel calibration are separate quantities.
+            sentence = re.sub(
+                r"(?<![\w])(?:[abc]\s*=\s*)+" + _NUMBER + r"\s*" + _UNIT, "", sentence, flags=re.I
+            )
+            spacing = _DISTANCE_LABEL.search(sentence)
+            error = _UNCERTAINTY_LABEL.search(sentence)
+            bare = _QUANTITY.fullmatch(sentence.strip(" •-~≈"))
+            for match in _QUANTITY.finditer(sentence):
+                if not spacing and not error and not bare:
+                    continue
+                error_value = bool(re.search(r"(?:±|\+/-)\s*$", sentence[: match.start()])) or bool(
+                    error and not spacing
+                )
+                for val in re.findall(_NUMBER, match["values"]):
+                    yield val, match["unit"], error_value
+                if match["uncertainty"] is not None:
+                    yield match["uncertainty"], match["unit"], True
+
+
+def matches_displayed(number, scale, expected):
+    """Allow rounding to the displayed decimal place, including scientific notation."""
+    value = Decimal(number.replace(",", "."))
+    if not (-300 <= value.as_tuple().exponent <= 300):
+        return False
+    shown = float(value) * scale
+    half_place = 0.5 * 10.0 ** value.as_tuple().exponent * scale
+    return (
+        math.isfinite(shown)
+        and math.isfinite(half_place)
+        and abs(shown - expected) <= half_place + 4 * math.ulp(expected)
+    )
+
+
+def spacing_sources(run, cited):
+    """Map cited JSON/table/report IDs to hash-checked d-spacing rows in this completed FFT run."""
+    artifacts = run["artifacts"]
+    ops = {s["step_id"]: s["operation_id"] for s in run["steps"] if s["status"] == "completed"}
+    if (
+        run["status"] != "completed"
+        or run["modality"] != "HRTEM"
+        or not OPERATIONS["J01"] <= set(ops.values())
+    ):
+        return {}
+    physical = {m["artifact_id"] for m in run["physical_measurements"]}
+    physical_steps = {artifacts[i]["step_id"] for i in physical}
+    rows = {}
+    for aid, a in artifacts.items():
+        step = a["step_id"]
+        role = a["role"]
+        if ops.get(step) not in {"diffraction.metrics", "diffraction.index"}:
+            continue
+        path = run["_directory"] / a["file"]
+        if role == "diffraction":
+            result = unique_json(path.read_text("utf-8"))
+            data = result["d_spacings"] if positive_distance_units(role, result) else []
+        elif role in {"d_spacing_table", "g_vector_table"} and step in physical_steps:
+            with path.open(encoding="utf-8-sig", newline="") as stream:
+                data = list(csv.DictReader(stream))
+            if role == "g_vector_table":
+                # The CSV serializes the measured magnitude as a Python measurement mapping.
+                # Convert 1/length to length, without transferring position-only uncertainties.
+                try:
+                    data = [ast.literal_eval(row["magnitude"]) for row in data]
+                except (SyntaxError, ValueError) as exc:
+                    raise EvidenceError("invalid_registered_reciprocal_measurement") from exc
+                data = [
+                    {"value": 1 / row["value"], "unit": row["unit"][2:], "uncertainty": None}
+                    for row in data
+                    if row["unit"].startswith("1/") and row["value"] > 0
+                ]
+        else:
+            continue
+        values = []
+        for row in data:
+            scale = length_scale(row["unit"])
+            if scale is not None and row["value"] not in (None, ""):
+                val = float(row["value"]) * scale
+                unc = row["uncertainty"]
+                if math.isfinite(val) and val > 0:
+                    values.append((val, None if unc in (None, "") else float(unc) * scale))
+        if values:
+            rows[aid] = values
+    sources = {aid: {aid: rows[aid]} for aid in cited & rows.keys()}
+    for aid in cited & artifacts.keys():
+        a = artifacts[aid]
+        if a["role"] not in {"report_manifest", "report_html"}:
+            continue
+        path = run["_directory"] / a["file"]
+        if a["role"] == "report_manifest":
+            report = unique_json(path.read_text("utf-8"))
+            ids = {
+                x["artifact_id"]
+                for x in report["artifacts"]
+                if x["artifact_id"] in rows
+                and x["sha256"] == artifacts[x["artifact_id"]]["sha256"]
+                and x["execution_usable"]
+            }
+        else:
+            hrefs = set(re.findall(r"""href=["']([^"']+)["']""", path.read_text("utf-8"), re.I))
+            ids = {i for i in rows if Path(artifacts[i]["file"]).name in hrefs}
+        if ids:
+            sources[aid] = {i: rows[i] for i in sorted(ids)}
+    return sources
+
+
+def check_spacing_answer(final, claims, runs, returned):
+    """Check a quoted d-spacing against its sources without judging scientific accuracy."""
+    known = set(runs) | {j["job_id"] for r in runs.values() for j in r["jobs"]}
+    require(
+        set(_ID.findall(final)) <= known | returned, "answer_mentions_unreturned_artifact_or_run"
+    )
+    cited = {aid for c in claims for aid in c["artifact_ids"]}
+    sources = {}
+    evidence = {}
+    for run in runs.values():
+        for aid, raw in spacing_sources(run, cited).items():
+            sources[aid] = raw
+            evidence[aid] = {
+                "run_id": run["run_id"],
+                "citation_sha256": run["artifacts"][aid]["sha256"],
+                "measurements": {i: run["artifacts"][i]["sha256"] for i in raw},
+            }
+    statements = list(spacing_statements(final))
+    observed(any(not unc for _, _, unc in statements), "spacing_value_and_unit_not_observed")
+    require(sources, "spacing_source_not_cited")
+    eligible = [
+        r for r in runs.values() if r["run_id"] in {item["run_id"] for item in evidence.values()}
+    ]
+    measurement_products = {
+        i for r in eligible for i, a in r["artifacts"].items() if a["execution_usable"]
+    } | sources.keys()
+    for line in final.splitlines():
+        refs = set(_ID.findall(line)) & returned
+        if refs & measurement_products:
+            require(
+                any(refs <= set(run["artifacts"]) for run in eligible),
+                "spacing_citation_mixes_unrelated_runs",
+            )
+            if refs & sources.keys():
+                match_spacing_statements(
+                    spacing_statements(line), [sources[i] for i in refs if i in sources]
+                )
+    for claim in claims:
+        refs = set(claim["artifact_ids"])
+        # A declaration may cite supporting plots as well as the quantitative table.
+        if any(not unc for _, _, unc in spacing_statements(claim["quote"])):
+            require(sources.keys() & refs, "spacing_claim_has_no_quantitative_source")
+            match_spacing_statements(
+                spacing_statements(claim["quote"]), [sources[i] for i in refs if i in sources]
+            )
+    match_spacing_statements(statements, sources.values())
+    return {
+        "source_artifacts": evidence,
+        "quantities": [
+            {"value_as_displayed": value, "unit": unit, "is_uncertainty": unc}
+            for value, unit, unc in statements
+        ],
+    }
+
+
+def match_spacing_statements(statements, sources):
+    values = [row for source in sources for rows in source.values() for row in rows]
+    last = values
+    for number, unit, uncertainty in statements:
+        scale = length_scale(unit)
+        if uncertainty:
+            require(
+                any(
+                    err is not None
+                    and float(number.replace(",", ".")) >= 0
+                    and matches_displayed(number, scale, err)
+                    for _, err in last
+                ),
+                "reported_spacing_uncertainty_mismatch",
+            )
+        else:
+            last = [
+                pair
+                for pair in values
+                if float(number.replace(",", ".")) > 0 and matches_displayed(number, scale, pair[0])
+            ]
+            require(last, "reported_spacing_value_or_unit_mismatch")
 
 
 def gpa_submission(turn, runs):
@@ -1701,6 +1957,9 @@ def verify(spec_path, *, bundle=None, root=None, project=None):
                 "claim_not_grounded_in_observed_answer_and_evidence",
             )
             result["claims"].append({"quote_sha256": text_digest(quote), "artifact_ids": refs})
+        if spec["case_id"] == "J01":
+            result["spacing_answer"] = check_spacing_answer(final, claims, runs, returned)
+            checks["quoted_spacing_consistency"] = "passed"
         checks["answer_return"] = "passed"
         host_observations(spec, base, turns + children, calls, result)
         observed(runtime is not None, "no_verified_release_binding")

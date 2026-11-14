@@ -14,6 +14,145 @@ def write_json(path, data):
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
+@pytest.fixture
+def spacing_run(tmp_path):
+    steps = [
+        {"step_id": op, "operation_id": op, "status": "completed"}
+        for op in verifier.OPERATIONS["J01"]
+    ]
+    run = {
+        "run_id": "r",
+        "modality": "HRTEM",
+        "status": "completed",
+        "_directory": tmp_path,
+        "steps": steps,
+        "artifacts": {},
+        "jobs": [],
+        "physical_measurements": [],
+    }
+
+    def artifact(role, content, step="diffraction.metrics", suffix="json"):
+        aid = f"{len(run['artifacts']) + 1:032x}"
+        path = tmp_path / f"{aid}.{suffix}"
+        path.write_text(content, encoding="utf-8")
+        run["artifacts"][aid] = {
+            "role": role,
+            "step_id": step,
+            "file": path.name,
+            "sha256": verifier.digest(path),
+            "execution_usable": step != "_report",
+        }
+        return aid
+
+    data = [
+        {"value": val, "unit": "nm", "uncertainty": err}
+        for val, err in [(0.15999999999999, None), (0.2448, 0.003)]
+    ]
+    metric = artifact(
+        "diffraction", json.dumps({"d_spacings": data, "provenance": {"physical": True}})
+    )
+    run["physical_measurements"].append({"artifact_id": metric, "units": ["nm"]})
+    table = artifact(
+        "d_spacing_table",
+        "value,unit,uncertainty\n0.15999999999999,nm,\n0.2448,nm,0.003\n",
+        suffix="csv",
+    )
+    g_table = artifact(
+        "g_vector_table", "magnitude\n\"{'value': 6.25, 'unit': '1/nm'}\"\n", suffix="csv"
+    )
+    manifest = artifact(
+        "report_manifest",
+        json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "artifact_id": table,
+                        "sha256": run["artifacts"][table]["sha256"],
+                        "execution_usable": True,
+                    },
+                ]
+            }
+        ),
+        "_report",
+    )
+    html = artifact("report_html", f'<a href="{metric}.json">spacing</a>', "_report", "html")
+    peak = artifact("peak_table", "x,y\n2,4\n", "diffraction.fft", "csv")
+    return run, {
+        "metric": metric,
+        "table": table,
+        "g": g_table,
+        "manifest": manifest,
+        "html": html,
+        "peak": peak,
+    }
+
+
+@pytest.mark.parametrize(
+    ("statement", "source"),
+    [
+        ("晶格间距约为 **160 pm**。", "metric"),
+        ("The interplanar distances are 1.60 and 2.45 Å.", "table"),
+        ("Espacement : 0,160 nm.", "g"),
+        ("d = 2.448e-1 ± 0.003 nm", "manifest"),
+        ("|peak|d-spacing (µm)|\n|---|---|\n|1|0.000160|", "html"),
+    ],
+)
+def test_returned_spacing_from_registered_result_table_or_report(spacing_run, statement, source):
+    run, ids = spacing_run
+    ref = ids[source]
+    answer = f"{statement}\nSource: {ref}"
+    checked = verifier.check_spacing_answer(
+        answer, [{"quote": statement, "artifact_ids": [ref]}], {"r": run}, {ref}
+    )
+    assert checked["quantities"] and checked["source_artifacts"][ref]["run_id"] == "r"
+    assert checked["source_artifacts"][ref]["citation_sha256"] == run["artifacts"][ref]["sha256"]
+
+
+@pytest.mark.parametrize(
+    ("statement", "source", "reason"),
+    [
+        ("间距 9.876 nm", "metric", "spacing_value_or_unit"),
+        ("d = 0.160 pm", "table", "spacing_value_or_unit"),
+        (
+            "The measured spacing is 0.160 nm. Its uncertainty is ±0.003 nm.",
+            "metric",
+            "spacing_uncertainty",
+        ),
+        ("Spacings 0.160 nm and 4.999 nm.", "manifest", "spacing_value_or_unit"),
+        ("| d (pm) |\n|---|\n| 0.160 |", "html", "spacing_value_or_unit"),
+        ("d = 0.16 nm", "peak", "spacing_source_not_cited"),
+        (
+            "Only the FFT and the report are available.",
+            "table",
+            "spacing_value_and_unit_not_observed",
+        ),
+    ],
+)
+def test_spacing_claim_rejects_mismatch_and_requires_quantitative_evidence(
+    spacing_run, statement, source, reason
+):
+    run, ids = spacing_run
+    ref = ids[source]
+    with pytest.raises(verifier.EvidenceError, match=reason):
+        verifier.check_spacing_answer(
+            f"{statement}\n{ref}", [{"quote": statement, "artifact_ids": [ref]}], {"r": run}, {ref}
+        )
+
+
+def test_explicit_spacing_source_cannot_be_borrowed_from_another_claim_or_run(spacing_run):
+    run, ids = spacing_run
+    answer = f"The measured spacing is 0.160 nm. {ids['peak']}\nSource: {ids['metric']}"
+    claims = [
+        {"quote": answer.splitlines()[0], "artifact_ids": [ids["peak"]]},
+        {"quote": answer.splitlines()[1], "artifact_ids": [ids["metric"]]},
+    ]
+    with pytest.raises(verifier.EvidenceError, match="spacing_claim_has_no_quantitative_source"):
+        verifier.check_spacing_answer(answer, claims, {"r": run}, set(ids.values()))
+    other = "f" * 32
+    with pytest.raises(verifier.EvidenceError, match="unreturned_artifact"):
+        verifier.check_spacing_answer(answer + " " + other, claims, {"r": run}, set(ids.values()))
+
+
 def test_j02_requires_same_raw_refinement_and_physical_distances(tmp_path):
     products = [
         ("input.load", "raw", {}),
