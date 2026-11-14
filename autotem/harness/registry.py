@@ -57,8 +57,16 @@ def role_schema(role: str) -> dict:
     }
 
 
-@lru_cache(maxsize=128)
 def probe_dependency(name: str) -> dict:
+    try:
+        return _cached_dependency(name)
+    except subprocess.TimeoutExpired:
+        # A timeout describes this attempt. The next request must be able to probe again.
+        return {"state": "dependency_broken", "dependency": name, "reason": "import_timeout"}
+
+
+@lru_cache(maxsize=128)
+def _cached_dependency(name: str) -> dict:
     # Import health is isolated: a broken optional extension must not crash the host.
     code = (
         "import importlib,importlib.util,json,sys; n=sys.argv[1]; "
@@ -66,13 +74,10 @@ def probe_dependency(name: str) -> dict:
         "print(json.dumps({'found':s is not None})); "
         "importlib.import_module(n) if s else None"
     )
-    try:
-        options = ["-I"] if sys.flags.isolated else []
-        result = subprocess.run(
-            [sys.executable, *options, "-c", code, name], capture_output=True, text=True, timeout=8
-        )
-    except subprocess.TimeoutExpired:
-        return {"state": "dependency_broken", "dependency": name, "reason": "import_timeout"}
+    options = ["-I"] if sys.flags.isolated else []
+    result = subprocess.run(
+        [sys.executable, *options, "-c", code, name], capture_output=True, text=True, timeout=8
+    )
     if result.returncode:
         missing = "ModuleNotFoundError" in result.stderr and "No module named" in result.stderr
         # A missing transitive dependency is a broken installation, not an absent backend.
@@ -122,11 +127,13 @@ class OperationRegistry:
         except KeyError as exc:
             raise HarnessError("UNKNOWN_OPERATION", operation_id) from exc
 
-    def availability(self, definition: OperationDefinition) -> dict:
+    def availability(self, definition: OperationDefinition, *, probe=None) -> dict:
         if definition.implementation_status == "reserved":
             return {"state": "unsupported_input", "code": "DEFERRED_THIS_PHASE"}
+        if probe is None:
+            probe = probe_dependency
         for name in definition.dependencies:
-            result = probe_dependency(name)
+            result = probe(name)
             if result["state"] != "available":
                 return result
         return {"state": "available"}
@@ -146,6 +153,8 @@ class OperationRegistry:
 
     def capabilities(self) -> list[dict]:
         result = []
+        # Shared dependencies should consume only one import budget per inventory request.
+        probe = lru_cache(maxsize=None)(probe_dependency)
         for definition in self.operations.values():
             handler = definition.handler
             result.append(
@@ -155,7 +164,7 @@ class OperationRegistry:
                     "profile_id": definition.profile_id,
                     "description": definition.description,
                     "implementation_status": definition.implementation_status,
-                    "availability": self.availability(definition),
+                    "availability": self.availability(definition, probe=probe),
                     "parameter_schema": definition.parameter_model.model_json_schema(),
                     "input_schema": {role: role_schema(role) for role in definition.input_roles},
                     "output_schema": {role: role_schema(role) for role in definition.output_roles},
