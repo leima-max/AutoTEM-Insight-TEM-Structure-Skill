@@ -20,7 +20,7 @@ from autotem.harness.compiler import compile_legacy_recipe
 from autotem.harness.contracts import HarnessError
 from autotem.io import read_image
 from autotem.preprocessing.quality import load_dataset_array
-from autotem.reporting.harness_evidence import delivery_index
+from autotem.reporting.harness_evidence import claim_html, delivery_index
 
 pytestmark = pytest.mark.smoke
 
@@ -164,14 +164,67 @@ def test_two_strain_methods_keep_complete_arrays_and_choose_plan_order(tmp_path)
         asynchronous=False,
     )
     assert state["status"] == "completed", state["error"]
-    report, _ = published(harness.export_report(state["run_id"], ["json"]))
+    report, files = published(harness.export_report(state["run_id"], ["json", "html"]))
     strain = report["strain_results"]
     assert strain["primary"]["role"] == "atom_strain"
     assert [s["role"] for s in strain["all"]] == ["atom_strain", "gpa"]
+    assert "validity_mask" not in strain["primary"]
+    mask_id = report["result_index"]["gpa.quality_mask"]
+    mask = strain["all"][1]["validity_mask"]
+    assert mask["artifact_id"] == mask_id
+    full = harness.read_artifact(strain["all"][1]["artifact_id"])
+    assert full["validity_mask_artifact_id"] == mask_id
+    assert full["validity_interpretation"] == mask["interpretation"]
+    preview = harness.read_artifact(report["result_index"]["gpa.strain_xx"])
+    assert preview["validity_interpretation"] == mask["interpretation"]
+    assert "Downloaded arrays can contain zeros" in mask["interpretation"]
+    page = files["report_html"].read_text(encoding="utf-8")
+    assert mask["interpretation"] in page
+    assert f'href="{mask_id}.npy">GPA quality mask (gpa)</a>' in page
     for result in strain["all"]:
         strict = StrainResult.model_validate(harness.store.load_json(result["artifact_id"]))
         assert strict.schema_version == "0.1.0" and strict.warnings
         assert np.load(strict.strain_xx.uri, allow_pickle=False).shape == image.shape
+
+
+def test_gpa_report_links_only_the_exact_mask_from_a_delivered_step():
+    run = {"request": {"steps": [
+        {"id": sid, "operation_id": "strain.gpa", "parameters": {}} for sid in ("one", "two")
+    ]}}
+    state = {"events": [], "steps": [
+        {"step_id": sid, "status": "completed"} for sid in ("one", "two")
+    ]}
+
+    def item(step, role, aid, kind):
+        return {"step_id": step, "role": role, "kind": kind, "artifact_id": aid, "size": 150,
+                "execution_usable": True, "path": aid + (".npy" if kind == "array" else ".json")}
+
+    evidence = [
+        item("one", "gpa", "result1", "json"),
+        item("one", "gpa.quality_mask", "mask1", "array"),
+        item("two", "gpa", "result2", "json"),
+        item("two", "gpa.quality_mask", "mask2", "array"),
+    ]
+    # The first JSON was copied from a Windows store. The second refers to a
+    # different step's artifact, even though its own step also has a mask.
+    payload = {"provenance": {"quality_mask": {"uri": r"D:\old\runs\mask1.npy"}}}
+    report = delivery_index(run, state, evidence, lambda aid: payload)
+    first, second = report["strain_results"]["all"]
+    assert first["validity_mask"]["artifact_id"] == "mask1"
+    assert second["validity_mask"]["artifact_id"] is None
+    assert "unavailable" in second["validity_mask"]["interpretation"]
+    html = claim_html(report, evidence)
+    assert 'href="mask1.npy">GPA quality mask (one)</a>' in html
+    assert 'href="mask2.npy">GPA quality mask (two)</a>' not in html
+    assert second["validity_mask"]["interpretation"] in html
+    evidence[0]["size"] = 256_001
+
+    def read_bounded(aid):
+        assert aid != "result1"
+        return payload
+
+    bounded = delivery_index(run, state, evidence, read_bounded)
+    assert bounded["strain_results"]["primary"]["validity_mask"]["artifact_id"] is None
 
 
 def test_missing_committed_id_is_reported_and_optional_failure_cannot_satisfy_a_claim():

@@ -7,6 +7,8 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
+from autotem.harness.gpa_evidence import gpa_result_mask
+
 STRAIN_ROLES = {"strain.gpa": "gpa", "strain.atom": "atom_strain"}
 
 
@@ -69,6 +71,7 @@ def delivery_index(run: dict, state: dict, evidence: list[dict], load_json) -> d
         by_role = defaultdict(list)
         diagnostic = []
         metrics = []
+        gpa_mask_references = {}
         for a in by_step[sid]:
             aid, role = a["artifact_id"], a["role"]
             if (
@@ -83,6 +86,8 @@ def delivery_index(run: dict, state: dict, evidence: list[dict], load_json) -> d
             if a["kind"] == "json" and a["size"] <= 256_000:
                 payload = load_json(aid)
                 if isinstance(payload, dict):
+                    if role == "gpa":
+                        gpa_mask_references[aid] = payload.get("provenance", {}).get("quality_mask")
                     metrics.extend(_measurement_examples(payload, aid))
         present = {aid for ids in by_role.values() for aid in ids}
         missing = sorted(set(refs or ()) - present)
@@ -110,17 +115,20 @@ def delivery_index(run: dict, state: dict, evidence: list[dict], load_json) -> d
         strain_role = STRAIN_ROLES.get(op)
         if strain_role and delivered:
             for aid in by_role.get(strain_role, []):
-                strain.append(
-                    {
-                        "step_id": sid,
-                        "operation_id": op,
-                        "role": strain_role,
-                        "artifact_id": aid,
-                        "required": row["required"],
-                        "scientific_level": row["scientific_level"],
-                        "warnings": row["warnings"],
-                    }
-                )
+                entry = {
+                    "step_id": sid,
+                    "operation_id": op,
+                    "role": strain_role,
+                    "artifact_id": aid,
+                    "required": row["required"],
+                    "scientific_level": row["scientific_level"],
+                    "warnings": row["warnings"],
+                }
+                if strain_role == "gpa":
+                    mask_ids = by_role.get("gpa.quality_mask", [])
+                    masks = [a for a in by_step[sid] if a["artifact_id"] in mask_ids]
+                    entry["validity_mask"] = gpa_result_mask(gpa_mask_references.get(aid), masks)
+                strain.append(entry)
     required = [c for c in claims if c["required"]]
     unmet = [c["step_id"] for c in required if not c["delivered"]]
     primary = next((s for s in strain if s["required"]), strain[0] if strain else None)
@@ -161,6 +169,14 @@ def claim_html(manifest: dict, evidence: list[dict]) -> str:
             f"<p>Primary strain result: {html.escape(primary['step_id'])} "
             f"({html.escape(primary['role'])})</p>"
         )
+    for result in manifest["strain_results"]["all"]:
+        mask = result.get("validity_mask")
+        if mask:
+            label = f"GPA quality mask ({html.escape(result['step_id'])})"
+            if mask["artifact_id"]:
+                url = html.escape(artifacts[mask["artifact_id"]], quote=True)
+                label = f'<a href="{url}">{label}</a>'
+            parts.append(f"<p>{label}. {html.escape(mask['interpretation'])}</p>")
     for claim in manifest["claim_evidence"]:
         links = [
             f'<a href="{html.escape(artifacts[aid], quote=True)}">{html.escape(role)} ({aid})</a>'

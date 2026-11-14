@@ -20,4 +20,6 @@ Optional [Codex native-agent templates](references/native-agents.md) are provide
 
 Uncalibrated inputs can produce pixel candidates/diagnostics; they cannot yield absolute nm/pm measurements or physical phase assignment. Refinement uses raw data; processed/denoised coordinates are candidates. HRTEM contrast is not automatically an atom-column identity. GPA/reference/valid-mask limitations, heuristic confidence, relative intensity and constrained phase hypotheses remain explicit. `not_evaluated` is not pass, and user approval cannot remove a scientific blocker.
 
+For each GPA displacement, strain or rotation result, cite its own step's quality mask. Read arrays and compute summaries only where the mask is true. Masked pixels appear as null in tool previews and can be zero-filled in downloaded arrays. If the mask is unavailable, explain the limitation and withhold measurements for those fields.
+
 Return a concise account of the question, actually executed operations, usable measurements, uncertainty/limits, needs-input or failed tasks, and links/IDs for the evidence. Do not claim frontend opening, native subagent support, actual host installation or general scientific accuracy without their own verification records.

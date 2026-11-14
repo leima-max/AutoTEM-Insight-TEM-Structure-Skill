@@ -23,6 +23,7 @@ from autotem._paths import io_path
 
 from .compiler import compile_plan, validate_graph
 from .contracts import HarnessError
+from .gpa_evidence import GPA_MASK_INTERPRETATION, gpa_result_mask
 from .input_requests import apply_response, parse_response, reject_credentials, rejected_response
 from .registry import default_registry
 from .runtime_binding import record_job_runtime
@@ -937,6 +938,7 @@ class Harness:
                         "ARRAY_VALIDATION_FAILED", "GPA field and quality mask do not match"
                     )
                 result["validity_mask_artifact_id"] = mask_id
+                result["validity_interpretation"] = GPA_MASK_INTERPRETATION
                 result["values"] = [
                     value if ok else None
                     for value, ok in zip(
@@ -950,6 +952,14 @@ class Harness:
                 result["preview_limitation"] = (
                     "JSON exceeds 256 kB; use the verified local reference"
                 )
+            if artifact["role"] == "gpa":
+                reference = result.get("value", {}).get("provenance", {}).get("quality_mask")
+                step_artifacts = self.store.artifacts(
+                    artifact["run_id"], step_id=artifact["step_id"]
+                )
+                mask = gpa_result_mask(reference, step_artifacts)
+                result["validity_mask_artifact_id"] = mask["artifact_id"]
+                result["validity_interpretation"] = mask["interpretation"]
         elif artifact["kind"] == "table":
             with Path(artifact["path"]).open(encoding="utf-8-sig", newline="") as stream:
                 import itertools

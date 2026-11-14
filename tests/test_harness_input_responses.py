@@ -478,9 +478,18 @@ def test_gpa_preview_uses_the_mask_from_the_same_step(tmp_path):
     preview = h.read_artifact(stored["artifact_id"], offset=0, limit=4)
     assert preview["values"] == [None, 0.0, 2.0, None]
     assert preview["validity_mask_artifact_id"] == mask["artifact_id"]
+    assert "Downloaded arrays can contain zeros" in preview["validity_interpretation"]
     assert h.read_artifact(stored["artifact_id"], offset=3, limit=10)["values"] == [None, 4.0, 5.0]
     assert h.read_artifact(mask["artifact_id"])["values"] == valid.ravel().tolist()
     np.testing.assert_array_equal(h.store.load_array(stored["artifact_id"]), field)
+    large = h.store.write_json(
+        rid, "gpa1", "gpa",
+        {"provenance": {"quality_mask": {"uri": mask["path"]}}, "notes": "x" * 256_001},
+    )
+    bounded = h.read_artifact(large["artifact_id"])
+    assert "value" not in bounded and "256 kB" in bounded["preview_limitation"]
+    assert bounded["validity_mask_artifact_id"] is None
+    assert "unavailable" in bounded["validity_interpretation"]
     Path(mask["path"]).write_bytes(b"damaged")
     with pytest.raises(HarnessError):
         h.read_artifact(stored["artifact_id"])
