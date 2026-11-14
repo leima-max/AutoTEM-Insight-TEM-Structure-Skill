@@ -474,6 +474,7 @@ def run_evidence(root, run_id, window, runtime):
         "_questions": question_records,
         "_children": all_children,
         "_request": request,
+        "_directory": directory,
     }
 
 
@@ -817,6 +818,70 @@ def check_gpa_followup(variant, turns, runs, excerpts):
     }
 
 
+def has_matching_gpa_repeat(measurements, completed):
+    """Match the card's comparison to the measured image and normalized plan parameters."""
+
+    def outputs(runs, operation, role):
+        for run in runs:
+            parameters = {step["id"]: step["parameters"] for step in run["_request"]["steps"]}
+            for step in run["steps"]:
+                if step["operation_id"] != operation or step["status"] != "completed":
+                    continue
+                for artifact in run["artifacts"].values():
+                    if (
+                        artifact["role"] == role
+                        and artifact["execution_usable"]
+                        and artifact.get("step_id") == step["step_id"]
+                    ):
+                        yield run, step, parameters[step["step_id"]], artifact
+
+    def image_hash(run, step, config):
+        image_id = step["consumed_artifacts"].get(config.get("image_role", "raw"))
+        return run["artifacts"].get(image_id, {}).get("sha256")
+
+    measured = [
+        (run["source_sha256"], image_hash(run, step, config), config)
+        for run, step, config, _ in outputs(measurements, "strain.gpa", "gpa")
+    ]
+    for run, step, parameters, artifact in outputs(
+        completed, "strain.gpa_compare", "gpa_comparison"
+    ):
+        config = parameters["reference_config"]
+        image = image_hash(run, step, config)
+        if (
+            not image
+            or config != parameters["candidate_config"]
+            or (run["source_sha256"], image, config) not in measured
+        ):
+            continue
+        path = run["_directory"] / artifact["file"]
+        require(digest(path) == artifact["sha256"], "gpa_comparison_artifact_changed")
+        result = unique_json(path.read_text("utf-8"))
+        overlap = result.get("quality", {}).get("intersection_fraction")
+        diagnosis = result.get("diagnosis", {})
+        error = diagnosis.get("max_strain_mae_percent")
+        effective = result.get("config_a")
+        # The service can resolve an omitted physical pixel size from image calibration.
+        compared = {
+            key: value
+            for key, value in config.items()
+            if key not in {"image_role", "absolute_reference", "reference_regions"}
+            and not (key == "pixel_size_nm" and value is None)
+        }
+        if (
+            isinstance(effective, dict)
+            and effective == result.get("config_b")
+            and all(key in effective and effective[key] == value for key, value in compared.items())
+            and type(overlap) in (int, float)
+            and 0 < overlap <= 1
+            and diagnosis.get("configs_aligned") is True
+            and type(error) in (int, float)
+            and error == 0
+        ):
+            return True
+    return False
+
+
 def check_case(case, calls, runs, turns, excerpts, variant=None):
     completed = [r for r in runs.values() if r["status"] == "completed"]
     if variant is not None:
@@ -846,6 +911,11 @@ def check_case(case, calls, runs, turns, excerpts, variant=None):
             and ROLES[case] <= {a["role"] for a in r["artifacts"].values() if a["execution_usable"]}
         ]
         require(candidates, "requested_operations_or_results_missing")
+        if case == "J03":
+            require(
+                has_matching_gpa_repeat(candidates, completed),
+                "same_parameter_gpa_comparison_missing",
+            )
         modalities = {"J01": {"HRTEM"}, "J02": {"HAADF-STEM"}, "J05": {"SAED", "NBED"}}
         if case in modalities:
             require(

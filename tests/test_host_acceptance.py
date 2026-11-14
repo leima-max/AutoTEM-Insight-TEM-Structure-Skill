@@ -14,6 +14,100 @@ def write_json(path, data):
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
+@pytest.mark.parametrize("separate_run", [False, True])
+def test_j03_requires_repeat_of_measured_fields(tmp_path, separate_run):
+    config = {"g_vectors": [[0.125, 0], [0, 0.125]], "reference_region": [16, 48, 16, 48]}
+    measurement = {
+        "status": "completed",
+        "error_code": None,
+        "_directory": tmp_path,
+        "steps": [
+            {
+                "step_id": "g",
+                "operation_id": "strain.gpa",
+                "status": "completed",
+                "consumed_artifacts": {"raw": "image"},
+            }
+        ],
+        "_request": {"steps": [{"id": "g", "parameters": config}]},
+        "artifacts": {
+            k: {"role": k, "step_id": "g", "execution_usable": True} for k in verifier.ROLES["J03"]
+        },
+        "source_sha256": "synthetic-source",
+        "run_id": "gpa",
+    }
+    measurement["artifacts"]["image"] = {
+        "role": "raw",
+        "sha256": "raw-hash",
+        "execution_usable": True,
+    }
+    runs = {"gpa": measurement}
+    with pytest.raises(verifier.EvidenceError, match="same_parameter_gpa_comparison_missing"):
+        verifier.check_case("J03", [], runs, [], {})
+
+    if separate_run:
+        repeat = {
+            **measurement,
+            "run_id": "repeat",
+            "steps": [],
+            "_request": {"steps": []},
+            "artifacts": {"other_id": dict(measurement["artifacts"]["image"])},
+        }
+        runs["repeat"] = repeat
+    else:
+        repeat = measurement
+    raw = "other_id" if separate_run else "image"
+    repeat["steps"].append(
+        {
+            "step_id": "compare",
+            "operation_id": "strain.gpa_compare",
+            "status": "completed",
+            "consumed_artifacts": {"raw": raw},
+        }
+    )
+    parameters = {"reference_config": dict(config), "candidate_config": dict(config)}
+    repeat["_request"]["steps"].append({"id": "compare", "parameters": parameters})
+    artifact = {
+        "role": "gpa_comparison",
+        "step_id": "compare",
+        "execution_usable": True,
+        "file": "compare.json",
+    }
+    repeat["artifacts"]["comparison"] = artifact
+    result = {
+        "config_a": config,
+        "config_b": dict(config),
+        "quality": {"intersection_fraction": 0.62},
+        "diagnosis": {"configs_aligned": True, "max_strain_mae_percent": 0.0},
+    }
+
+    def store():
+        write_json(tmp_path / "compare.json", result)
+        artifact["sha256"] = verifier.digest(tmp_path / "compare.json")
+
+    store()
+    verifier.check_case("J03", [], runs, [], {})
+    result["quality"]["intersection_fraction"] = 0.0
+    store()
+    with pytest.raises(verifier.EvidenceError, match="same_parameter_gpa_comparison_missing"):
+        verifier.check_case("J03", [], runs, [], {})
+    result["quality"]["intersection_fraction"] = 0.62
+    result["config_a"] = result["config_b"] = {**config, "g_vectors": [[0, 0.1], [0.1, 0]]}
+    store()
+    with pytest.raises(verifier.EvidenceError, match="same_parameter_gpa_comparison_missing"):
+        verifier.check_case("J03", [], runs, [], {})
+    result["config_a"] = result["config_b"] = config
+    store()
+    parameters["candidate_config"]["reference_region"] = [20, 40, 20, 40]
+    with pytest.raises(verifier.EvidenceError, match="same_parameter_gpa_comparison_missing"):
+        verifier.check_case("J03", [], runs, [], {})
+    if separate_run:
+        parameters["candidate_config"] = dict(config)
+        repeat["artifacts"][raw]["sha256"] = "different-bytes"
+        with pytest.raises(verifier.EvidenceError, match="same_parameter_gpa_comparison_missing"):
+            verifier.check_case("J03", [], runs, [], {})
+
+
 def sample(tmp_path):
     record = tmp_path / "case.json"
     verifier.main(["init", str(tmp_path), "--host", "codex", "--case", "J10"])
