@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -482,12 +483,19 @@ def test_unknown_host_is_rejected(tmp_path):
 
 
 class MCPProcess:
-    def __init__(self, responses):
-        self.stdin = io.StringIO()
-        self.stdout = io.StringIO("\n".join(json.dumps(response) for response in responses) + "\n")
+    def __init__(self, responses, *, silent=False):
+        self.stdin = io.BytesIO()
+        read_fd, write_fd = os.pipe()
+        self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+        self.writer = os.fdopen(write_fd, "wb", buffering=0)
+        for response in responses:
+            self.writer.write((json.dumps(response) + "\n").encode("utf-8"))
+        if not silent:
+            self.writer.close()
         self.killed = False
 
     def wait(self, timeout):
+        self.writer.close()
         return 0
 
     def kill(self):
@@ -554,22 +562,13 @@ def test_mcp_server_error_is_projected_without_raw_error_details(monkeypatch):
 
 
 def test_mcp_timeout_closes_owned_process_and_streams(monkeypatch):
-    process = MCPProcess([])
-
-    class SilentQueue:
-        def __init__(self, **kwargs):
-            pass
-
-        def put_nowait(self, item):
-            pass
-
-        def get(self, timeout):
-            raise readiness.queue.Empty
-
-    monkeypatch.setattr(readiness.queue, "Queue", SilentQueue)
+    process = MCPProcess([], silent=True)
     monkeypatch.setattr(readiness.subprocess, "Popen", lambda *args, **kwargs: process)
-    result = readiness._mcp_probe("/fake/python", "/scratch", 1)
+    result = readiness._mcp_probe("/fake/python", "/scratch", 0.05)
     assert result["code"] == "MCP_PROBE_TIMEOUT"
+    assert result["diagnostic"]["stage"] == "initialize"
+    assert result["diagnostic"]["last_response"] is None
+    assert result["diagnostic"]["cleanup"] == "closed"
     assert process.stdin.closed and process.stdout.closed
 
 
@@ -660,25 +659,54 @@ def test_mcp_text_only_capability_envelope_is_accepted(monkeypatch):
     assert result["code"] == "LOCAL_MCP_TOOL_CALL_OK"
 
 
-def test_mcp_tool_call_timeout_is_not_successful_discovery(monkeypatch):
-    process = MCPProcess([])
-
-    class TimeoutAfterDiscovery:
-        def __init__(self, **kwargs):
-            self.responses = iter(mcp_initial_responses())
-
-        def put_nowait(self, item):
-            pass
-
-        def get(self, timeout):
-            try:
-                return json.dumps(next(self.responses))
-            except StopIteration:
-                raise readiness.queue.Empty from None
-
-    monkeypatch.setattr(readiness.queue, "Queue", TimeoutAfterDiscovery)
+@pytest.mark.parametrize(("count", "stage", "previous"), [
+    (1, "tools/list", "initialize"), (2, "tools/call", "tools/list"),
+])
+def test_mcp_timeout_keeps_the_last_completed_exchange(monkeypatch, count, stage, previous):
+    process = MCPProcess(mcp_initial_responses()[:count], silent=True)
     monkeypatch.setattr(readiness.subprocess, "Popen", lambda *args, **kwargs: process)
-    result = readiness._mcp_probe("/fake/python", "/scratch", 1)
+    result = readiness._mcp_probe("/fake/python", "/scratch", 0.05)
     assert result["code"] == "MCP_PROBE_TIMEOUT"
     assert result["status"] == "blocked"
+    assert result["diagnostic"]["stage"] == stage
+    assert result["diagnostic"]["last_response"] == previous
     assert process.stdin.closed and process.stdout.closed
+
+
+def test_mcp_timeout_can_close_while_another_process_holds_stdout(monkeypatch):
+    process = MCPProcess([], silent=True)
+    # Hold an extra writer just as an inheriting descendant would. The caller cannot close it.
+    # Release by a timer so this test also finishes on the historical blocking implementation.
+    import threading
+    import time
+
+    extra_writer = os.fdopen(os.dup(process.writer.fileno()), "wb", buffering=0)
+    release = threading.Timer(3.0, extra_writer.close)
+    release.start()
+    monkeypatch.setattr(readiness.subprocess, "Popen", lambda *args, **kwargs: process)
+    try:
+        started = time.monotonic()
+        result = readiness._mcp_probe("/fake/python", "/scratch", 0.05)
+        assert time.monotonic() - started < 2.0
+        assert not extra_writer.closed and process.stdout.closed
+        assert result["code"] == "MCP_PROBE_TIMEOUT" and result["diagnostic"]["cleanup"] == "closed"
+    finally:
+        release.cancel()
+        release.join()
+        extra_writer.close()
+
+
+def test_mcp_partial_and_coalesced_reply_bytes_keep_framing(monkeypatch):
+    import time
+
+    monkeypatch.setattr(readiness, "MAX_OUTPUT_BYTES", 8)
+    fragments = iter([b"a", b"b\nc\nd", b"\n", b"tail", b"", b""])
+    buffered = bytearray()
+    def read(size):
+        return next(fragments)
+
+    deadline = time.monotonic() + 5
+    assert [readiness._mcp_line(read, buffered, deadline) for _ in range(5)] == [
+        b"ab", b"c", b"d", b"tail", None,
+    ]
+    assert readiness._mcp_line(lambda size: b"x" * size, bytearray(), deadline) is None

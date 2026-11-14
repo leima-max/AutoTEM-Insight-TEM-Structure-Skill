@@ -64,7 +64,10 @@ def install_timeout(project, monkeypatch, *, missing_gate=False, wrong_wheel=Fal
             "readiness": {
                 "runtime": {
                     "status": "ready",
-                    "local_mcp": {"status": "blocked", "code": "MCP_PROBE_TIMEOUT"},
+                    "local_mcp": {
+                        "status": "blocked", "code": "MCP_PROBE_TIMEOUT",
+                        "diagnostic": {"stage": "tools/call", "last_response": "tools/list"},
+                    },
                 }
             },
         }
@@ -130,8 +133,11 @@ def test_incomplete_inventory_preserves_original_transport_diagnosis(release_pro
     failure = install_timeout(project, monkeypatch)
     assert failure["staged_file_ownership"] == "not_established"
     txn = managed._record_path(project / ".autotem", failure["installation_id"])
-    assert "runtime_inventory_sha256" not in json.loads(txn.read_bytes())
+    stored = json.loads(txn.read_bytes())
+    assert "runtime_inventory_sha256" not in stored
     assert failure["runtime_diagnostic"]["local_mcp"]["code"] == "MCP_PROBE_TIMEOUT"
+    assert stored["runtime_diagnostic"] == failure["runtime_diagnostic"]
+    assert stored["runtime_diagnostic"]["local_mcp"]["diagnostic"]["stage"] == "tools/call"
 
 
 @pytest.mark.parametrize("options", [{"missing_gate": True}, {"wrong_wheel": True}])

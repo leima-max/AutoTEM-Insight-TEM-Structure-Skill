@@ -13,13 +13,11 @@ from __future__ import annotations
 import json
 import math
 import os
-import queue
 import re
 import shutil
 import stat
 import subprocess
 import sys
-import threading
 import time
 import uuid
 from pathlib import Path
@@ -123,6 +121,70 @@ def _missing_module(probe: dict) -> str | None:
     return name if name in {*CORE_MODULES, "autotem", "mcp"} else None
 
 
+def _nonblocking_stdout(stream):
+    """Read an anonymous child pipe without a reader thread or a wait on another writer."""
+    fd = stream.fileno()
+    if os.name == "nt" and sys.version_info < (3, 12):
+        # os.set_blocking gained Windows pipe support in Python 3.12.
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        peek = ctypes.WinDLL("kernel32", use_last_error=True).PeekNamedPipe
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(fd))
+        available = wintypes.DWORD()
+
+        def read_available(size):
+            # We own the pipe's only reader, so another reader cannot drain this byte count.
+            if not peek(handle, None, 0, None, ctypes.byref(available), None):
+                error = ctypes.get_last_error()
+                if error in (109, 233):  # ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED
+                    return b""
+                raise ctypes.WinError(error)
+            return os.read(fd, min(size, available.value)) if available.value else None
+
+        return read_available
+
+    os.set_blocking(fd, False)
+
+    def read(size):
+        try:
+            return os.read(fd, size)
+        except BlockingIOError:
+            return None
+
+    return read
+
+
+def _mcp_line(read, buffered: bytearray, deadline: float) -> bytes | None:
+    """Return one bounded JSON line (or EOF), retaining any following partial reply."""
+    scanned = 0
+    while True:
+        newline = buffered.find(b"\n", scanned)
+        if newline >= 0:
+            if newline + 1 > MAX_OUTPUT_BYTES:
+                return None
+            line = bytes(buffered[:newline])
+            del buffered[:newline + 1]
+            return line
+        if len(buffered) >= MAX_OUTPUT_BYTES:
+            return None
+        scanned = len(buffered)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        chunk = read(min(65536, MAX_OUTPUT_BYTES - len(buffered)))
+        if chunk is None:
+            time.sleep(min(0.01, remaining))
+        elif chunk:
+            buffered.extend(chunk)
+        else:
+            # Text streams also accept a final line that ends at EOF without a newline.
+            line = bytes(buffered)
+            buffered.clear()
+            return line or None
+
+
 def _mcp_probe(python: str, root: str, timeout: float) -> dict:
     """Real initialize, tool discovery and capability call; no host/LLM launch."""
     messages = [
@@ -143,47 +205,41 @@ def _mcp_probe(python: str, root: str, timeout: float) -> dict:
         "stdin": subprocess.PIPE,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.DEVNULL,
-        "encoding": "utf-8",
         "shell": False,
+        "bufsize": 0,
     }
     if os.name == "nt":
         options["creationflags"] = subprocess.CREATE_NO_WINDOW
     process = None
-    reader = None
-    received: queue.Queue = queue.Queue(maxsize=8)
-
-    def collect(stream):
-        try:
-            for _ in range(8):
-                line = stream.readline(MAX_OUTPUT_BYTES + 1)
-                if not line:
-                    received.put_nowait(None)
-                    return
-                if len(line) > MAX_OUTPUT_BYTES:
-                    received.put_nowait(None)
-                    return
-                received.put_nowait(line)
-        except (OSError, ValueError, queue.Full):
-            return
+    timeout_detail = None
+    stage = "initialize"
+    last_response = None
+    started = time.monotonic()
+    stage_started = started
+    cleanup = "closed"
 
     try:
         process = subprocess.Popen(
             [python, "-I", "-m", "autotem.harness.cli", "--root", root, "mcp"], **options
         )
-        reader = threading.Thread(target=collect, args=(process.stdout,), daemon=True)
-        reader.start()
-        deadline = time.monotonic() + timeout
+        read = _nonblocking_stdout(process.stdout)
+        buffered = bytearray()
+        started = time.monotonic()
+        deadline = started + timeout
         responses = {}
         for message in messages:
-            process.stdin.write(json.dumps(message) + "\n")
+            stage = message["method"]
+            stage_started = time.monotonic()
+            process.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
             process.stdin.flush()
             if "id" not in message:
                 continue
-            line = received.get(timeout=max(0.001, deadline - time.monotonic()))
+            line = _mcp_line(read, buffered, deadline)
             response = _json_object({"stdout": line}) if line is not None else None
             if response is None or response.get("id") != message["id"] or "error" in response:
                 return {"status": "blocked", "code": "MCP_PROTOCOL_FAILED"}
             responses[message["id"]] = response.get("result")
+            last_response = stage
         initialized = responses.get(1)
         listed = responses.get(2)
         tools = listed.get("tools") if isinstance(listed, dict) else None
@@ -217,9 +273,11 @@ def _mcp_probe(python: str, root: str, timeout: float) -> dict:
             "method": "tools/call",
             "params": {"name": "list_capabilities", "arguments": {}},
         }
-        process.stdin.write(json.dumps(call) + "\n")
+        stage = call["method"]
+        stage_started = time.monotonic()
+        process.stdin.write((json.dumps(call) + "\n").encode("utf-8"))
         process.stdin.flush()
-        line = received.get(timeout=max(0.001, deadline - time.monotonic()))
+        line = _mcp_line(read, buffered, deadline)
         response = _json_object({"stdout": line}) if line is not None else None
         if response is None or response.get("id") != 3 or "error" in response:
             return {"status": "blocked", "code": "MCP_TOOL_CALL_FAILED"}
@@ -262,12 +320,21 @@ def _mcp_probe(python: str, root: str, timeout: float) -> dict:
             "tool_count": len(names),
             "operation_count": len(operations),
         }
-    except queue.Empty:
-        return {"status": "blocked", "code": "MCP_PROBE_TIMEOUT"}
+    except TimeoutError:
+        ended = time.monotonic()
+        timeout_detail = {
+            "stage": stage,
+            "last_response": last_response,
+            "budget_seconds": timeout,
+            "elapsed_seconds": round(ended - started, 3),
+            "stage_seconds": round(ended - stage_started, 3),
+        }
+        return {"status": "blocked", "code": "MCP_PROBE_TIMEOUT", "diagnostic": timeout_detail}
     except (OSError, ValueError, TypeError):
         return {"status": "blocked", "code": "MCP_PROCESS_FAILED"}
     finally:
         if process is not None:
+            cleanup_started = time.monotonic()
             if process.stdin:
                 try:
                     process.stdin.close()
@@ -276,12 +343,18 @@ def _mcp_probe(python: str, root: str, timeout: float) -> dict:
             try:
                 process.wait(timeout=min(2.0, timeout))
             except subprocess.TimeoutExpired:
+                cleanup = "direct_child_killed"
                 process.kill()
-                process.wait(timeout=2)
-            if reader:
-                reader.join(timeout=1)
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    cleanup = "direct_child_exit_unconfirmed"
             if process.stdout:
                 process.stdout.close()
+            if timeout_detail is not None:
+                timeout_detail.update(
+                    cleanup=cleanup, cleanup_seconds=round(time.monotonic() - cleanup_started, 3)
+                )
 
 
 def _runtime(python: str | None, timeout: float, project_root: Path | None = None) -> dict:
