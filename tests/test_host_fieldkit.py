@@ -7,6 +7,7 @@ import pytest
 from PIL import Image
 
 from tools.host_acceptance import prepare_fieldkit as kit
+from tools.host_acceptance.operator import collect as operator
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -17,7 +18,14 @@ def release_sources(tmp_path, request):
     bundle.mkdir()
     matrix = kit.HERE / "matrix.json"
     source = bundle / "sources.zip"
-    original = {name: (ROOT / name).read_bytes() for name in kit.INPUT_SOURCES}
+    original = {
+        name: (ROOT / name).read_bytes()
+        for name in (
+            *kit.INPUT_SOURCES,
+            "tools/host_acceptance/field_capture.py",
+            "tools/host_acceptance/README.md",
+        )
+    }
     if getattr(request, "param", None) == "gpa":
         original[kit.GPA_CARD_SOURCE] = (ROOT / kit.GPA_CARD_SOURCE).read_bytes()
     with ZipFile(source, "w") as archive:
@@ -81,6 +89,84 @@ def test_optional_gpa_card_is_frozen_without_expanding_required_cards(tmp_path, 
     (destination / "index.json").write_bytes(kit.as_json(spec))
     with pytest.raises(ValueError, match="GPA follow-up card differs from frozen source"):
         kit.verify(destination, bundle, index, matrix)
+
+
+def test_pack_operator_preserves_card_bytes_and_refuses_existing_output(tmp_path, release_sources):
+    bundle, index, matrix = release_sources
+    root = tmp_path / "现场验收"
+    spec = kit.prepare(root, bundle, index, matrix)
+    output = tmp_path / "operator.zip"
+    args = [
+        "pack-operator",
+        str(root),
+        "--release",
+        str(bundle),
+        "--release-index",
+        str(index),
+        "--out",
+        str(output),
+    ]
+    assert kit.main(args) == 0
+    with ZipFile(output) as archive:
+        assert archive.read("现场验收/index.json") == (root / "index.json").read_bytes()
+        for name, expected in spec["files_sha256"].items():
+            assert kit.sha(archive.read("现场验收/" + name)) == expected
+        assert (
+            archive.read("现场取证/field_capture.py")
+            == (kit.HERE / "field_capture.py").read_bytes()
+        )
+        assert (
+            archive.read("现场取证/Collect.ps1") == (kit.HERE / "operator/Collect.ps1").read_bytes()
+        )
+    before = output.read_bytes()
+    with pytest.raises(SystemExit) as existing:
+        kit.main(args)
+    assert existing.value.code == 2 and output.read_bytes() == before
+
+
+def test_external_operator_stages_only_first_prompt_inputs(tmp_path, release_sources):
+    root = tmp_path / "operator" / "现场验收"
+    root.parent.mkdir()
+    bundle, index, matrix = release_sources
+    spec = kit.prepare(root, bundle, index, matrix)
+    project = tmp_path / "受测项目"
+    project.mkdir()
+    inputs = project / root.name / "inputs"
+    operator.stage_inputs(project, root, spec, [])
+    assert not inputs.parent.exists()
+    card = next(row for row in spec["cards"] if row["variant"] == "numerical_failure")
+    keys = operator.first_inputs(root, card, "J11", "numerical_failure")
+    assert keys == ["nbed"] and card["inputs"] == ["nbed", "flat"]
+    operator.stage_inputs(project, root, spec, keys)
+    operator.stage_inputs(project, root, spec, keys)
+    relative = spec["inputs"]["nbed"]["path"]
+    assert [p.relative_to(project).as_posix() for p in project.rglob("*") if p.is_file()] == [
+        root.name + "/" + relative
+    ]
+    assert (project / root.name / relative).read_bytes() == (root / relative).read_bytes()
+    target = project / root.name / spec["inputs"]["flat"]["path"]
+    target.write_bytes(b"participant data")
+    with pytest.raises(ValueError, match="Different project input"):
+        operator.stage_inputs(project, root, spec, ["j02", "flat"])
+    assert target.read_bytes() == b"participant data"
+    assert not (project / root.name / spec["inputs"]["j02"]["path"]).exists()
+
+
+def test_previous_colocated_guide_can_still_be_verified(tmp_path, release_sources):
+    root = tmp_path / "现场验收"
+    bundle, index, matrix = release_sources
+    spec = kit.prepare(root, bundle, index, matrix)
+    assert spec["schema_version"] == 2 and "受测项目外" in (root / "README.md").read_text("utf8")
+    rows = kit.render_rows(
+        kit.load(matrix),
+        [kit.load(root / "basis" / (name + ".zh-CN.json")) for name in ("science", "operations")],
+        root.name,
+    )
+    (root / "README.md").write_bytes(kit.guide(rows, spec["release"], version=1))
+    spec["schema_version"] = 1
+    spec["files_sha256"]["README.md"] = kit.file_sha(root / "README.md")
+    (root / "index.json").write_bytes(kit.as_json(spec))
+    assert kit.verify(root, bundle, index, matrix) == spec
 
 
 def test_portable_operator_cards_make_and_verify_only_synthetic_inputs(tmp_path, release_sources):

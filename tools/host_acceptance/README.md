@@ -1,5 +1,11 @@
 # 三宿主真实旅程取证
 
+维护者可为已有的中文现场材料生成 Windows 收件包。用发行环境的 Python 执行以下命令，指向已通过校验的卡片目录、解压后的核心发行目录和本次正式资格索引。输出文件使用新路径。压缩包在卡片目录旁附带 PowerShell 入口、源自该版的核验助手和填写指南，现场操作者使用项目私有 Python。[Windows 使用说明](operator/README.md)
+
+```powershell
+& $python -I -B -X utf8 .\tools\host_acceptance\prepare_fieldkit.py pack-operator $kit --release $release --release-index $index --out $newZip
+```
+
 J08 提供独立的 [GPA 选峰与参考区现场卡](field/J08-GPA.zh-CN.md)。使用支持这些变体的发行包，初始化时可在 `init <目录> --host codex --case J08` 后加 `--variant gpa_answered`、`--variant gpa_unanswered` 或 `--variant gpa_invalid_reply`。现场脚本会使用原安装包的冻结校验器。已登记的原子应变记录保留其原变体；GPA 专项结果按宿主单列，使用 J03 合成 HRTEM 输入。
 
 此工具读取已经发生的宿主调用和 Harness 登记产物。每一份记录对应一个宿主版本、一次会话、一个 J01–J15 场景和一个发行包。原始输入、宿主日志、截图、原话和 SQLite 保留在操作者的本地证据目录。可分发摘要包含哈希、运行标识、角色、形状及逐项判定。科学精度保留为 `not_evaluated`。

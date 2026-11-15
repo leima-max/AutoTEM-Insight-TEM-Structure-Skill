@@ -13,12 +13,13 @@ $qualification = (Resolve-Path -LiteralPath (Read-Host '同版资格索引 JSON 
 $matrix = (Resolve-Path -LiteralPath 'tools/host_acceptance/matrix.json').Path
 $active = Get-Content -Raw -LiteralPath (Join-Path $trial '.autotem/active-runtime.json') | ConvertFrom-Json
 $python = Join-Path $trial ".autotem/runtimes/$($active.runtime_id)/Scripts/python.exe"
-$kit = Join-Path $trial '现场验收'
+$operator = (Resolve-Path -LiteralPath (Read-Host '受测项目外的操作员目录')).Path
+$kit = Join-Path $operator '现场验收'
 & $python -I -B tools/host_acceptance/prepare_fieldkit.py prepare --release $bundle --release-index $qualification --matrix $matrix --out $kit
 & $python -I -B tools/host_acceptance/prepare_fieldkit.py verify $kit --release $bundle --release-index $qualification --matrix $matrix
 ```
 
-打开 `现场验收/README.md` 选卡。目录可以整体移到另一项目根目录，保留目录名即可使用卡中的相对路径。`index.json` 记录各个文件的 SHA-256、数组形状和输入来源。外部发行包、资格索引和冻结矩阵可用于独立核对材料身份。已经存在的同版完整材料会被复用，有差异的材料应使用新的目录。
+在操作员目录中打开 `现场验收/README.md` 选卡。完整卡片含预期测量值和各轮追问，保存在受测项目外。使用 Windows 操作包时，`Collect.ps1 init` 会按卡放置首轮输入。手动执行时只复制本轮请求列出的文件，在受测项目里保留 `现场验收/inputs/` 相对路径。`index.json` 记录各个文件的 SHA-256、数组形状和输入来源。外部发行包、资格索引和冻结矩阵可用于独立核对材料身份。[Windows 现场操作](../operator/README.md)
 
 ## 现场执行
 

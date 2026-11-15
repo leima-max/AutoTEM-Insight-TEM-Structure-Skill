@@ -11,8 +11,9 @@ import shutil
 import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from string import Formatter
+from tempfile import TemporaryDirectory
 from uuid import uuid4
-from zipfile import BadZipFile, ZipFile
+from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 
 import numpy as np
 from PIL import Image, ImageSequence
@@ -427,15 +428,21 @@ def card_text(row):
     return "\n".join(lines).encode("utf-8")
 
 
-def guide(rows, identity, *, gpa_card=False):
+def guide(rows, identity, *, gpa_card=False, version=2):
+    location = (
+        "将整个目录放在所选项目根目录，保留目录名。按卡片指定的发行档和条件在真实宿主中执行。"
+        if version == 1 else
+        "将完整卡片和核对材料放在受测项目外。按卡选择发行档、输入和执行条件。"
+        "向宿主发送当前轮的请求，在受测项目中仅放入这一轮使用的输入文件。"
+    )
     lines = [
         "# AutoTEM 宿主现场验收",
         "",
         f"核心发行 {identity['release_id']}，清单 SHA-256 为 "
         f"`{identity['release_manifest_sha256']}`。",
         "",
-        "将整个目录放在所选项目根目录，保留目录名。按卡片指定的发行档和条件在真实宿主中执行。"
-        "请现场决定项目信任和工具权限，记录实际宿主版本、时间、请求、工具调用及运行编号。",
+        location
+        + "请现场决定项目信任和工具权限，记录实际宿主版本、时间、请求、工具调用及运行编号。",
         "",
         "这些卡片和样本供操作使用。结果与原始会话应保存到独立证据目录。",
         "",
@@ -498,7 +505,7 @@ def verify(root, release=None, release_index=None, matrix=None):
     require(all(not linked(p) for p in (root, *root.parents)), "Linked field kit path")
     spec = load(safe_file(root, "index.json"))
     require(
-        spec["schema_version"] == 1
+        spec["schema_version"] in (1, 2)
         and spec["kind"] == GENERATED
         and spec["project_directory"] == root.name,
         "Wrong field kit identity or directory name",
@@ -541,7 +548,7 @@ def verify(root, release=None, release_index=None, matrix=None):
     )
     require(
         safe_file(root, "README.md").read_bytes()
-        == guide(rows, identity, gpa_card=GPA_CARD_SOURCE in src),
+        == guide(rows, identity, gpa_card=GPA_CARD_SOURCE in src, version=spec["schema_version"]),
         "Field kit guide differs from its cards",
     )
     expected = {"README.md", *("basis/" + n for n in BINDINGS)}
@@ -658,7 +665,7 @@ def prepare(out, release, release_index, matrix, *, templates=HERE / "field"):
                 **input_info(root / "inputs", key),
             }
         index = {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": GENERATED,
             "project_directory": out.name,
             "release": identity,
@@ -680,11 +687,70 @@ def prepare(out, release, release_index, matrix, *, templates=HERE / "field"):
         shutil.rmtree(stage)
 
 
+def pack_operator(kit, release, release_index, output):
+    """Attach the Windows entry point beside the verified field kit."""
+    require(kit.name == "现场验收", "Use the field kit prepared with the directory name 现场验收")
+    index = verify(kit, release, release_index)
+    index_bytes = safe_file(kit, "index.json").read_bytes()
+    require(json.loads(index_bytes) == index, "Field index changed during packaging")
+    files = {"现场验收/index.json": index_bytes}
+    for name, expected in index["files_sha256"].items():
+        contents = safe_file(kit, name).read_bytes()
+        require(sha(contents) == expected, f"Changed field kit member: {name}")
+        files["现场验收/" + name] = contents
+    manifest = load(safe_file(release, "release-manifest.json"))
+    source = safe_file(release, manifest["source"]["archive"])
+    with source.open("rb") as frozen:
+        require(
+            hashlib.file_digest(frozen, "sha256").hexdigest()
+            == index["release"]["source_archive_sha256"],
+            "Changed release source archive",
+        )
+        with ZipFile(frozen) as archive:
+            helper = archive.read("tools/host_acceptance/field_capture.py")
+            guide = archive.read("tools/host_acceptance/README.md").decode("utf-8")
+    section = guide[guide.index("## 本地记录") : guide.index("## 验证与复审")]
+    files["现场取证/取证格式.md"] = ("# 填写本次真实会话记录\n\n" + section).encode("utf-8")
+    files["现场取证/field_capture.py"] = helper
+    files["现场取证/binding.json"] = as_json(
+        {
+            "kit_index_sha256": sha(index_bytes),
+            "release_index_sha256": index["release"]["release_index_sha256"],
+        }
+    )
+    for name in ("Collect.ps1", "collect.py", "README.md"):
+        files["现场取证/" + name] = (HERE / "operator" / name).read_bytes()
+    require(
+        not output.resolve().is_relative_to(kit.resolve()),
+        "Place the ZIP outside the verified field kit",
+    )
+    with TemporaryDirectory(dir=output.parent) as folder:
+        staged = Path(folder) / "operator.zip"
+        with ZipFile(staged, "x", compression=ZIP_DEFLATED) as archive:
+            for name, payload in sorted(files.items()):
+                archive.writestr(name, payload)
+        with ZipFile(staged) as archive:
+            require(
+                set(archive.namelist()) == files.keys()
+                and all(archive.read(n) == b for n, b in files.items()),
+                "Operator ZIP readback failed",
+            )
+        os.link(staged, output)
+    return index
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest="action", required=True)
     build = actions.add_parser("prepare", help="Create or reuse an intact field kit")
     check = actions.add_parser("verify", help="Verify a field kit offline")
+    pack = actions.add_parser(
+        "pack-operator", help="Package a qualified Windows field kit with a capture entry point"
+    )
+    pack.add_argument("kit", type=Path)
+    pack.add_argument("--out", required=True, type=Path)
+    pack.add_argument("--release", required=True, type=Path)
+    pack.add_argument("--release-index", required=True, type=Path)
     build.add_argument("--out", required=True, type=Path)
     check.add_argument("kit", type=Path)
     for action in (build, check):
@@ -697,6 +763,8 @@ def main(argv=None):
     try:
         if args.action == "prepare":
             index = prepare(args.out, args.release, args.release_index, args.matrix)
+        elif args.action == "pack-operator":
+            index = pack_operator(args.kit, args.release, args.release_index, args.out)
         else:
             index = verify(args.kit, args.release, args.release_index, args.matrix)
         print(
