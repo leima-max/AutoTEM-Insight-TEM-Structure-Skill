@@ -593,14 +593,42 @@ def resolve_calibration(ctx: OperationContext, params: dict) -> ServiceResult:
     p = validated(CalibrationParameters, params)
     image_array(ctx.array("raw"))
     dataset = ctx.model("dataset", TEMDataset)
-    values = p.model_dump(exclude_none=True, exclude={"require_physical"})
-    reference = {
-        key: values[key]
-        for key in ("reference_length", "reference_pixels", "reference_unit")
-        if key in values
-    }
-    # The legacy resolver may infer a scale bar from image pixels or a filename. The Harness
-    # accepts supplied references/metadata only; unknown calibration remains unknown.
+    return calibration_from_evidence(dataset, p)
+
+
+def calibration_from_evidence(
+    dataset: TEMDataset,
+    p: CalibrationParameters,
+    *,
+    method: str = "auto",
+    reference: dict | None = None,
+    legacy_parameters: dict | None = None,
+) -> ServiceResult:
+    """Resolve physical calibration from supplied references and metadata alone."""
+    values = dict(legacy_parameters or {})
+    supplied = dict(reference or {})
+    nested = values.pop("reference", None)
+    if isinstance(nested, dict):
+        supplied.update(nested)
+    if p.reference_length is not None:
+        manual_reference = {"reference_length", "known_length", "reference_pixels", "pixel_span"}
+        if manual_reference.intersection(supplied):
+            raise HarnessError("INVALID_PARAMETERS", "Specify one manual pixel reference")
+        supplied.update(
+            reference_length=p.reference_length,
+            reference_pixels=p.reference_pixels,
+            reference_unit=p.reference_unit,
+        )
+    if "known_length_unit" not in supplied:
+        supplied.setdefault("reference_unit", p.reference_unit)
+    values.update(
+        p.model_dump(
+            exclude_none=True,
+            exclude={"require_physical"},
+            exclude_unset=legacy_parameters is not None,
+        )
+    )
+    # Withhold the image and filename so a guessed scale bar cannot meet a physical requirement.
     calibration_input = dataset.model_copy(
         update={
             "data": ArrayReference(shape=dataset.data.shape, dtype=dataset.data.dtype),
@@ -608,7 +636,9 @@ def resolve_calibration(ctx: OperationContext, params: dict) -> ServiceResult:
         },
         deep=True,
     )
-    result = calibrate_dataset(calibration_input, reference=reference, parameters=values)
+    result = calibrate_dataset(
+        calibration_input, method=method, reference=supplied, parameters=values
+    )
     if (
         result.transform.get("diffraction_source") == "pixel_size_fft_fallback"
         and len(dataset.data.shape) == 2
@@ -624,15 +654,6 @@ def resolve_calibration(ctx: OperationContext, params: dict) -> ServiceResult:
         }
         result.warnings.append(
             "Rectangular FFT requires per-axis scales; scalar diffraction scale withheld."
-        )
-    # A direct diffraction pattern cannot use a real-space FFT pixel-size fallback.
-    if (
-        dataset.modality in {"SAED", "NBED"}
-        and result.transform.get("diffraction_source") == "pixel_size_fft_fallback"
-    ):
-        result.diffraction_scale = None
-        result.warnings.append(
-            "Direct diffraction requires detector/reference calibration; FFT fallback withheld."
         )
     for measurement in (result.pixel_size, result.diffraction_scale, result.voltage):
         if measurement is not None and (

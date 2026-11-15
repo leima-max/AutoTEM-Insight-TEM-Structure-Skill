@@ -345,12 +345,19 @@ def test_calibration_respects_manual_scale_and_preserves_unknown(tmp_path, monke
 
 
 def test_direct_diffraction_cannot_use_fft_calibration_fallback(tmp_path):
-    ctx = loaded(tmp_path, np.ones((16, 16)), "SAED")
-    result = ctx.call(dq.resolve_calibration, {"pixel_size_nm": 0.2})
-    assert result.outputs["calibration"].diffraction_scale is None
+    ctx = loaded(tmp_path, np.ones((16, 24)), "SAED")
+    detector = {"voltage_kv": 200, "detector_pixel_size_um": 15}
+    result = ctx.call(dq.resolve_calibration, {"pixel_size_nm": 0.2, **detector})
+    calibration = result.outputs["calibration"]
+    assert calibration.diffraction_scale is None and calibration.camera_length is None
+    assert calibration.provenance["diffraction_source"] == "unresolved"
+    assert "fft_per_axis_inv_nm_per_px" not in calibration.transform
     assert result.scientific_level == "diagnostic"
-    result = ctx.call(dq.resolve_calibration, {"known_d_spacing": 0.25, "measured_radius_px": 20.0})
+    result = ctx.call(
+        dq.resolve_calibration, {"known_d_spacing": 0.25, "measured_radius_px": 20.0, **detector}
+    )
     assert result.outputs["calibration"].diffraction_scale.value == pytest.approx(0.2)
+    assert result.outputs["calibration"].camera_length.value > 0
     assert "reciprocal_image" in ctx.arrays
 
 

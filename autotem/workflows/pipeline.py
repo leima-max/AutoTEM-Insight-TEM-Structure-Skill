@@ -714,13 +714,34 @@ class TEMAnalysisSkill:
         reference: dict[str, object] | None = None,
         parameters: dict[str, Any] | None = None,
     ) -> CalibrationResult:
-        calibration = calibrate_dataset(
+        physical_options = {"require_physical", "reference_length", "reference_pixels"}
+        if parameters and physical_options.intersection(parameters):
+            from autotem.services.data_quality import (
+                CalibrationParameters,
+                calibration_from_evidence,
+                validated,
+            )
+
+            extras = dict(parameters)
+            registered = {
+                name: extras.pop(name)
+                for name in CalibrationParameters.model_fields
+                if name in extras
+            }
+            result = calibration_from_evidence(
+                dataset,
+                validated(CalibrationParameters, registered),
+                method=method,
+                reference=reference,
+                legacy_parameters=extras,
+            )
+            return result.outputs["calibration"]
+        return calibrate_dataset(
             dataset,
             method=method,
             reference=reference,
             parameters=parameters,
         )
-        return calibration
 
     def preprocess(
         self,

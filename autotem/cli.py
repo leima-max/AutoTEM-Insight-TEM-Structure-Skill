@@ -297,7 +297,12 @@ def main(argv: list[str] | None = None) -> int:
         except HarnessError as exc:
             print(f"AutoTEM {exc.code}: {exc.message}", file=sys.stderr)
             if exc.code == "NEEDS_INPUT" and exc.details:
-                print("Set workflow.parameters.load in the recipe (--workflow).", file=sys.stderr)
+                fields = {item["name"] for item in exc.details.get("fields", [])}
+                calibration_fields = {"pixel_size_nm", "diffraction_scale_inv_nm_per_px"}
+                group = "calibration" if fields & calibration_fields else "load"
+                print(
+                    f"Set workflow.parameters.{group} in the recipe (--workflow).", file=sys.stderr
+                )
                 print(json.dumps(exc.details, ensure_ascii=True), file=sys.stderr)
             if exc.code.startswith("LEGACY_") or exc.code.startswith("INVALID_"):
                 return EXIT_CONFIG_ERROR

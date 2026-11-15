@@ -354,6 +354,82 @@ def test_minimal_legacy_and_registered_facades_agree_on_disk_input(tmp_path, cap
         np.testing.assert_array_equal(store.load_array(store.role(result["run_id"], "raw")), data)
 
 
+@pytest.mark.parametrize(
+    "modality,options,field",
+    [
+        ("HRTEM", {}, "pixel_size_nm"),
+        ("SAED", {"pixel_size_nm": 0.2}, "diffraction_scale_inv_nm_per_px"),
+        ("NBED", {"pixel_size_nm": 0.2}, "diffraction_scale_inv_nm_per_px"),
+    ],
+)
+def test_legacy_physical_calibration_requests_the_missing_scale(
+    tmp_path, capsys, modality, options, field
+):
+    source = tmp_path / "unknown.npy"
+    np.save(source, np.arange(384, dtype=np.uint16).reshape(16, 24))
+    workflow = {
+        "steps": ["load", "calibrate", "report"],
+        "parameters": {
+            "load": {"modality": modality},
+            "calibration": {"require_physical": True, **options},
+        },
+    }
+    recipe = write_recipe(tmp_path / "calibrate.yaml", {"workflow": workflow})
+    with pytest.raises(HarnessError) as exc:
+        TEMAnalysisSkill().run(source, recipe, tmp_path / "api")
+    assert exc.value.code == "NEEDS_INPUT"
+    assert [item["name"] for item in exc.value.details["fields"]] == [field]
+    command = ["analyze", str(source), "--workflow", str(recipe), "--output", str(tmp_path / "cli")]
+    assert main(command) == EXIT_RUNTIME_ERROR
+    stderr = capsys.readouterr().err
+    assert "workflow.parameters.calibration" in stderr
+    assert json.loads(stderr.splitlines()[-1]) == exc.value.details
+    assert not list(tmp_path.rglob("analysis_report.json"))
+
+
+def test_legacy_manual_calibration_reaches_api_cli_and_strict_exports(tmp_path, capsys):
+    source = tmp_path / "frame.npy"
+    np.save(source, np.arange(384, dtype=np.uint16).reshape(16, 24))
+    reference = {"reference_length": 2000, "reference_unit": "pm", "reference_pixels": 10}
+    workflow = {
+        "steps": ["load", "calibrate", "report"],
+        "parameters": {"load": {"modality": "HRTEM"}, "calibration": reference},
+    }
+    recipe = write_recipe(tmp_path / "reference.yaml", {"workflow": workflow})
+    TEMAnalysisSkill().run(source, recipe, tmp_path / "api")
+    command = ["analyze", str(source), "--workflow", str(recipe), "--output", str(tmp_path / "cli")]
+    assert main(command) == EXIT_OK
+    capsys.readouterr()
+    for out in (tmp_path / "api", tmp_path / "cli"):
+        report = AnalysisReport.model_validate_json((out / "analysis_report.json").read_bytes())
+        summary = RunSummary.model_validate_json((out / "run_summary.json").read_bytes())
+        assert summary.schema_version == report.schema_version == "0.1.0"
+        scale = report.calibration.pixel_size
+        assert scale.value == pytest.approx(0.2) and scale.unit == "nm/pixel"
+        assert scale.method == "manual_reference_length"
+        assert report.calibration.transform["fft_per_axis_inv_nm_per_px"] == pytest.approx(
+            {"x": 1 / 4.8, "y": 1 / 3.2}
+        )
+
+
+def test_physical_requirement_preserves_legacy_reference_units_and_rejects_conflicts(tmp_path):
+    source = tmp_path / "frame.npy"
+    np.save(source, np.arange(16, dtype=np.uint16).reshape(4, 4))
+    skill = TEMAnalysisSkill()
+    dataset = skill.load_data(source)
+    nested = {"known_length": 20, "pixel_span": 10, "known_length_unit": "angstrom"}
+    result = skill.calibrate(dataset, parameters={"require_physical": True, "reference": nested})
+    assert result.pixel_size.value == pytest.approx(0.2)
+    with pytest.raises(HarnessError) as exc:
+        skill.calibrate(
+            dataset, reference=nested, parameters={"reference_length": 3, "reference_pixels": 10}
+        )
+    assert exc.value.code == "INVALID_PARAMETERS"
+    with pytest.raises(HarnessError) as exc:
+        skill.calibrate(dataset, parameters={"reference_pixels": 10})
+    assert exc.value.code == "INVALID_PARAMETERS"
+
+
 @pytest.mark.parametrize("kind", ["channel", "frame", "dataset"])
 def test_legacy_selection_reloads_the_requested_pixels(tmp_path, capsys, kind):
     grid = np.arange(78 * 90, dtype=np.int16).reshape(78, 90)
