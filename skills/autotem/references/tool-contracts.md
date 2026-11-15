@@ -25,9 +25,10 @@ For repeated requests use `python -m autotem.harness.cli --root outputs/harness 
 
 For sequential domain work, finish a bounded work package, then validate/submit only new steps with `run_id` (CLI `--run-id`). A completed run's committed roles seed the next package. Keep the same input, selection, execution mode and budgets; do not reuse old step IDs or alter old parameters. This lets the three profiles share one run without recomputing input. Only append to completed runs; concurrent or failed runs require recovery rather than an unsafe append.
 
-When a run returns `needs_input`, read its `input_requests`. Show the relevant
-`evidence_artifact_ids` and ask for one of its `answer_options` with the allowed unit
-and measurement basis. Use the actual request ID and the user's values in the
+When a run returns `needs_input`, read its `input_requests`. Give the full parent
+`run_id` and relevant `evidence_artifact_ids`. End the current turn by asking for
+one of its `answer_options` with the allowed unit and measurement basis. The next
+user message supplies that input. Use the actual request ID and the user's values in the
 child plan. For example, a user who reports 20 pm per pixel from the acquisition
 record supplies the following `plan.user_input`.
 
@@ -37,6 +38,7 @@ record supplies the following `plan.user_input`.
 
 Validate the complete replacement plan, then submit with the parent's
 `parent_run_id` and a new `idempotency_key`. Reuse that key for retries of
-the same answer. If validation rejects a value, show the named field, range
-and unit. If the user has yet to reply, leave the request open. Use
+the same answer. If validation rejects a value, report the original error code,
+the full parent `run_id`, and the field, range and unit that need correction.
+End the turn with the corrected input request. Use
 `latest_response_child_run_id` on the parent to find the resulting analysis.
