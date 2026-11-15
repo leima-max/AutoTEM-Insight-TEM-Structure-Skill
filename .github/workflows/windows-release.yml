@@ -15,9 +15,9 @@ on:
       - 'autotem/**'
       - 'apps/atom_detection_ui.py'
       - 'apps/requirements.txt'
-      # The detached source suite also reads these inputs from its pinned Git checkout.
       - 'apps/b1_b3_preview_ui.py'
       - 'apps/b2_diffraction_ui.py'
+      # The detached source suite also reads these inputs from its pinned Git checkout.
       - 'benchmarks/suite_public_minimal.yaml'
       - 'benchmarks/cases/*/analysis_report.json'
       - 'examples/diffsims_closed_loop.yaml'

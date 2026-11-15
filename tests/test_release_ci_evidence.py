@@ -187,9 +187,10 @@ def test_windows_release_triggers_on_every_frozen_source_rule():
         else:
             expected.add(pattern)
     assert expected <= triggers, f"Missing Windows release triggers: {sorted(expected - triggers)}"
-    assert {".gitattributes", "apps/atom_detection_ui.py", "apps/requirements.txt"} <= set(
-        build_release.SOURCE_PATHS
-    )
+    assert {
+        ".gitattributes", "apps/atom_detection_ui.py", "apps/b1_b3_preview_ui.py",
+        "apps/b2_diffraction_ui.py", "apps/requirements.txt",
+    } <= set(build_release.SOURCE_PATHS)
 
 
 def test_windows_release_triggers_on_source_suite_git_inputs():

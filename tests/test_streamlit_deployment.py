@@ -239,3 +239,42 @@ def test_installed_wheel_starts_entrypoint_without_repository_imports(tmp_path) 
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert '"startup": "passed"' in result.stdout
+
+
+@pytest.mark.skipif(
+    os.environ.get("AUTOTEM_DEPLOYMENT_WHEEL") != "1",
+    reason="Requires an installed deployment wheel with its registered preview scripts.",
+)
+def test_installed_diffraction_preview_starts_from_its_own_resources(tmp_path) -> None:
+    script = textwrap.dedent(
+        """
+        import sys
+        from pathlib import Path
+        from streamlit.testing.v1 import AppTest
+        from autotem.cli import _diffraction_preview_script
+
+        repository = Path(sys.argv[1]).resolve()
+        entry = _diffraction_preview_script()
+        assert entry.is_file() and not entry.is_relative_to(repository)
+        assert entry.parts[-4:-1] == ("share", "autotem-insight", "apps")
+        for subpath in ("apps/b1_b3_preview_ui.py", "apps/b2_diffraction_ui.py",
+                        "configs/hrtem_fft_phase.yaml"):
+            assert (entry.parents[1] / subpath).read_bytes() == (repository / subpath).read_bytes()
+        # Streamlit's CLI prepends the main script directory before executing it.
+        sys.path.insert(0, str(entry.parent))
+        app = AppTest.from_file(str(entry), default_timeout=45).run()
+        assert not app.exception, [error.message for error in app.exception]
+        assert not app.error, [error.value for error in app.error]
+        assert any(title.value == "AutoTEM B1-B5 Diffraction Debug UI" for title in app.title)
+        assert Path(sys.modules["b2_diffraction_ui"].__file__).parent == entry.parent
+        expected_output = Path.cwd() / "outputs/b1_b3_preview"
+        assert Path(app.session_state["b1b3_output_root_value"]) == expected_output
+        """
+    )
+    env = os.environ.copy()
+    env.pop("AUTOTEM_UI_OUTPUT_ROOT", None)
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(REPOSITORY_ROOT)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=90, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

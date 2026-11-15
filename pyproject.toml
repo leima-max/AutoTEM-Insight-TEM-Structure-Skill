@@ -65,6 +65,10 @@ autotem-harness = "autotem.harness.cli:main"
 [tool.setuptools.packages.find]
 include = ["autotem*"]
 
+[tool.setuptools.data-files]
+"share/autotem-insight/apps" = ["apps/b1_b3_preview_ui.py", "apps/b2_diffraction_ui.py"]
+"share/autotem-insight/configs" = ["configs/hrtem_fft_phase.yaml"]
+
 [tool.setuptools.package-data]
 "autotem.harness" = [
   "resources/openclaw/*.cjs",

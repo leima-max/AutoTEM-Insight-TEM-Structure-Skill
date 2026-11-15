@@ -106,6 +106,10 @@ The shorter alias is also available:
 autotem preview-b --host 127.0.0.1 --port 8501
 ```
 
+The installed preview writes under `outputs/b1_b3_preview` in the current working directory.
+Use `--output-root PATH` to select another destination. A source checkout defaults to its own
+`outputs/b1_b3_preview` directory.
+
 If UI dependencies are missing:
 
 ```powershell

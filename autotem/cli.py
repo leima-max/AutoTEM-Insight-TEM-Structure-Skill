@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import importlib.util
 import json
 import os
@@ -26,6 +27,25 @@ EXIT_OK = 0
 EXIT_CONFIG_ERROR = 2
 EXIT_FILE_ERROR = 3
 EXIT_RUNTIME_ERROR = 4
+
+
+def _diffraction_preview_script() -> Path | None:
+    """Find the checked-out script or the data file registered by this installation."""
+    checkout = Path(__file__).resolve().parents[1]
+    script = "b1_b3_preview_ui.py"
+    source = checkout / "apps" / script
+    if (checkout / "pyproject.toml").is_file() and source.is_file():
+        return source
+    try:
+        distribution = importlib.metadata.distribution("autotem-insight")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    for entry in distribution.files or ():
+        if entry.parts[-4:] == ("share", "autotem-insight", "apps", script):
+            installed = Path(distribution.locate_file(entry))
+            if installed.is_file():
+                return installed.resolve()
+    return None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -373,10 +393,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             return EXIT_CONFIG_ERROR
 
-        app_path = Path(__file__).resolve().parents[1] / "apps" / "b1_b3_preview_ui.py"
-        if not app_path.exists():
+        app_path = _diffraction_preview_script()
+        if app_path is None:
             print(
-                f"AutoTEM preview file error: UI script not found: {app_path}",
+                'AutoTEM preview file error: reinstall "autotem-insight[ui]" '
+                "to restore the B1-B5 preview scripts.",
                 file=sys.stderr,
             )
             return EXIT_FILE_ERROR
