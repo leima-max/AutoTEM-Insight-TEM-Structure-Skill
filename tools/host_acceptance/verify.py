@@ -2172,6 +2172,299 @@ def check_tool_runs(calls, runs):
                 )
 
 
+def structured_observation(text):
+    """Return JSON/JSONL records, or None for a plain native text export."""
+    stripped = text.lstrip()
+    if not stripped.startswith(("{", "[")):
+        return None
+    try:
+        return [unique_json(text)]
+    except ValueError:
+        try:
+            return [unique_json(line) for line in text.splitlines() if line.strip()]
+        except ValueError:
+            return []
+
+
+def inventory_rows(rows):
+    if not isinstance(rows, list):
+        return set()
+    found = set()
+    for item in rows:
+        name = item.get("name") if isinstance(item, dict) else item
+        if isinstance(name, str):
+            name = name.removeprefix("mcp__autotem__")
+            if name in TOOLS:
+                found.add(name)
+    return found
+
+
+def plain_inventory(text):
+    found = set()
+    for line in text.splitlines():
+        tokens = re.split(r"[\s,，|]+", line.strip(" \t-*•"))
+        names = [token.strip(" \t\x60") for token in tokens]
+        if names and all(n.removeprefix("mcp__autotem__") in TOOLS for n in names):
+            found.update(inventory_rows(names))
+    return TOOLS <= found
+
+
+def has_inventory(text):
+    records = structured_observation(text)
+    if records is None:
+        return plain_inventory(text)
+    for event in records:
+        if isinstance(event, list) and TOOLS <= inventory_rows(event):
+            return True
+        if not isinstance(event, dict):
+            continue
+        listing = event.get("result", event)
+        if any(
+            entry[key] != "autotem"
+            for entry in (event, listing)
+            if isinstance(entry, dict)
+            for key in ("server", "serverName", "server_name")
+            if key in entry
+        ):
+            continue
+        if isinstance(listing, dict) and TOOLS <= inventory_rows(listing.get("tools")):
+            return True
+        if isinstance(listing, dict) and isinstance(listing.get("data"), list):
+            # Codex ListMcpServerStatusResponse groups a tool map under each server.
+            for server in listing["data"]:
+                if isinstance(server, dict) and server.get("name") == "autotem":
+                    tools = server.get("tools")
+                    if isinstance(tools, dict) and TOOLS <= inventory_rows(list(tools.values())):
+                        return True
+        # Codex Code Mode records each returned value as a distinct text block.
+        # A separately returned ALL_TOOLS array is evidence; names in Skill prose are not.
+        reply = event.get("payload", {})
+        if isinstance(reply, dict) and reply.get("type") in {
+            "custom_tool_call_output",
+            "function_call_output",
+        }:
+            blocks = reply.get("output")
+            if isinstance(blocks, str):
+                blocks = [{"text": blocks}]
+            for block in blocks if isinstance(blocks, list) else ():
+                value = block.get("text", "") if isinstance(block, dict) else ""
+                if not isinstance(value, str):
+                    continue
+                inner = structured_observation(value)
+                if (inner is None and plain_inventory(value)) or any(
+                    isinstance(row, list) and TOOLS <= inventory_rows(row) for row in inner or ()
+                ):
+                    return True
+    return False
+
+
+def granted_text(text):
+    # Consent must describe the user's decision about this server in the same
+    # statement. "accepted" in a fit table and approved CLI instructions are unrelated.
+    service = r"\bautotem\b"
+    resource = (
+        r"(?:mcp[ -]+)?(?:server|connector|tools?|access|permissions?|"
+        r"connection|authorization|consent|request)"
+    )
+    action = r"(?:approved|accepted|allowed|granted|authorized|permitted)"
+    separator = r"[\s:=,，：—–-]+"
+    english = (
+        rf"(?:user\s+)?{action}\s+(?:(?:the|access|permission|request|for|to|connect|use|with)\s+)*"
+        rf"{service}(?:{separator}{resource})*|"
+        rf"(?:{resource}\s+(?:to|for|on)\s+)?{service}(?:['’]s)?(?:{separator}{resource})*"
+        rf"{separator}(?:(?:is|was|has been|user)\s+)?{action}(?:\s+by\s+(?:the\s+)?user)?|"
+        rf"{resource}{separator}{action}\s+(?:to|for)\s+{service}(?:{separator}{resource})*"
+    )
+    chinese = (
+        r"(?:用户|操作者)?(?:已经|已)(?:授权|允许|同意|批准)(?:访问|连接|调用|使用)?"
+        r"autotem(?:的)?(?:mcp)?(?:服务|连接器|工具|权限|访问|调用|请求)*|"
+        r"autotem(?:的)?(?:mcp)?(?:服务|连接器|工具|权限|访问|调用|请求)*[：:，,]?"
+        r"(?:已经|已)(?:由用户)?(?:授权|允许|同意|批准)"
+    )
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    statements = re.split(r"[.!?;。！？；\r\n]", text)
+    for header, body in pairwise(lines):
+        if re.fullmatch(r"autotem(?:\s+(?:mcp|server|connector|工具|服务))*", header, re.I):
+            statements.append(header + " " + body)
+    granted = False
+    for statement in statements:
+        s = statement.strip(" \t-•")
+        if re.search(r"(?<![\w-])autotem(?![a-z0-9_-])", s, re.I | re.ASCII) and re.search(
+            r"\b(denied|revoked|declined|not\s+(?:allowed|approved|granted))\b|已拒绝|未授权|未允许",
+            s,
+            re.I,
+        ):
+            return False
+        explicit_access = re.search(rf"\b(?:user|{resource})\b", s, re.I)
+        if explicit_access and re.fullmatch(
+            rf"(?:{english})(?:\s+(?:for this session|for this project|once))?", s, re.I
+        ):
+            granted = True
+        if re.fullmatch(chinese, re.sub(r"\s+", "", s), re.I):
+            granted = True
+    return granted
+
+
+def has_grant(text, sessions, host=None):
+    records = structured_observation(text)
+    if records is None:
+        if host not in HOSTS:
+            return False
+        # A service form or an isolated caption can contain the same words.
+        # Preserve a visible host permissions heading or a host-labelled log entry.
+        label = re.escape(host)
+        header = rf"(?:OpenAI\s+)?{label}(?:\s*[-:·：]?\s*(?:MCP|tool|工具|服务))?"
+        heading = rf"{header}\s*(?:[-:·：]\s*)?(?:permissions?|authorization|approval|权限|授权)"
+        if re.search(rf"(?im)^\s*{heading}\s*$", text):
+            return granted_text(text)
+        for line in text.splitlines():
+            prefixed = re.fullmatch(rf"\s*{label}\s*[:：]\s*(.+)", line, re.I)
+            if prefixed and granted_text(prefixed[1]):
+                return True
+        return False
+    for event in records[0] if len(records) == 1 and isinstance(records[0], list) else records:
+        # An MCP server owns its elicitation form and can choose the question,
+        # fields and labels. Even a correlated "accept" is a response to that
+        # server, not a grant from the hosting application's permission UI.
+        if not isinstance(event, dict) or any(
+            k in event for k in ("jsonrpc", "method", "result", "error")
+        ):
+            continue
+        body = event.get("item") if event.get("type") == "item.completed" else event
+        if event.get("type") == "event_msg":
+            body = event.get("payload")
+        if not isinstance(body, dict):
+            continue
+        tag = re.sub(r"[^a-z]", "", str(body.get("type") or body.get("event") or "").lower())
+        if not re.fullmatch(
+            r"(?:mcp)?(?:server|tool)?(?:permission|consent|authorization|approval)"
+            r"(?:decision|decided|granted|approved|allowed|accepted|response)?",
+            tag,
+        ):
+            continue
+        origin = body.get("origin", event.get("origin"))
+        actor = body.get("actor", event.get("actor"))
+        if host not in HOSTS or origin != host or actor != "user":
+            continue
+        session = body.get("session_id") or body.get("threadId") or event.get("session_id")
+        if not isinstance(session, str) or session not in sessions:
+            continue
+        server = body.get("server") or body.get("server_name") or body.get("serverName")
+        decision = body.get("decision") or body.get("action") or body.get("status")
+        if server == "autotem" and (
+            decision
+            in ("allow", "accept", "approved", "allowed", "granted", "accepted", "authorized")
+            or decision is None
+            and tag.endswith(("granted", "approved", "allowed", "accepted"))
+        ):
+            return True
+    return False
+
+
+WIN_OCR = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.IsGenericMethod -and $_.GetParameters().Count -eq 1 -and
+    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+} | Select-Object -First 1
+function Await($operation, [Type]$type) {
+    $task = $asTask.MakeGenericMethod($type).Invoke($null, @($operation))
+    $task.GetAwaiter().GetResult()
+}
+$fileType = [Windows.Storage.StorageFile,Windows.Storage,ContentType=WindowsRuntime]
+function WinType($space, $name) { [type]("$space.$name, $space, ContentType=WindowsRuntime") }
+$streamType = WinType Windows.Storage.Streams IRandomAccessStreamWithContentType
+$decoderType = WinType Windows.Graphics.Imaging BitmapDecoder
+$bitmapType = WinType Windows.Graphics.Imaging SoftwareBitmap
+$engineType = [Windows.Media.Ocr.OcrEngine,Windows.Foundation,ContentType=WindowsRuntime]
+$resultType = [Windows.Media.Ocr.OcrResult,Windows.Foundation,ContentType=WindowsRuntime]
+$file = Await ($fileType::GetFileFromPathAsync($env:AUTOTEM_HOST_OBSERVATION_IMAGE)) $fileType
+$stream = Await ($file.OpenReadAsync()) $streamType
+$decoder = Await ($decoderType::CreateAsync($stream)) $decoderType
+$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) $bitmapType
+foreach ($language in $engineType::AvailableRecognizerLanguages) {
+    $engine = $engineType::TryCreateFromLanguage($language)
+    if ($engine) {
+        $result = Await ($engine.RecognizeAsync($bitmap)) $resultType
+        $result.Lines | ForEach-Object { $_.Text }
+    }
+}
+"""
+
+
+def screenshot_text(path):
+    """Read a real screenshot locally. An unavailable recognizer leaves the proof pending."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    formats = ("PNG", "JPEG", "BMP", "WEBP", "GIF", "TIFF")
+    try:
+        with Image.open(path, formats=formats) as image:
+            image.verify()
+        with Image.open(path, formats=formats) as image:
+            image.load()
+    except (Image.DecompressionBombError, EOFError, OSError, SyntaxError, ValueError):
+        return None
+    return windows_ocr(path)
+
+
+def windows_ocr(path):
+    import os
+    import subprocess
+
+    if sys.platform != "win32":
+        return ""
+    powershell = (
+        Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    )
+    try:
+        process = subprocess.run(
+            [str(powershell), "-NoProfile", "-NonInteractive", "-Command", WIN_OCR],
+            env={**os.environ, "AUTOTEM_HOST_OBSERVATION_IMAGE": str(path)},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return process.stdout.decode("utf-8-sig", errors="replace") if process.returncode == 0 else ""
+
+
+def evidence_text(path, ref, name, evidence):
+    # Text/structured exports already contain a readable original. A transcription
+    # may help a reviewer, but must not replace the original when checking the claim.
+    if path.suffix.lower() not in {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".tif",
+        ".tiff",
+        ".webp",
+    }:
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+            if "\0" not in text:
+                return text
+        except UnicodeDecodeError:
+            pass
+    if not isinstance(ref, dict):
+        return ""
+    recognized = screenshot_text(path)
+    if recognized is not None:
+        evidence[name + "_image_decoded"] = True
+        if recognized:
+            evidence[name + "_recognized_text_sha256"] = text_digest(recognized)
+        else:
+            evidence[name + "_visual_review"] = "not_evaluated"
+    return recognized or ""
+
+
 def host_observations(spec, base, turns, calls, result):
     """Recognize effective access separately from first consent and full inventory."""
     evidence = result["evidence"]
@@ -2194,30 +2487,39 @@ def host_observations(spec, base, turns, calls, result):
         ref = source[name]
         file = capture_file(base, ref if isinstance(ref, str) else ref["original_evidence"])
         evidence[name + "_sha256"] = digest(file)
-        if isinstance(ref, str):
-            # Host text and structured CLI/UI exports can be checked without a human signature.
-            text = file.read_text("utf-8-sig")
-        else:
-            # Images have no portable text extraction here. Preserve the original
-            # and the actual transcribed content; bind this observation to its session.
+        transcript = None
+        sessions = {t["session"] for t in turns}
+        if isinstance(ref, dict):
             require(
-                ref.get("session_id") in {t["session"] for t in turns},
+                ref.get("session_id") in sessions,
                 "host_observation_session_mismatch",
             )
-            text = ref.get("observed_text", "")
-            observed(isinstance(text, str) and text.strip(), "missing_observation_transcription")
-            evidence[name + "_transcription_sha256"] = text_digest(text)
-        if name == "discovery" and all(re.search(r"\b" + tool + r"\b", text) for tool in TOOLS):
-            checks["full_tool_inventory"] = "passed"
-        if name == "authorization":
-            authorized = re.search(
-                r"\b(allowed|accepted|approved|granted)\b|已授权|已允许", text, re.I
+            transcript = ref.get("observed_text", "")
+            observed(
+                isinstance(transcript, str) and transcript.strip(),
+                "missing_observation_transcription",
             )
-            denied = re.search(
-                r"denied|not allowed|not granted|not approved|拒绝|未授权|未允许", text, re.I
-            )
-            if "autotem" in text.lower() and authorized and not denied:
+            evidence[name + "_transcription_sha256"] = text_digest(transcript)
+        if name in {"discovery", "authorization"}:
+            text = evidence_text(file, ref, name, evidence)
+            if (
+                name == "discovery"
+                and has_inventory(text)
+                and (transcript is None or has_inventory(transcript))
+            ):
+                checks["full_tool_inventory"] = "passed"
+            if (
+                name == "authorization"
+                and has_grant(text, sessions, spec.get("host"))
+                and (
+                    transcript is None
+                    or granted_text(transcript)
+                    or has_grant(transcript, sessions, spec.get("host"))
+                )
+            ):
                 checks["first_authorization"] = "passed"
+            continue
+        text = transcript if transcript is not None else file.read_text("utf-8-sig")
         if (
             name == "skill_discovery"
             and "autotem" in text.lower()
