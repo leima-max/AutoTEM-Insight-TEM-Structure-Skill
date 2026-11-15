@@ -1047,6 +1047,204 @@ def test_automatic_host_proofs_are_scoped_without_a_reviewer(tmp_path):
     assert verifier.verify(record, root=tmp_path)["reason"] == "host_version_evidence_mismatch"
 
 
+@pytest.mark.parametrize(
+    ("original", "passed"),
+    [
+        ("User approved access to AutoTEM tools", True),
+        ("AutoTEM request was approved", True),
+        ("AutoTEM\nPermission granted", True),
+        ("AutoTEM accepted", False),
+        ("AutoTEM access granted. AutoTEM access denied", False),
+        ("AutoTEM 权限：已授权", True),
+        ("已允许调用 AutoTEM 工具", True),
+        ("AutoTEM request was not approved", False),
+        ("AutoTEM accepted 42 refined columns", False),
+        ("AutoTEM instructions mention the approved CLI fallback", False),
+        ("Other server permission granted. AutoTEM", False),
+        ("Allow AutoTEM tools?", False),
+        ('{"type":"approval_configuration","server":"autotem","status":"granted"}', False),
+        ('{"type":"permission_decision","server":"autotem","decision":"granted"}', False),
+        (
+            '{"type":"permission_decision","session_id":"session",'
+            '"server":"autotem","decision":"granted"}',
+            False,
+        ),
+        ('{"type":"permission_decision","server":"other","decision":"granted"}', False),
+        (
+            '{"type":"permission_decision","server":"autotem","session_id":"elsewhere","decision":"granted"}',
+            False,
+        ),
+        (
+            '{"type":"item.completed","item":{"type":"agent_message",'
+            '"text":"AutoTEM access granted"}}',
+            False,
+        ),
+    ],
+)
+def test_first_consent_requires_an_observed_decision_for_this_service(original, passed):
+    if not original.startswith("{"):
+        original = "Codex tool permissions\n" + original
+    assert verifier.has_grant(original, {"session"}, "codex") is passed
+
+
+@pytest.mark.parametrize("method", ["mcpServer/elicitation/request", "tool/requestUserInput"])
+@pytest.mark.parametrize(
+    "question", ["Allow AutoTEM tool to rescale this frame?", "Allow this MCP tool to run?"]
+)
+def test_service_defined_forms_never_establish_host_permission(method, question):
+    request = {
+        "id": 17,
+        "method": method,
+        "params": {
+            "serverName": "autotem",
+            "threadId": "session",
+            "mode": "form",
+            "message": question,
+            "requestedSchema": {"type": "object", "properties": {"allow": {"type": "boolean"}}},
+        },
+    }
+    response = {"id": 17, "result": {"action": "accept", "content": {"allow": True}}}
+    if method == "tool/requestUserInput":
+        request["params"] = {
+            "threadId": "session",
+            "turnId": "turn",
+            "itemId": "item",
+            "isBlocking": True,
+            "questions": [{"id": "allow", "header": "AutoTEM", "question": question}],
+        }
+        response["result"] = {"answers": {"allow": {"answers": ["yes"]}}}
+    text = "\n".join(json.dumps(v) for v in (request, response))
+    assert not verifier.has_grant(text, {"session"}, "codex")
+    assert not verifier.has_grant("AutoTEM permission granted", {"session"}, "codex")
+    assert not verifier.has_grant(
+        "MCP server form\nAutoTEM permission granted", {"session"}, "codex"
+    )
+    assert verifier.has_grant("Codex: AutoTEM access granted", {"session"}, "codex")
+
+
+@pytest.mark.parametrize(
+    ("change", "passed"),
+    [
+        ({}, True),
+        ({"origin": "autotem"}, False),
+        ({"origin": "workbuddy"}, False),
+        ({"actor": "server"}, False),
+        ({"server": "other"}, False),
+        ({"session_id": "elsewhere"}, False),
+        ({"decision": "denied"}, False),
+    ],
+)
+def test_separate_host_permission_record_requires_user_host_server_and_session(change, passed):
+    event = {
+        "type": "tool_permission_decision",
+        "origin": "codex",
+        "actor": "user",
+        "server": "autotem",
+        "session_id": "session",
+        "decision": "granted",
+        **change,
+    }
+    response = {"id": 17, "result": {"action": "accept", "content": event}}
+    assert not verifier.has_grant(json.dumps(response), {"session"}, "codex")
+    assert verifier.has_grant(json.dumps([response, event]), {"session"}, "codex") is passed
+
+
+def test_only_the_original_catalogue_counts(tmp_path):
+    names = sorted(verifier.TOOLS)
+    catalog = [{"name": "mcp__autotem__" + name} for name in names]
+    wrapper = {
+        "type": "response_item",
+        "payload": {
+            "type": "custom_tool_call_output",
+            "output": [
+                {"type": "input_text", "text": json.dumps(catalog)},
+            ],
+        },
+    }
+    assert verifier.has_inventory(json.dumps(wrapper))
+    assert not verifier.has_inventory(json.dumps({"serverName": "other", "tools": catalog}))
+    server = {
+        "name": "autotem",
+        "authStatus": "notLoggedIn",
+        "resources": [],
+        "resourceTemplates": [],
+        "tools": {n: {"name": n, "inputSchema": {}} for n in names},
+    }
+    status = {"id": 4, "result": {"data": [server], "nextCursor": None}}
+    assert verifier.has_inventory(json.dumps(status))
+    assert not verifier.has_grant(json.dumps(status), {"session"})
+    server["name"] = "other"
+    assert not verifier.has_inventory(json.dumps(status))
+    assert verifier.has_inventory(json.dumps({"result": {"tools": [{"name": n} for n in names]}}))
+    assert verifier.has_inventory("\n".join(names))
+    instructions = "All tools mentioned in the manual include " + ", ".join(names) + "."
+    assert not verifier.has_inventory(instructions)
+    assert not verifier.has_inventory(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "command_execution", "aggregated_output": instructions},
+            }
+        )
+    )
+    path = tmp_path / "request.txt"
+    path.write_text("Analyze this image", encoding="utf-8")
+    spec = {
+        "host_observations": {
+            "authorization": {
+                "session_id": "session",
+                "original_evidence": path.name,
+                "observed_text": "AutoTEM access granted",
+            }
+        }
+    }
+    result = {"checks": {}, "evidence": {}}
+    verifier.host_observations(
+        spec, tmp_path, [{"session": "session", "skill_opened": False}], [], result
+    )
+    assert result["checks"]["first_authorization"] == "not_evaluated"
+
+
+def test_ui_transcription_needs_a_decodable_image_and_actual_readable_grant(tmp_path, monkeypatch):
+    from PIL import Image
+
+    path = tmp_path / "screen.png"
+    spec = {
+        "host": "codex",
+        "host_observations": {
+            "authorization": {
+                "session_id": "session",
+                "original_evidence": path.name,
+                "observed_text": "AutoTEM access granted",
+            }
+        },
+    }
+    turns = [{"session": "session", "skill_opened": False}]
+
+    def check():
+        result = {"checks": {}, "evidence": {}}
+        verifier.host_observations(spec, tmp_path, turns, [], result)
+        return result
+
+    path.write_bytes(b"\x89PNG\r\n\x1a\ntruncated")
+    monkeypatch.setattr(verifier, "windows_ocr", lambda _: pytest.fail("Invalid image reached OCR"))
+    assert check()["checks"]["first_authorization"] == "not_evaluated"
+    path.write_text("AutoTEM access granted", encoding="utf-8")
+    assert check()["checks"]["first_authorization"] == "not_evaluated"
+    Image.new("RGB", (16, 16), "white").save(path)
+    # Isolate recognition outcomes here; the Windows integration probe uses real screen pixels.
+    for original, expected in (
+        ("", False),
+        ("Accepted refinement (42)", False),
+        ("AutoTEM access granted", False),
+        ("Codex tool permissions\nAutoTEM access granted", True),
+    ):
+        monkeypatch.setattr(verifier, "windows_ocr", lambda _, text=original: text)
+        result = check()
+        assert result["evidence"]["authorization_image_decoded"]
+        assert (result["checks"]["first_authorization"] == "passed") is expected
+
+
 def test_windows_capture_time_uses_all_available_microseconds():
     assert verifier.stamp("2026-11-12T13:17:38.1920650+08:00") == verifier.stamp(
         "2026-11-12T05:17:38.192065Z"
