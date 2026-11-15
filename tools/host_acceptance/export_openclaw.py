@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import re
 import runpy
 import shutil
 import uuid
@@ -13,6 +14,9 @@ TOOLS = _verifier["TOOLS"]
 require = _verifier["require"]
 unique_json = _verifier["unique_json"]
 envelope = _verifier["envelope"]
+same_json = _verifier["same_json"]
+CACHE_FILE = "cache-trace.jsonl"
+OMISSION = "\n\n⚠️ [... middle content omitted — showing head and tail ...]\n\n"
 
 
 def branch(data, project, leaf):
@@ -76,8 +80,148 @@ def message_text(content):
     return "\n".join(block["text"] for block in content if block.get("type") == "text")
 
 
-def read_session(data, project, leaf=None):
+def truncation_preview(full, preview):
+    """Replay the 2026.5.18 guard for the plugin's single-line JSON.stringify text."""
+    if "\n" in full or OMISSION not in preview:
+        return False
+    text = full.encode("utf-16-le", "surrogatepass")
+    original = len(text) // 2
+    limit = len(preview.encode("utf-16-le", "surrogatepass")) // 2
+    if original <= limit:
+        return False
+
+    def suffix(removed):
+        return f"[... {max(1, removed)} more characters truncated]"
+
+    budget = limit - len(suffix(original - limit))
+    tail = min(budget * 3 // 10, 4000)
+    head = budget - tail - 63
+    if budget <= 4000 or head <= 2000:
+        return False
+    kept = text[: 2 * head] + OMISSION.encode("utf-16-le") + text[-2 * tail :]
+    while kept:
+        size = len(kept) // 2
+        ending = suffix(original - size)
+        overflow = size + len(ending) - limit
+        if overflow <= 0:
+            return kept + ending.encode("utf-16-le") == preview.encode("utf-16-le", "surrogatepass")
+        kept = kept[: 2 * max(0, size - overflow)]
+    return False
+
+
+def cache_message_matches(raw, cached, fingerprint):
+    if same_json(raw, cached):
+        return
+    require(
+        raw.get("role") == "toolResult" and isinstance(cached, dict),
+        "openclaw_cache_message_mismatch",
+    )
+    raw_blocks, blocks = raw.get("content"), cached.get("content")
+    require(
+        isinstance(raw_blocks, list)
+        and len(raw_blocks) == 1
+        and isinstance(blocks, list)
+        and len(blocks) == 1
+        and all(
+            isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+            for b in (raw_blocks[0], blocks[0])
+        ),
+        "openclaw_cache_content_mismatch",
+    )
+    replaced = {**cached, "content": [{**blocks[0], "text": raw_blocks[0]["text"]}]}
+    require(
+        same_json(raw, replaced) and truncation_preview(blocks[0]["text"], raw_blocks[0]["text"]),
+        "openclaw_cache_preview_mismatch",
+    )
+    # Pi may create an own "details": undefined. The native stable hash includes it;
+    # JSONL omits it. Hash the full recovered return, including its unshown middle.
+    fields = {
+        key: json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        for key, value in cached.items()
+    }
+
+    def matches(items):
+        record = "{" + ",".join(json.dumps(k) + ":" + items[k] for k in sorted(items)) + "}"
+        return hashlib.sha256(record.encode("utf8")).hexdigest() == fingerprint
+
+    require(
+        matches(fields)
+        or ("details" not in fields and matches({**fields, "details": "undefined"})),
+        "openclaw_cache_return_fingerprint_mismatch",
+    )
+
+
+def cache_messages(data, session, project, chain):
+    """Compare every cumulative after-turn snapshot to one chosen branch, in order."""
+    native = [(line, row["message"]) for line, row in chain if row["type"] == "message"]
+    sources = {}
+    complete = False
+    session_key = None
+    for number, line in enumerate(data.decode("utf-8-sig").splitlines(), 1):
+        if not line.strip():
+            continue
+        record = unique_json(line)
+        require(isinstance(record, dict), "invalid_openclaw_cache_record")
+        if record.get("stage") != "session:after":
+            continue
+        cwd = record.get("workspaceDir")
+        require(
+            record.get("sessionId") == session
+            and isinstance(cwd, str)
+            and Path(cwd).is_absolute()
+            and Path(cwd).resolve() == project,
+            "openclaw_cache_session_or_workspace_mismatch",
+        )
+        require(
+            isinstance(record.get("runId"), str)
+            and record["runId"].strip()
+            and isinstance(record.get("sessionKey"), str)
+            and record["sessionKey"].strip()
+            and record["sessionKey"] == (session_key or record["sessionKey"])
+            and type(record.get("seq")) is int
+            and record["seq"] > 0
+            and isinstance(record.get("ts"), str),
+            "invalid_openclaw_cache_identity",
+        )
+        session_key = record["sessionKey"]
+        _verifier["stamp"](record["ts"])
+        messages, fingerprints = record.get("messages"), record.get("messageFingerprints")
+        require(
+            isinstance(messages, list)
+            and 0 < len(messages) <= len(native)
+            and all(isinstance(m, dict) and type(m.get("timestamp")) is int for m in messages)
+            and messages[-1].get("role") == "assistant"
+            and messages[-1].get("stopReason") == "stop"
+            and record.get("messageCount") == len(messages)
+            and record.get("messageRoles") == [m.get("role") for m in messages]
+            and isinstance(fingerprints, list)
+            and len(fingerprints) == len(messages)
+            and all(isinstance(k, str) and re.fullmatch(r"[a-f0-9]{64}", k) for k in fingerprints),
+            "incomplete_openclaw_cache_snapshot",
+        )
+        checksum = hashlib.sha256(json.dumps("|".join(fingerprints)).encode()).hexdigest()
+        require(record.get("messagesDigest") == checksum, "openclaw_cache_snapshot_digest_mismatch")
+        for index, (cached, fingerprint) in enumerate(zip(messages, fingerprints, strict=True)):
+            original_line, raw = native[index]
+            cache_message_matches(raw, cached, fingerprint)
+            if raw.get("role") == "toolResult":
+                previous = sources.get(original_line)
+                if previous is None or same_json(previous[0], raw):
+                    sources[original_line] = (cached, number, index + 1)
+                elif not same_json(cached, raw):
+                    # A later turn may reload exactly the guarded preview from disk.
+                    require(same_json(previous[0], cached), "conflicting_openclaw_cache_copies")
+        complete |= len(messages) == len(native)
+    require(complete, "missing_complete_openclaw_cache_snapshot")
+    return sources
+
+
+def read_session(data, project, leaf=None, cache_data=None):
     session, selected, chain = branch(data, project.resolve(), leaf)
+    cached = {}
+    if cache_data is not None:
+        chain = list(chain)
+        cached = cache_messages(cache_data, session, project.resolve(), chain)
     turns, pending = [], {}
     seen_calls = set()
     source = "session.jsonl"
@@ -143,6 +287,19 @@ def read_session(data, project, leaf=None):
             if not name.startswith("autotem__"):
                 continue
             tool = name.removeprefix("autotem__")
+            proof = {}
+            evidence = source
+            if line in cached:
+                full, cache_line, message_number = cached[line]
+                proof = {
+                    "transcript_evidence": source,
+                    "cache_trace_evidence": CACHE_FILE,
+                    "cache_trace_line": cache_line,
+                    "cache_message_number": message_number,
+                }
+                if not same_json(full, message):
+                    message = full
+                    evidence = CACHE_FILE
             try:
                 response = envelope(tool, message)
             except json.JSONDecodeError as exc:
@@ -178,7 +335,8 @@ def read_session(data, project, leaf=None):
                     "arguments": arguments,
                     "response": response,
                     "host_is_error": host_error,
-                    "original_evidence": source,
+                    "original_evidence": evidence,
+                    **proof,
                     "call_id": call_id,
                     "request_line": start,
                     "result_line": line,
@@ -192,7 +350,7 @@ def read_session(data, project, leaf=None):
     return selected, turns
 
 
-def write_capture(destination, data, selected, turns):
+def write_capture(destination, data, selected, turns, cache_data=None):
     (destination / "session.jsonl").write_bytes(data)
     manifest = {
         "capture_format": "observed-host-export",
@@ -201,6 +359,10 @@ def write_capture(destination, data, selected, turns):
         "session_sha256": hashlib.sha256(data).hexdigest(),
         "turns": [],
     }
+    if cache_data is not None:
+        (destination / CACHE_FILE).write_bytes(cache_data)
+        manifest["cache_trace"] = CACHE_FILE
+        manifest["cache_trace_sha256"] = hashlib.sha256(cache_data).hexdigest()
     for number, turn in enumerate(turns, 1):
         prompt, trace = f"turn-{number}.txt", f"turn-{number}.json"
         (destination / prompt).write_bytes(turn.pop("prompt").encode())
@@ -212,7 +374,7 @@ def write_capture(destination, data, selected, turns):
     return manifest
 
 
-def export(session_file, project, destination, leaf=None):
+def export(session_file, project, destination, leaf=None, cache_trace=None):
     project = project.resolve(strict=True)
     destination = destination.resolve()
     require(
@@ -222,12 +384,13 @@ def export(session_file, project, destination, leaf=None):
     if destination.exists():
         raise FileExistsError(destination)
     data = session_file.read_bytes()
-    selected, turns = read_session(data, project, leaf)
+    cache_data = cache_trace.read_bytes() if cache_trace is not None else None
+    selected, turns = read_session(data, project, leaf, cache_data)
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = destination.with_name(f".{destination.name}-{uuid.uuid4().hex}.tmp")
     staging.mkdir()
     try:
-        manifest = write_capture(staging, data, selected, turns)
+        manifest = write_capture(staging, data, selected, turns, cache_data)
         staging.rename(destination)
         return manifest
     finally:
@@ -243,9 +406,14 @@ if __name__ == "__main__":
         "--out", required=True, type=Path, help="New private field records directory"
     )
     parser.add_argument("--leaf", help="Native entry ID of the session branch to export")
+    parser.add_argument(
+        "--cache-trace",
+        type=Path,
+        help="Dedicated same-session cacheTrace JSONL with complete after-turn snapshots",
+    )
     args = parser.parse_args()
     try:
-        result = export(args.session_jsonl, args.project, args.out, args.leaf)
+        result = export(args.session_jsonl, args.project, args.out, args.leaf, args.cache_trace)
     except (OSError, ValueError, TypeError, KeyError) as exc:
         parser.exit(1, f"OpenClaw export failed: {exc}\n")
     print(f"{len(result['turns'])} turns, original SHA-256 {result['session_sha256']}")
