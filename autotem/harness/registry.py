@@ -157,20 +157,43 @@ class OperationRegistry:
             ) from exc
         return result.model_dump(mode="json")
 
-    def capabilities(self) -> list[dict]:
+    def capabilities(self, *, view: str = "full", operation_id: str | None = None) -> list[dict]:
+        if view not in ("full", "summary", "parameters"):
+            raise HarnessError("INVALID_PARAMETERS", "Unknown capability view")
+        if view == "parameters" and not operation_id:
+            raise HarnessError(
+                "INVALID_PARAMETERS", "The parameters view requires one operation_id"
+            )
+        definitions = self.operations.values() if operation_id is None else [self.get(operation_id)]
         result = []
         # Shared dependencies should consume only one import budget per inventory request.
         probe = lru_cache(maxsize=None)(probe_dependency)
-        for definition in self.operations.values():
+        for definition in definitions:
             handler = definition.handler
-            result.append(
+            item = {
+                "operation_id": definition.operation_id,
+                "version": definition.version,
+                "profile_id": definition.profile_id,
+                "description": definition.description,
+                "implementation_status": definition.implementation_status,
+                "availability": self.availability(definition, probe=probe),
+            }
+            result.append(item)
+            if view == "summary":
+                continue
+            if view == "parameters":
+                item.update(
+                    parameter_schema=definition.parameter_model.model_json_schema(),
+                    input_roles=definition.input_roles,
+                    output_roles=definition.output_roles,
+                    budget_seconds=definition.timeout_seconds,
+                    scientific_limitations=definition.scientific_limitations,
+                    result_level=definition.result_level,
+                    scientific_accuracy="not_evaluated",
+                )
+                continue
+            item.update(
                 {
-                    "operation_id": definition.operation_id,
-                    "version": definition.version,
-                    "profile_id": definition.profile_id,
-                    "description": definition.description,
-                    "implementation_status": definition.implementation_status,
-                    "availability": self.availability(definition, probe=probe),
                     "parameter_schema": definition.parameter_model.model_json_schema(),
                     "input_schema": {role: role_schema(role) for role in definition.input_roles},
                     "output_schema": {role: role_schema(role) for role in definition.output_roles},

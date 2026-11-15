@@ -26,7 +26,13 @@ def _object_schema(properties: dict[str, Any], required: tuple[str, ...] = ()) -
 STRING = {"type": "string", "minLength": 1}
 OBJECT = {"type": "object"}
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
-    "list_capabilities": _object_schema({"enabled_plugins": {"type": "array"}}),
+    "list_capabilities": _object_schema(
+        {
+            "enabled_plugins": {"type": "array"},
+            "view": {"type": "string", "enum": ["full", "summary", "parameters"]},
+            "operation_id": STRING,
+        }
+    ),
     "inspect_input": _object_schema({"path": STRING, "selection": OBJECT}, ("path",)),
     "validate_plan": _object_schema({"plan": OBJECT, "run_id": STRING}, ("plan",)),
     "submit_analysis": _object_schema(
@@ -67,7 +73,10 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
 }
 TOOL_DESCRIPTIONS = {
-    "list_capabilities": "Discover operations, availability, parameters and limitations.",
+    "list_capabilities": (
+        "Discover operations. Use view=summary for availability, then view=parameters with "
+        "one operation_id for its exact parameters and scientific limits. Default: full catalog."
+    ),
     "inspect_input": "Inspect authorized input with explicit dataset/frame/channel selection.",
     "validate_plan": "Validate operations, parameters, dependencies and budgets without analysis.",
     "submit_analysis": "Execute a validated traditional plan; returns a run ID and real status.",

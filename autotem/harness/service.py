@@ -60,11 +60,19 @@ class Harness:
         self.queue_limit = queue_limit
         self.workspace = workspace.resolve(strict=True) if workspace is not None else None
 
-    def list_capabilities(self, enabled_plugins: list[str] | None = None) -> dict:
+    def list_capabilities(
+        self,
+        enabled_plugins: list[str] | None = None,
+        *,
+        view: str = "full",
+        operation_id: str | None = None,
+    ) -> dict:
         self._check_workspace_plugins(enabled_plugins)
         return {
             "envelope_version": "1.0.0",
-            "operations": default_registry(enabled_plugins).capabilities(),
+            "operations": default_registry(enabled_plugins).capabilities(
+                view=view, operation_id=operation_id
+            ),
             "installed_plugins": [
                 {
                     "name": entry.name,

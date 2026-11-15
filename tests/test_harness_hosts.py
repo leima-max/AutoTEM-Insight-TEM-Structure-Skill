@@ -77,6 +77,42 @@ class RecordingHarness:
         return {"artifact_id": kwargs["artifact_id"], "data": []}
 
 
+def test_host_can_read_the_index_and_one_exact_parameter_schema(tmp_path, monkeypatch):
+    from autotem.harness.service import Harness
+
+    monkeypatch.setattr(
+        "autotem.harness.registry.probe_dependency", lambda dep: {"state": "available"}
+    )
+    harness = Harness(tmp_path)
+
+    def call(**args):
+        return dispatch_request(harness, {"tool": "list_capabilities", "arguments": args})
+
+    full = {item["operation_id"]: item for item in call()["result"]["operations"]}
+    summary = call(view="summary")
+    assert summary["ok"] and len(json.dumps(summary)) < 16000
+    index = {item["operation_id"]: item for item in summary["result"]["operations"]}
+    assert index.keys() == full.keys()
+    for key, item in index.items():
+        assert item["availability"] == full[key]["availability"]
+        assert "parameter_schema" not in item
+    for key in ("diffraction.match", "strain.gpa"):
+        response = call(view="parameters", operation_id=key)
+        assert response["ok"] and len(json.dumps(response)) < 16000
+        (details,) = response["result"]["operations"]
+        for field in ("parameter_schema", "scientific_limitations", "input_roles", "result_level"):
+            assert details[field] == full[key][field]
+        assert "output_schema" not in details
+    assert call(operation_id="diffraction.match")["result"]["operations"] == [
+        full["diffraction.match"]
+    ]
+    assert call(view="parameters")["error"]["code"] == "INVALID_PARAMETERS"
+    assert (
+        call(view="parameters", operation_id="unknown.operation")["error"]["code"]
+        == "UNKNOWN_OPERATION"
+    )
+
+
 @pytest.mark.smoke
 @pytest.mark.parametrize("host", ["codex", "openclaw", "workbuddy"])
 def test_host_dry_run_is_write_free_and_reports_no_native_verification(tmp_path, host):

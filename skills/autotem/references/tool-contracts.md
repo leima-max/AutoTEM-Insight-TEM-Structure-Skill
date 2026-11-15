@@ -6,6 +6,8 @@ The nine coarse tools are `list_capabilities`, `inspect_input`, `validate_plan`,
 
 `inspect_input` takes `path` and optional `selection` mapping. `validate_plan` takes a `plan` and optional `run_id`. `submit_analysis` takes `plan`, optional `run_id`, `idempotency_key`, `parent_run_id`, `user_request`, `asynchronous` (default true), and `execution_mode` (this adapter supports sequential). Status/cancel/list/export take `run_id`. `read_artifact` takes `artifact_id`, optional zero-based `offset` and `limit` (1–1000). Export formats are JSON/HTML/PDF; PDF is a bounded evidence summary, while JSON/HTML preserve full structured status. Use references/small previews rather than returning whole image arrays to the host.
 
+The compact catalog uses `{"view":"summary"}` for the operation index and `{"view":"parameters","operation_id":"diffraction.match"}` for one operation's exact parameter schema, roles, budget, result level and scientific limits. An empty arguments object still returns the full catalog, including input and output schemas. A host can request that full detail for one operation with `{"operation_id":"diffraction.match"}`.
+
 CLI commands:
 
 ```powershell
