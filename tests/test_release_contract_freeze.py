@@ -8,11 +8,16 @@ from zipfile import ZipFile
 import pytest
 
 from tools.release import contract_freeze as freeze
+from autotem.harness.cli import TOOL_SCHEMAS
 
 
 @pytest.fixture(scope="module")
 def definitions():
     return freeze.validators()
+
+
+def test_all_published_tool_arguments_match_the_frozen_contract():
+    assert freeze.read(freeze.POLICY)["tools"] == TOOL_SCHEMAS
 
 
 def test_core_reader_scope_and_tool_catalogue_are_explicit():

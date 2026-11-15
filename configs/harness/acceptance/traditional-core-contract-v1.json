@@ -37,6 +37,14 @@
       "properties": {
         "enabled_plugins": {
           "type": "array"
+        },
+        "view": {
+          "type": "string",
+          "enum": ["full", "summary", "parameters"]
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "required": [],

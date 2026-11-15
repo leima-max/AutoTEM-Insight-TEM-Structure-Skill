@@ -366,7 +366,7 @@ OpenClaw 分开验证 Skill eligibility、会话实际发现、网关健康、�
 
 | 工具 | 真实参数 | 行为及限制 |
 |---|---|---|
-| list_capabilities | 可选 enabled_plugins，最多 16 | 返回操作/参数 schema、依赖、限制；不保证某图像科学前提满足 |
+| list_capabilities | 可选 `enabled_plugins`（最多 16 个）、`view`、`operation_id` | 默认 `full` 返回完整合同。`summary` 列出操作及当前可用性。`parameters` 需指定一个操作 ID，返回完整参数 schema、角色、预算和科学限制。图像前提由分析时核实。 |
 | inspect_input | path；可选 selection | 实际读取；**创建同步 inspection run**，返回 run_id、产物与 dataset |
 | validate_plan | plan；可选 run_id | 编译并检查参数/依赖/角色/预算；不等于已运行数值算法 |
 | submit_analysis | plan；可选 run_id、parent_run_id、idempotency_key、execution_mode、user_request、asynchronous | 默认异步；execution_mode 只允许 sequential；run_id 与 parent_run_id 互斥 |
