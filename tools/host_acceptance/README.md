@@ -96,6 +96,10 @@ WorkBuddy 和 OpenClaw 的手工观察格式用于补充本机可导出的原始
 
 `response` 填写实际完整 Harness envelope 或 MCP 返回体。原生模式在父 trace 的 `delegation_events` 内逐条转录 `action`（spawn、return）、`session_id` 和 `original_evidence`。合成测试只用于测试校验器。
 
+使用项目的 OpenClaw 网关插件时，可由操作员在受测项目外导出该场的 v3 会话。选择该卡实际的专用 JSONL，运行 `python tools/host_acceptance/export_openclaw.py <session.jsonl> --project <受测工程> --out <新的私有取证目录>`。工具保留原始字节，根据父记录链逐轮配对 `autotem__` 调用、参数、工具结果中的 `request_id` 和最终原文。多分支会话通过 `--leaf <末端记录ID>` 选择实际交付给用户的一支。`turns.json` 给出 `capture_format` 和逐轮文件，可填入同目录的现场 `case.json`。按实际会话补上发行绑定、时间、宿主发现、权限与科学引用，再运行冻结取证入口。网关 `tools.catalog` 原始返回可用于核实 `autotem-harness` 插件目录；用户授权、会话内有效访问及科学结果仍需相应的独立原件。
+
+每张卡从受测工程开启新会话。OpenClaw 的 `forkFrom` 可以把旧项目消息复制进带新工作目录的会话，导出时会要求原项目的独立记录。工具本身返回的业务错误与宿主 `isError` 分别保存。出现 `openclaw_tool_result_truncated` 时，原始会话只保留了工具结果预览。OpenClaw 2026.5.18 的默认上限为 16,000 字符，该版配置允许的最高值为 250,000 字符；已测的完整能力返回有 256,873 字符。这种情况需要该次调用在截断前的完整原件。
+
 ## 验证与复审
 
 从 checkout 外的当前目录运行，给出本次安装项目的私有 Python 和核对工具的绝对路径。

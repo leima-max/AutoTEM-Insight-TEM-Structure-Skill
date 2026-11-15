@@ -2312,7 +2312,35 @@ def plain_inventory(text):
     return TOOLS <= found
 
 
-def has_inventory(text):
+def openclaw_plugin_inventory(listing):
+    """Read the AutoTEM group's tool IDs from an OpenClaw tools.catalog response."""
+    if not isinstance(listing.get("agentId"), str) or not listing["agentId"].strip():
+        return False
+    groups = listing.get("groups")
+    if not isinstance(groups, list):
+        return False
+    matches = [g for g in groups if isinstance(g, dict) and g.get("id") == "plugin:autotem-harness"]
+    if len(matches) != 1:
+        return False
+    group = matches[0]
+    plugin = "autotem-harness"
+    if group.get("source") != "plugin" or group.get("pluginId") != plugin:
+        return False
+    tools = group.get("tools")
+    if not isinstance(tools, list):
+        return False
+    names = {
+        item["id"]
+        for item in tools
+        if isinstance(item, dict)
+        and isinstance(item.get("id"), str)
+        and item.get("source") == "plugin"
+        and item.get("pluginId") == plugin
+    }
+    return {f"autotem__{name}" for name in TOOLS} <= names
+
+
+def has_inventory(text, host=None):
     records = structured_observation(text)
     if records is None:
         return plain_inventory(text)
@@ -2329,6 +2357,10 @@ def has_inventory(text):
             for key in ("server", "serverName", "server_name")
             if key in entry
         ):
+            continue
+        if host == "openclaw" and isinstance(listing, dict) and "groups" in listing:
+            if openclaw_plugin_inventory(listing):
+                return True
             continue
         if isinstance(listing, dict) and TOOLS <= inventory_rows(listing.get("tools")):
             return True
@@ -2831,8 +2863,8 @@ def host_observations(spec, base, turns, calls, result, *, project=None):
             text = evidence_text(file, ref, name, evidence)
             if (
                 name == "discovery"
-                and has_inventory(text)
-                and (transcript is None or has_inventory(transcript))
+                and has_inventory(text, spec.get("host"))
+                and (transcript is None or has_inventory(transcript, spec.get("host")))
             ):
                 checks["full_tool_inventory"] = "passed"
             if (

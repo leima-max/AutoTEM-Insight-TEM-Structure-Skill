@@ -1283,6 +1283,40 @@ def test_separate_host_permission_record_requires_user_host_server_and_session(c
     assert verifier.has_grant(json.dumps([response, event]), {"session"}, "codex") is passed
 
 
+def test_openclaw_catalog_requires_the_named_plugin_group_and_tool_ids(tmp_path):
+    plugin = "autotem-harness"
+    rows = [
+        {"id": f"autotem__{name}", "source": "plugin", "pluginId": plugin}
+        for name in sorted(verifier.TOOLS)
+    ]
+    group = {"id": f"plugin:{plugin}", "pluginId": plugin, "source": "plugin", "tools": rows}
+    catalog = {"agentId": "main", "groups": [group]}
+    raw = tmp_path / "catalog.stdout"
+    write_json(raw, catalog)
+    report = {"evidence": {}, "checks": {}}
+    verifier.host_observations(
+        {"host": "openclaw", "host_observations": {"discovery": raw.name}},
+        tmp_path,
+        [{"session": "test-only", "skill_opened": False}],
+        [{"tool": "list_capabilities"}],
+        report,
+    )
+    assert report["checks"]["full_tool_inventory"] == "passed"
+    assert report["checks"]["first_authorization"] == "not_evaluated"
+    assert report["observed_tools"] == ["list_capabilities"]
+    assert not verifier.has_inventory(json.dumps(catalog), "codex")
+    assert not verifier.has_inventory(json.dumps({**catalog, "agentId": ""}), "openclaw")
+    for groups in (
+        [{**group, "source": "core"}],
+        [{**group, "pluginId": "other"}],
+        [{**group, "tools": rows[1:]}, {**group, "id": "plugin:other", "tools": rows[:1]}],
+        [{**group, "tools": [*rows[1:], {**rows[0], "pluginId": "other"}]}],
+        [{**group, "tools": [*rows[1:], {"label": rows[0]["id"]}]}],
+        [group, group],
+    ):
+        assert not verifier.has_inventory(json.dumps({**catalog, "groups": groups}), "openclaw")
+
+
 def test_only_the_original_catalogue_counts(tmp_path):
     names = sorted(verifier.TOOLS)
     catalog = [{"name": "mcp__autotem__" + name} for name in names]
