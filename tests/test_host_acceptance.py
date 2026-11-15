@@ -742,6 +742,109 @@ def test_discards_nonhost_cli_and_unmatched_results(tmp_path, alter, reason):
     assert report["case_verdict"] != "passed" and report["reason"] == reason
 
 
+@pytest.fixture
+def failed_codex_result(tmp_path):
+    from copy import deepcopy
+
+    _, spec, trace, events = sample(tmp_path)
+    completed = events[2]["item"]
+    failure = {
+        "schema_version": "1.0.0",
+        "request_id": None,
+        "tool": "validate_plan",
+        "ok": False,
+        "result": None,
+        "error": {
+            "code": "DEPENDENCY_BROKEN",
+            "message": "strain.gpa",
+            "retryable": False,
+            "details": {"reason": "import_timeout"},
+        },
+    }
+    completed.update(
+        status="failed",
+        error=None,
+        result={
+            "content": [{"type": "text", "text": json.dumps(failure)}],
+            "structured_content": deepcopy(failure),
+        },
+    )
+    started = dict(deepcopy(completed), status="in_progress", result=None)
+    retry = dict(
+        deepcopy(completed),
+        id="item_2",
+        status="completed",
+        result={"structured_content": dict(failure, ok=True, error=None, result={"valid": True})},
+    )
+    events[2:3] = [
+        {"type": "item.started", "item": started},
+        events[2],
+        {"type": "item.completed", "item": retry},
+    ]
+
+    def read():
+        trace.write_text("\n".join(map(json.dumps, events)), encoding="utf-8")
+        return verifier.read_turn(
+            tmp_path, spec["turns"][0], "codex", "codex-exec-jsonl", "autotem"
+        )
+
+    return started, completed, read
+
+
+def test_codex_retains_received_business_error_and_later_success(failed_codex_result):
+    _, completed, read = failed_codex_result
+    for copy_key in ("structured_content", "content"):
+        # Both native encodings carry a complete envelope, including text-only hosts.
+        original = completed["result"].pop(copy_key)
+        calls = read()["calls"]
+        assert [c["response"]["ok"] for c in calls] == [False, True]
+        assert calls[0]["response"]["error"]["details"] == {"reason": "import_timeout"}
+        assert calls[0]["arguments"] == completed["arguments"] and calls[0]["line"] == 4
+        completed["result"][copy_key] = original
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("completed", "error"), {"message": "server disconnected"}),
+        (("completed", "result"), None),
+        (("started", "id"), "unrelated"),
+        (("started", "tool"), "submit_analysis"),
+        (("started", "arguments"), {"plan": {"steps": []}}),
+        (("started", "server"), "other"),
+        (("started", "status"), "completed"),
+        (("completed", "result", "content", 0, "text"), '{"schema_version":'),
+        (("completed", "result", "content", 0, "text"), '{"ok": true}'),
+        (("completed", "result", "isError"), False),
+        (("response", "tool"), "submit_analysis"),
+        (("response", "request_id"), "other-request"),
+        (("response", "result"), {}),
+        (("response", "error", "retryable"), 0),
+        (("response", "error", "code"), ""),
+    ],
+)
+def test_codex_failed_item_rejects_unbound_or_incomplete_results(failed_codex_result, path, value):
+    started, completed, read = failed_codex_result
+    payload = completed["result"]
+    target = {"started": started, "completed": completed, "response": payload["structured_content"]}
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    if path[0] == "response":
+        payload["content"][0]["text"] = json.dumps(payload["structured_content"])
+    with pytest.raises((verifier.EvidenceError, verifier.NotEvaluated, ValueError)):
+        read()
+
+
+def test_codex_failed_item_rejects_an_otherwise_valid_positive_envelope(failed_codex_result):
+    _, completed, read = failed_codex_result
+    response = completed["result"]["structured_content"]
+    response.update(ok=True, result={"valid": True}, error=None)
+    completed["result"]["content"][0]["text"] = json.dumps(response)
+    with pytest.raises(verifier.EvidenceError, match="invalid_failed_mcp_error_envelope"):
+        read()
+
+
 def test_real_disk_hash_and_readonly_database_verification(tmp_path):
     import time
     import uuid

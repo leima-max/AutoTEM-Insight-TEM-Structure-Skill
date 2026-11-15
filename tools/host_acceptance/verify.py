@@ -193,6 +193,51 @@ def envelope(tool, payload):
     return result
 
 
+def codex_mcp_response(item, started):
+    """Codex also marks a received MCP isError business response as a failed item."""
+    status, payload = item.get("status"), item.get("result")
+    observed(
+        status in {"completed", "failed"} and payload and item.get("error") is None,
+        "host_did_not_receive_tool_result",
+    )
+    if status == "completed":
+        return envelope(item["tool"], payload)
+
+    # Bind a failed completion to the original in-flight call. An MCP error
+    # response still has the tool-result wrapper; a transport failure has none.
+    require(
+        started is not None
+        and started.get("status") == "in_progress"
+        and item["tool"] == started["tool"]
+        and isinstance(item.get("arguments"), dict)
+        and same_json(item["arguments"], started["arguments"]),
+        "failed_mcp_call_request_mismatch",
+    )
+    require(
+        isinstance(payload, dict)
+        and "tool" not in payload
+        and all(payload.get(key, True) is True for key in ("isError", "is_error")),
+        "failed_mcp_item_result_mismatch",
+    )
+    response = envelope(item["tool"], payload)
+    error = response.get("error")
+    require(
+        response["ok"] is False
+        and "result" in response
+        and response["result"] is None
+        and "request_id" in response
+        and response["request_id"] is None  # MCP dispatch does not supply a CLI request_id.
+        and isinstance(error, dict)
+        and isinstance(error.get("code"), str)
+        and re.fullmatch(r"[A-Z][A-Z0-9_]*", error["code"])
+        and isinstance(error.get("message"), str)
+        and error["message"].strip()
+        and type(error.get("retryable")) is bool,
+        "invalid_failed_mcp_error_envelope",
+    )
+    return response
+
+
 def read_turn(base, turn, host, capture_format, server):
     prompt_file = capture_file(base, turn.get("prompt"))
     trace_file = capture_file(base, turn.get("trace"))
@@ -204,6 +249,7 @@ def read_turn(base, turn, host, capture_format, server):
         require(host == "codex", "capture_format_host_mismatch")
         phase = "before_thread"
         completed_ids = set()
+        started_calls = {}
         with trace_file.open(encoding="utf-8-sig") as stream:
             for line_no, line in enumerate(stream, 1):
                 if not line.strip():
@@ -229,6 +275,14 @@ def read_turn(base, turn, host, capture_format, server):
                         continue
                     require(phase == "active", "host_item_outside_turn")
                     if kind == "item.started":
+                        if item["type"] == "mcp_tool_call" and item.get("server") == server:
+                            item_id = item.get("id")
+                            if isinstance(item_id, str) and item_id:
+                                require(
+                                    item_id not in started_calls and item_id not in completed_ids,
+                                    "duplicate_host_item_start",
+                                )
+                                started_calls[item_id] = item
                         continue
                     item_id = item.get("id")
                     if item_id is not None:
@@ -249,15 +303,13 @@ def read_turn(base, turn, host, capture_format, server):
                     if item["type"] == "mcp_tool_call" and item.get("server") == server:
                         tool = item["tool"]
                         require(tool in TOOLS, "unexpected_tool_in_autotem_namespace")
-                        observed(
-                            item.get("status") == "completed" and item.get("result"),
-                            "host_did_not_receive_tool_result",
-                        )
                         calls.append(
                             {
                                 "tool": tool,
                                 "arguments": item["arguments"],
-                                "response": envelope(tool, item["result"]),
+                                "response": codex_mcp_response(
+                                    item, started_calls.pop(item_id, None)
+                                ),
                                 "line": line_no,
                             }
                         )
@@ -2184,6 +2236,11 @@ def verify(spec_path, *, bundle=None, root=None, project=None):
                     "tool": c["tool"],
                     "line": c["line"],
                     "ok": c["response"]["ok"],
+                    **(
+                        {"error_code": c["response"]["error"].get("code")}
+                        if not c["response"]["ok"]
+                        else {}
+                    ),
                     "argument_sha256": text_digest(
                         json.dumps(c["arguments"], sort_keys=True, ensure_ascii=False)
                     ),
