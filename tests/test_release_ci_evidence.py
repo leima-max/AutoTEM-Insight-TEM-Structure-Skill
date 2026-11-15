@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import subprocess
 from contextlib import closing
 from pathlib import Path, PurePosixPath
 from zipfile import ZipFile
@@ -191,6 +192,16 @@ def test_windows_release_triggers_on_every_frozen_source_rule():
         ".gitattributes", "apps/atom_detection_ui.py", "apps/b1_b3_preview_ui.py",
         "apps/b2_diffraction_ui.py", "apps/requirements.txt",
     } <= set(build_release.SOURCE_PATHS)
+
+
+def test_shipped_app_sources_use_their_git_line_endings_on_windows(tmp_path):
+    subprocess.run(["git", "init", "-q", tmp_path], check=True)
+    (tmp_path / ".gitattributes").write_bytes((ROOT / ".gitattributes").read_bytes())
+    shipped = [name for name in build_release.SOURCE_PATHS if name.startswith("apps/")]
+    rules = subprocess.check_output(
+        ["git", "-C", tmp_path, "-c", "core.autocrlf=true", "check-attr", "-z", "eol", "--", *shipped]
+    ).decode().split("\0")[:-1]
+    assert dict(zip(rules[::3], rules[2::3])) == dict.fromkeys(shipped, "lf")
 
 
 def test_windows_release_triggers_on_source_suite_git_inputs():

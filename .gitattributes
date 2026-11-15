@@ -22,6 +22,8 @@
 /tools/host_acceptance/** text=auto eol=lf
 /tests/** text=auto eol=lf
 /apps/atom_detection_ui.py text eol=lf
+/apps/b1_b3_preview_ui.py text eol=lf
+/apps/b2_diffraction_ui.py text eol=lf
 /apps/requirements.txt text eol=lf
 /docs/HARNESS_RELEASE_TECHNICAL_DEVELOPMENT_PLAN.md text eol=lf
 /docs/harness-windows-release.md text eol=lf
