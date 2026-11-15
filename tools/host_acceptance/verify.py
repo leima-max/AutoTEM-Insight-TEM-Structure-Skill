@@ -13,6 +13,7 @@ import sqlite3
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
+from html.parser import HTMLParser
 from pathlib import Path
 
 MATRIX = json.loads(Path(__file__).with_name("matrix.json").read_text("utf-8"))
@@ -465,9 +466,14 @@ def run_evidence(root, run_id, window, runtime):
             "handler_origin_mismatch",
         )
     science = []
-    for step_id, op in successful.items():
+    parameters = {s["id"]: s.get("parameters", {}) for s in request["steps"]}
+    for step in steps:
+        step_id = step["step_id"]
+        op = successful.get(step_id)
         if op in {"strain.gpa", "strain.atom"}:
-            science.append(check_strain_fields(scientific_files, step_id, op))
+            science.append(
+                check_strain_fields(scientific_files, step, parameters[step_id], artifacts)
+            )
         if op == "simulation.diffraction":
             simulation = unique_json(scientific_files[(step_id, "simulation")].read_text("utf-8"))
             require(
@@ -516,9 +522,67 @@ def run_evidence(root, run_id, window, runtime):
     }
 
 
-def check_strain_fields(files, step_id, operation):
+def check_gpa_geometry(mask, source, config, consumed, artifacts):
+    """Bind full fields and half-open reference boxes to the image actually used."""
+    role = config.get("image_role", "raw")
+    image_id = consumed.get(role)
+    image = artifacts.get(image_id, {})
+    provenance = source["provenance"]
+    require(
+        image.get("role") == role
+        and image.get("execution_usable")
+        and image.get("kind") == "array"
+        and provenance.get("image_role", role) == role
+        and mask.ndim == 2
+        and list(mask.shape) == image.get("shape"),
+        "gpa_fields_do_not_cover_consumed_image",
+    )
+    shared = config.get("reference_region")
+    pair = config.get("reference_regions")
+    expected = pair if pair is not None else [shared, shared]
+    require(isinstance(expected, list) and len(expected) == 2, "invalid_gpa_reference_pair")
+    regions = dict(zip(("g1", "g2"), expected, strict=True))
+    common = expected[0] if expected[0] == expected[1] else None
+    # Older records stored a common box alone. Distinct boxes need both labels.
+    recorded = provenance.get(
+        "reference_regions", dict.fromkeys(regions, source.get("reference_region"))
+    )
+    absolute = config.get("absolute_reference", False)
+    require(
+        recorded == regions
+        and source.get("reference_region") == common
+        and provenance.get("absolute_reference_accepted", False) is absolute,
+        "gpa_reference_differs_from_request",
+    )
+    coverage = {}
+    for label, box in regions.items():
+        if box is None:
+            require(absolute is True, "gpa_reference_without_valid_pixels")
+            continue
+        require(
+            isinstance(box, list) and len(box) == 4 and all(type(v) is int for v in box),
+            "invalid_gpa_reference_bounds",
+        )
+        y0, y1, x0, x1 = box
+        require(
+            0 <= y0 < y1 <= mask.shape[0] and 0 <= x0 < x1 <= mask.shape[1],
+            "invalid_gpa_reference_bounds",
+        )
+        valid = int(mask[y0:y1, x0:x1].sum())
+        require(valid >= 9, "gpa_reference_without_valid_pixels")
+        coverage[label] = {"box": box, "valid_count": valid, "total_count": (y1 - y0) * (x1 - x0)}
+    return {
+        "image_artifact_id": image_id,
+        "image_shape": image["shape"],
+        "reference_coverage": coverage,
+    }
+
+
+def check_strain_fields(files, step, config, artifacts):
     import numpy as np
 
+    step_id = step["step_id"]
+    operation = step["operation_id"]
     prefix = "gpa" if operation == "strain.gpa" else "atom_strain"
     source = unique_json(files[(step_id, prefix)].read_text("utf-8"))
 
@@ -540,16 +604,6 @@ def check_strain_fields(files, step_id, operation):
             source["provenance"].get("complete_arrays") is True,
             "strain_fields_not_declared_complete",
         )
-        references = source["provenance"].get("reference_regions", {})
-        regions = list(references.values()) if references else [source.get("reference_region")]
-        if not source["provenance"].get("absolute_reference_accepted"):
-            require(
-                regions
-                and all(
-                    r and len(r) == 4 and mask[r[0] : r[1], r[2] : r[3]].sum() >= 9 for r in regions
-                ),
-                "gpa_reference_without_valid_pixels",
-            )
     else:
         mask = array("valid_atom_mask")
         fields = ("atom_strain_xx", "atom_strain_yy", "atom_strain_xy")
@@ -559,6 +613,10 @@ def check_strain_fields(files, step_id, operation):
             "missing_atomic_strain_reference_or_display_limits",
         )
     require(mask.dtype == np.bool_ and mask.any(), "strain_validity_mask_empty")
+    geometry = {}
+    if prefix == "gpa":
+        consumed = unique_json(step["result"] or "{}").get("consumed_artifacts", {})
+        geometry = check_gpa_geometry(mask, source, config, consumed, artifacts)
     for name in fields:
         values = array(name)
         require(
@@ -570,6 +628,7 @@ def check_strain_fields(files, step_id, operation):
         "valid_count": int(mask.sum()),
         "total_count": mask.size,
         "scientific_level": "diagnostic",
+        **geometry,
     }
 
 
@@ -694,6 +753,270 @@ def matches_displayed(number, scale, expected):
         and math.isfinite(half_place)
         and abs(shown - expected) <= half_place + 4 * math.ulp(expected)
     )
+
+
+_PIXELS = r"(?:\d{1,3}(?:,\d{3})+|\d+)"
+_COVERAGE_NUMBER = re.compile(
+    rf"(?P<valid>{_PIXELS})\s*(?:/|／|\bof\b|\bout of\b)\s*(?P<total>{_PIXELS})"
+    r"|(?P<percent>[+-]?\d+(?:\.\d+)?)\s*[%％]|(?P<fraction>(?<![\d.])[01]\.\d+)(?![\w.%％])",
+    re.I,
+)
+_COVERAGE_LABEL = (
+    r"(?:(?<![非不])有效(?:像素|像元)(?:数(?:量)?|覆盖率|占比|比例|百分比|率)?"
+    r"|(?<![非不])有效(?:区域?|掩膜)?(?:覆盖率?|占比|比例)|(?:质量|有效)掩膜覆盖(?:率|全图)?"
+    r"|(?:全图|整幅图像)(?:的)?(?:掩膜)?覆盖率"
+    r"|(?:全图|整幅图像)(?:所有|全部)?像素(?:均|全部|都)有效"
+    r"|\bvalid[- ]pixels?(?:\s+(?:fraction|coverage|percentage|count|ratio))?"
+    r"|(?:quality[- ]mask|valid[- ]area)\s+coverage)"
+)
+_COVERAGE_AFTER_LABEL = re.compile(
+    _COVERAGE_LABEL + r"(?:占全图的?)?[\s*_：（(≈=:]*(?:(?:约为|约占|约|为|是|占|的|共|总计"
+    r"|is|was|of|about|approximately)"
+    r"[\s*_≈=:]*)*$",
+    re.I,
+)
+_COVERAGE_AFTER_VALUE = re.compile(
+    r"^[\s*_]*(?:(?:of\s+)?(?:(?:all|the)\s+)*(?:image\s+)?pixels?\s+(?:are|were)\s+valid"
+    r"|[个的]?(?:像素|像元)(?:为|是)?有效)",
+    re.I,
+)
+_GPA_SCOPE = re.compile(
+    r"(?P<image>全图|整幅(?:图像)?|整张图|整个图像|全场|原图所有|"
+    r"\b(?:overall|whole[- ]image|full[- ](?:image|frame)|all\s+(?:image\s+)?pixels)\b)"
+    r"|(?P<region>参考(?:区域?|框)|局部|选区|\b(?:roi|reference (?:region|box)|local region)\b)",
+    re.I,
+)
+
+
+def gpa_coverage_statements(answer):
+    """Recognize labeled whole-image percentages and valid/total pixel counts in the final text."""
+    # A comma can separate an ROI, strain, or uncertainty measurement. Keep grouped integer digits.
+    sentences = re.compile(r"[^。；;!！?？\n]+?(?=[。；;!！?？\n]|\.(?:\s|$)|$)")
+    clauses = re.compile(r"(?:[^，,]|,(?=\d{3}(?!\d)))+")
+    section = None
+    for sentence in sentences.finditer(answer):
+        heading = sentence[0].strip().strip("*").strip()
+        if heading.startswith("#") or heading.endswith(("：", ":")):
+            scopes = list(_GPA_SCOPE.finditer(heading))
+            section = scopes[-1].lastgroup if scopes else None
+        scope = section
+        for clause in clauses.finditer(sentence[0]):
+            words = clause[0]
+            previous = None
+            for number in _COVERAGE_NUMBER.finditer(words):
+                prefix, suffix = words[: number.start()], words[number.end() :]
+                regions = list(_GPA_SCOPE.finditer(prefix))
+                active_scope = regions[-1].lastgroup if regions else scope
+                # "valid pixel coverage 100% within the ROI" has a trailing scope.
+                after = re.match(
+                    r"[\s*_]*(?:(?:within|in|inside)\s+(?:the\s+)?|在|位于)", suffix, re.I
+                )
+                if after:
+                    trailing = _GPA_SCOPE.match(suffix, after.end())
+                    if trailing:
+                        active_scope = trailing.lastgroup
+                parenthetical = re.match(
+                    r"[\s*_]*[（(]\s*(?:within\s+|in\s+)?(?:the\s+)?", suffix, re.I
+                )
+                if parenthetical:
+                    trailing = _GPA_SCOPE.match(suffix, parenthetical.end())
+                    if trailing and re.match(r"[\s内中]*[）)]", suffix[trailing.end() :]):
+                        active_scope = trailing.lastgroup
+                adjacent = previous is not None and re.fullmatch(
+                    r"[\s*_]*(?:个?(?:像素|像元)|pixels?)?[\s*_]*(?:[（(]|即|=)[\s*_约≈]*",
+                    words[previous : number.start()],
+                    re.I,
+                )
+                if active_scope == "region" or not (
+                    _COVERAGE_AFTER_LABEL.search(prefix)
+                    or _COVERAGE_AFTER_VALUE.match(suffix)
+                    or adjacent
+                ):
+                    previous = None
+                    continue
+                if number["fraction"] is not None and not re.search(
+                    r"(?:占比|比例|\bfraction\b|\bratio\b)[\s*_：:=≈]*(?:约为|为|约|is|was|about)?"
+                    r"[\s*_：:=≈]*$",
+                    prefix,
+                    re.I,
+                ):
+                    previous = None
+                    continue
+                observed(
+                    not re.match(r"\s*(?:[-–—~～至到]|或|\bor\b)\s*\d", suffix, re.I),
+                    "whole_image_gpa_coverage_range_not_resolved",
+                )
+                previous = number.end()
+                offset = sentence.start() + clause.start()
+                yield offset + number.start(), offset + number.end(), number, sentence[0]
+            regions = list(_GPA_SCOPE.finditer(words))
+            if regions:
+                scope = regions[-1].lastgroup
+
+
+class _LocalReportAnchors(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.hrefs = set()
+        self.has_base = False
+
+    def handle_starttag(self, tag, attrs):
+        href = dict(attrs).get("href")
+        if tag == "base" and href:
+            self.has_base = True
+        if tag == "a" and href:
+            self.hrefs.add(href)
+
+
+def gpa_coverage_sources(run, cited):
+    """Resolve a returned mask, GPA JSON or report to the specific registered masks it supports."""
+    if run["status"] != "completed":
+        return {}, {}
+    artifacts, directory = run["artifacts"], run["_directory"]
+    gpa_steps = {
+        s["step_id"]
+        for s in run["steps"]
+        if s["operation_id"] == "strain.gpa" and s["status"] == "completed"
+    }
+    counts = {s["step_id"]: s for s in run["strain_validity"] if s["step_id"] in gpa_steps}
+    masks, sources = {}, {}
+    for aid, item in artifacts.items():
+        step = item["step_id"]
+        if item["role"] == "gpa.quality_mask" and item["execution_usable"] and step in counts:
+            require(step not in masks, "ambiguous_registered_gpa_mask")
+            masks[step] = aid
+    evidence = {
+        aid: {
+            "run_id": run["run_id"],
+            "step_id": step,
+            "mask_sha256": artifacts[aid]["sha256"],
+            "valid_pixels": counts[step]["valid_count"],
+            "total_pixels": counts[step]["total_count"],
+        }
+        for step, aid in masks.items()
+    }
+    for ref in cited & artifacts.keys():
+        item = artifacts[ref]
+        step, role = item["step_id"], item["role"]
+        path = directory / item["file"]
+        if ref in evidence:
+            ids = {ref}
+        elif role == "gpa" and item["execution_usable"] and step in masks:
+            mask_id = masks[step]
+            pointer = unique_json(path.read_text("utf-8"))["provenance"].get("quality_mask", {})
+            target = directory / artifacts[mask_id]["file"]
+            ids = (
+                {mask_id}
+                if Path(pointer.get("uri") or "") in {target, Path(target.name)}
+                else set()
+            )
+        elif role == "report_manifest":
+            report = unique_json(path.read_text("utf-8"))
+            require(report.get("run", {}).get("run_id") == run["run_id"], "gpa_report_run_mismatch")
+            inventory = {a["artifact_id"]: a for a in report["artifacts"]}
+            ids = set()
+            for row in report.get("strain_results", {}).get("all", []):
+                mask_id = (row.get("validity_mask") or {}).get("artifact_id")
+                result = artifacts.get(row.get("artifact_id"), {})
+                if (
+                    mask_id in evidence
+                    and row.get("operation_id") == "strain.gpa"
+                    and row.get("step_id") == evidence[mask_id]["step_id"] == result.get("step_id")
+                    and result.get("role") == "gpa"
+                    and result.get("execution_usable")
+                ):
+                    a = inventory.get(mask_id, {})
+                    require(
+                        a.get("role") == "gpa.quality_mask"
+                        and a.get("step_id") == row["step_id"]
+                        and a.get("execution_usable")
+                        and a.get("sha256") == evidence[mask_id]["mask_sha256"],
+                        "gpa_report_mask_registration_mismatch",
+                    )
+                    ids.add(mask_id)
+        elif role == "report_html":
+            anchors = _LocalReportAnchors()
+            anchors.feed(path.read_text("utf-8"))
+            anchors.close()
+            ids = {
+                i
+                for i in evidence
+                if not anchors.has_base
+                and (directory / artifacts[i]["file"]).parent == path.parent
+                and Path(artifacts[i]["file"]).name in anchors.hrefs
+            }
+        else:
+            continue
+        sources[ref] = ids
+    return evidence, sources
+
+
+def check_gpa_coverage_answer(final, claims, runs, returned, compared):
+    """Check each whole-image claim against one cited mask from a compared GPA step."""
+    statements = list(gpa_coverage_statements(final))
+    observed(statements, "whole_image_gpa_coverage_not_observed")
+    evidence, sources = {}, {}
+    cited = {i for c in claims for i in c["artifact_ids"]} & returned
+    for run in runs.values():
+        measurements, linked = gpa_coverage_sources(run, cited)
+        evidence.update(measurements)
+        sources.update(linked)
+    quantities = []
+    for start, end, number, sentence in statements:
+        covering = []
+        for claim in claims:
+            for occurrence in re.finditer(re.escape(claim["quote"]), final):
+                if occurrence.start() <= start and end <= occurrence.end():
+                    covering.append(claim)
+                    break
+        observed(covering, "gpa_coverage_claim_has_no_linked_citation")
+        size = min(len(c["quote"]) for c in covering)
+        refs = {i for c in covering if len(c["quote"]) == size for i in c["artifact_ids"]} & cited
+        mentioned = set(_ID.findall(sentence))
+        inline = mentioned & returned
+        if inline:
+            refs &= inline
+        elif len(evidence) > 1:
+            # A detached annotation cannot choose a run/step for ambiguous host prose.
+            observed(
+                sum(m["run_id"] in mentioned for m in evidence.values()) == 1,
+                "gpa_coverage_claim_has_no_local_mask_reference",
+            )
+        resolved = [sources[i] for i in refs if i in sources]
+        observed(resolved and all(resolved), "gpa_coverage_claim_has_no_linked_mask")
+        ids = set.intersection(*resolved)
+        require(ids, "gpa_coverage_citations_disagree")
+        observed(len(ids) == 1, "gpa_coverage_claim_has_ambiguous_mask")
+        mask_id = next(iter(ids))
+        measured = evidence[mask_id]
+        run_id, step = measured["run_id"], measured["step_id"]
+        require(
+            refs <= runs[run_id]["artifacts"].keys() and mentioned.intersection(runs) <= {run_id},
+            "gpa_coverage_citation_mixes_runs",
+        )
+        require((run_id, step) in compared, "gpa_coverage_step_was_not_compared")
+        valid, total = measured["valid_pixels"], measured["total_pixels"]
+        if number["percent"] is not None:
+            ok = matches_displayed(number["percent"], 1, 100 * valid / total)
+        elif number["fraction"] is not None:
+            ok = matches_displayed(number["fraction"], 1, valid / total)
+        else:
+            ok = (int(number["valid"].replace(",", "")), int(number["total"].replace(",", ""))) == (
+                valid,
+                total,
+            )
+        require(ok, "answer_gpa_coverage_differs_from_registered_mask")
+        quantities.append(
+            {
+                "as_displayed": number[0],
+                "cited_artifacts": sorted(refs),
+                "mask_artifact_id": mask_id,
+            }
+        )
+    return {
+        "masks": {i: evidence[i] for i in sorted({q["mask_artifact_id"] for q in quantities})},
+        "quantities": quantities,
+    }
 
 
 def spacing_sources(run, cited):
@@ -1109,7 +1432,7 @@ def check_gpa_followup(variant, turns, runs, excerpts):
     }
 
 
-def has_matching_gpa_repeat(measurements, completed):
+def compared_gpa_steps(measurements, completed):
     """Match the card's comparison to the measured image and normalized plan parameters."""
 
     def outputs(runs, operation, role):
@@ -1131,19 +1454,26 @@ def has_matching_gpa_repeat(measurements, completed):
         return run["artifacts"].get(image_id, {}).get("sha256")
 
     measured = [
-        (run["source_sha256"], image_hash(run, step, config), config)
+        (
+            (run["run_id"], step["step_id"]),
+            run["source_sha256"],
+            image_hash(run, step, config),
+            config,
+        )
         for run, step, config, _ in outputs(measurements, "strain.gpa", "gpa")
     ]
+    matched = set()
     for run, step, parameters, artifact in outputs(
         completed, "strain.gpa_compare", "gpa_comparison"
     ):
         config = parameters["reference_config"]
         image = image_hash(run, step, config)
-        if (
-            not image
-            or config != parameters["candidate_config"]
-            or (run["source_sha256"], image, config) not in measured
-        ):
+        matching = {
+            location
+            for location, source, raw, plan in measured
+            if (source, raw, plan) == (run["source_sha256"], image, config)
+        }
+        if not image or config != parameters["candidate_config"] or not matching:
             continue
         path = run["_directory"] / artifact["file"]
         require(digest(path) == artifact["sha256"], "gpa_comparison_artifact_changed")
@@ -1169,8 +1499,8 @@ def has_matching_gpa_repeat(measurements, completed):
             and type(error) in (int, float)
             and error == 0
         ):
-            return True
-    return False
+            matched.update(matching)
+    return matched
 
 
 def has_raw_refined_atomic_measurements(run):
@@ -1252,10 +1582,9 @@ def check_case(case, calls, runs, turns, excerpts, variant=None):
         ]
         require(candidates, "requested_operations_or_results_missing")
         if case == "J03":
-            require(
-                has_matching_gpa_repeat(candidates, completed),
-                "same_parameter_gpa_comparison_missing",
-            )
+            compared = compared_gpa_steps(candidates, completed)
+            require(compared, "same_parameter_gpa_comparison_missing")
+            return compared
         modalities = {"J01": {"HRTEM"}, "J02": {"HAADF-STEM"}, "J05": {"SAED", "NBED"}}
         if case in modalities:
             require(
@@ -1887,11 +2216,11 @@ def verify(spec_path, *, bundle=None, root=None, project=None):
             variant = mode
         if variant:
             result["variant"] = variant
-        followup = check_case(
+        case_evidence = check_case(
             spec["case_id"], calls, runs, turns, spec.get("followup_excerpts", {}), variant
         )
-        if followup:
-            result["gpa_followup"] = followup
+        if case_evidence and spec["case_id"] == "J08":
+            result["gpa_followup"] = case_evidence
         checks["case_execution"] = "passed"
         all_artifacts = {i: a for run in runs.values() for i, a in run["artifacts"].items()}
         returned = set()
@@ -1960,6 +2289,18 @@ def verify(spec_path, *, bundle=None, root=None, project=None):
         if spec["case_id"] == "J01":
             result["spacing_answer"] = check_spacing_answer(final, claims, runs, returned)
             checks["quoted_spacing_consistency"] = "passed"
+        elif spec["case_id"] == "J03":
+            try:
+                result["gpa_coverage_answer"] = check_gpa_coverage_answer(
+                    final, claims, runs, returned, case_evidence
+                )
+            except NotEvaluated:
+                checks["quoted_gpa_coverage_consistency"] = "not_evaluated"
+                raise
+            except EvidenceError:
+                checks["quoted_gpa_coverage_consistency"] = "failed"
+                raise
+            checks["quoted_gpa_coverage_consistency"] = "passed"
         checks["answer_return"] = "passed"
         host_observations(spec, base, turns + children, calls, result)
         observed(runtime is not None, "no_verified_release_binding")

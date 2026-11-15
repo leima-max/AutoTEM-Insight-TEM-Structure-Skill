@@ -153,6 +153,220 @@ def test_explicit_spacing_source_cannot_be_borrowed_from_another_claim_or_run(sp
         verifier.check_spacing_answer(answer + " " + other, claims, {"r": run}, set(ids.values()))
 
 
+@pytest.fixture
+def coverage_capture(tmp_path):
+    import numpy as np
+
+    def make_run(name, counts):
+        directory = tmp_path / name
+        directory.mkdir()
+        run = {
+            "run_id": name,
+            "status": "completed",
+            "_directory": directory,
+            "steps": [],
+            "artifacts": {},
+            "strain_validity": [],
+        }
+        rows = []
+
+        def register(role, path, step):
+            aid = path.stem
+            run["artifacts"][aid] = {
+                "role": role,
+                "file": path.name,
+                "step_id": step,
+                "sha256": verifier.digest(path),
+                "execution_usable": step != "_report",
+            }
+            return aid
+
+        for sequence, valid in enumerate(counts):
+            step = f"g{sequence}"
+            run["steps"].append(
+                {"step_id": step, "operation_id": "strain.gpa", "status": "completed"}
+            )
+            mask = (np.arange(2000) < valid).reshape(40, 50)
+            path = directory / f"{name[:28]}{sequence:02x}01.npy"
+            np.save(path, mask)
+            mask_id = register("gpa.quality_mask", path, step)
+            run["strain_validity"].append(
+                {"step_id": step, "valid_count": int(mask.sum()), "total_count": mask.size}
+            )
+            gpa = directory / f"{name[:28]}{sequence:02x}02.json"
+            write_json(gpa, {"provenance": {"quality_mask": {"uri": str(path)}}})
+            rows.append(
+                {
+                    "artifact_id": register("gpa", gpa, step),
+                    "operation_id": "strain.gpa",
+                    "step_id": step,
+                    "validity_mask": {"artifact_id": mask_id},
+                }
+            )
+        manifest = directory / f"{name[:28]}ffff.json"
+        write_json(
+            manifest,
+            {
+                "run": {"run_id": name},
+                "strain_results": {"all": rows},
+                "artifacts": [dict(artifact_id=i, **a) for i, a in run["artifacts"].items()],
+            },
+        )
+        register("report_manifest", manifest, "_report")
+        html = directory / f"{name[:28]}fffe.html"
+        html.write_text(
+            " ".join(f'<a href="{r["validity_mask"]["artifact_id"]}.npy">mask</a>' for r in rows)
+        )
+        register("report_html", html, "_report")
+        return run
+
+    return make_run
+
+
+def check_coverage(run, text, roles=("gpa.quality_mask",)):
+    refs = [i for i, a in run["artifacts"].items() if a["role"] in roles]
+    answer = text + " " + " ".join(refs)
+    compared = {(run["run_id"], s["step_id"]) for s in run["steps"]}
+    return verifier.check_gpa_coverage_answer(
+        answer, [{"quote": answer, "artifact_ids": refs}], {run["run_id"]: run}, set(refs), compared
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "role", "quantities"),
+    [
+        (
+            "全图有效像素占比约为 73.55%，参考框内有效覆盖率 100%，εxx 为 2%。",
+            "gpa.quality_mask",
+            1,
+        ),
+        ("有效像素占全图的 74%（1,471 / 2,000 个像素）", "gpa", 2),
+        ("参考框内的有效覆盖率 100%，整幅图像有效覆盖率 73.6％", "report_manifest", 1),
+        ("Whole-image valid pixel coverage is 73.55% (1,471 of 2,000 pixels).", "report_html", 2),
+        ("73.55% of all pixels are valid.", "gpa.quality_mask", 1),
+        ("全图共有 1471/2000 个像素有效", "report_manifest", 1),
+        ("全图有效像素占比0.7355", "gpa.quality_mask", 1),
+        ("全图有 73.55% 的像素有效", "gpa", 1),
+        ("## 全图\n有效覆盖率 74%\n## 参考框\n有效覆盖率 100%", "gpa.quality_mask", 1),
+    ],
+)
+def test_j03_answer_matches_the_registered_full_image_mask(
+    coverage_capture, text, role, quantities
+):
+    run = coverage_capture("a" * 32, [1471])
+    result = check_coverage(run, text, (role,))
+    mask = next(iter(result["masks"]))
+    assert result["masks"][mask] == {
+        "run_id": run["run_id"],
+        "step_id": "g0",
+        "mask_sha256": run["artifacts"][mask]["sha256"],
+        "valid_pixels": 1471,
+        "total_pixels": 2000,
+    }
+    assert len(result["quantities"]) == quantities
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "有效覆盖率 100%",
+        "GPA 掩膜显示全图覆盖率为 100%",
+        "全图所有像素均有效（100%）",
+        "全图有效覆盖率 73.54%",
+        "有效像素 1471/1999",
+        "Whole-image valid pixel fraction is 1.00",
+        "全图有效像素占比 1471/2000 (100%)",
+        "全图有效覆盖率 74%。另一项全图有效覆盖率 100%。",
+    ],
+)
+def test_j03_answer_rejects_explicit_wrong_numeric_coverage(coverage_capture, text):
+    with pytest.raises(verifier.EvidenceError, match="answer_gpa_coverage_differs"):
+        check_coverage(coverage_capture("a" * 32, [1471]), text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "参考区有效覆盖率 100%，全图应变 73.55%",
+        "Valid pixel coverage is 100% within the ROI.",
+        "有效覆盖率 100%（参考框内）。",
+        "参考框：\n有效像素占比 100%",
+        "invalid pixel coverage is 26.45%.",
+        "全图 εxx 73.55%，不确定度 100%，掩膜已登记。",
+        "有效覆盖率在 60% 至 90% 之间",
+    ],
+)
+def test_j03_roi_or_unlabeled_percentage_is_not_a_whole_image_measurement(coverage_capture, text):
+    with pytest.raises(verifier.NotEvaluated, match="whole_image_gpa_coverage"):
+        check_coverage(coverage_capture("a" * 32, [1471]), text)
+
+
+def test_j03_coverage_binds_one_compared_step_and_actual_report(coverage_capture):
+    first = coverage_capture("a" * 32, [1471, 500])
+    second = coverage_capture("b" * 32, [2000])
+    runs = {r["run_id"]: r for r in (first, second)}
+    m1, m2 = (i for i, a in first["artifacts"].items() if a["role"] == "gpa.quality_mask")
+    report = next(i for i, a in first["artifacts"].items() if a["role"] == "report_manifest")
+    other = next(i for i, a in second["artifacts"].items() if a["role"] == "gpa.quality_mask")
+    compared = {(first["run_id"], "g0"), (second["run_id"], "g0")}
+
+    def claim(rows):
+        claims = [{"quote": f"{s} {' '.join(ids)}", "artifact_ids": ids} for s, ids in rows]
+        return verifier.check_gpa_coverage_answer(
+            "\n".join(c["quote"] for c in claims),
+            claims,
+            runs,
+            {i for c in claims for i in c["artifact_ids"]},
+            compared,
+        )
+
+    assert (
+        len(claim([("有效覆盖率 74%", [m1, report]), ("有效覆盖率 100%", [other])])["masks"]) == 2
+    )
+    with pytest.raises(verifier.NotEvaluated, match="ambiguous_mask"):
+        claim([("全图有效覆盖率 74%", [report])])
+    with pytest.raises(verifier.EvidenceError, match="citations_disagree"):
+        claim([("有效覆盖率 100%", [other, report])])
+    with pytest.raises(verifier.EvidenceError, match="step_was_not_compared"):
+        claim([("有效覆盖率 25%", [m2, report])])
+    with pytest.raises(verifier.EvidenceError, match="differs_from_registered_mask"):
+        claim([("有效覆盖率 100%", [m1]), ("有效覆盖率 100%", [other])])
+    answer = f"全图有效覆盖率 100%。两次运行的掩膜编号为 {m1} 和 {other}。"
+    with pytest.raises(verifier.NotEvaluated, match="no_local_mask_reference"):
+        verifier.check_gpa_coverage_answer(
+            answer,
+            [{"quote": "全图有效覆盖率 100%", "artifact_ids": [other]}],
+            runs,
+            {m1, other},
+            compared,
+        )
+    path = first["_directory"] / first["artifacts"][report]["file"]
+    data = json.loads(path.read_text("utf-8"))
+    next(a for a in data["artifacts"] if a["artifact_id"] == m1)["sha256"] = "0" * 64
+    write_json(path, data)
+    with pytest.raises(verifier.EvidenceError, match="report_mask_registration_mismatch"):
+        claim([("有效覆盖率 74%", [m1, report])])
+    data["run"]["run_id"] = second["run_id"]
+    write_json(path, data)
+    with pytest.raises(verifier.EvidenceError, match="gpa_report_run_mismatch"):
+        claim([("有效覆盖率 74%", [report])])
+
+
+def test_j03_report_and_result_must_link_to_the_registered_mask(coverage_capture):
+    run = coverage_capture("a" * 32, [1471])
+    arts = run["artifacts"]
+    mask = next(i for i, a in arts.items() if a["role"] == "gpa.quality_mask")
+    gpa = next(a for a in arts.values() if a["role"] == "gpa")
+    write_json(
+        run["_directory"] / gpa["file"], {"provenance": {"quality_mask": {"uri": "other.npy"}}}
+    )
+    html = next(a for a in arts.values() if a["role"] == "report_html")
+    (run["_directory"] / html["file"]).write_text(f'<!-- <a href="{mask}.npy">mask</a> -->')
+    for role in ("gpa", "report_html"):
+        with pytest.raises(verifier.NotEvaluated, match="claim_has_no_linked_mask"):
+            check_coverage(run, "有效覆盖率 74%", (role,))
+
+
 def test_j02_requires_same_raw_refinement_and_physical_distances(tmp_path):
     products = [
         ("input.load", "raw", {}),
@@ -206,6 +420,83 @@ def test_j02_requires_same_raw_refinement_and_physical_distances(tmp_path):
     lattice["provenance"]["raw_refinement"]["point_status"] = []
     write_json(tmp_path / "refined_atoms", lattice)
     with pytest.raises(verifier.EvidenceError, match="raw_refined_physical"):
+        check()
+
+
+def test_gpa_geometry_binds_full_image_and_requested_reference(tmp_path):
+    import numpy as np
+
+    mask = np.ones((6, 8), dtype=bool)
+    mask[0] = False
+    values = np.where(mask, 0.25, np.nan)
+    files = {}
+    for name in (
+        "quality_mask",
+        "displacement_x",
+        "displacement_y",
+        "strain_xx",
+        "strain_yy",
+        "strain_xy",
+        "rotation_xy",
+        "uncertainty",
+    ):
+        path = tmp_path / f"{name}.npy"
+        np.save(path, mask if name == "quality_mask" else values)
+        files["g", f"gpa.{name}"] = path
+    files["g", "gpa"] = tmp_path / "gpa.json"
+    step = {
+        "step_id": "g",
+        "operation_id": "strain.gpa",
+        "result": json.dumps({"consumed_artifacts": {"processed": "filtered"}}),
+    }
+    image = {"role": "processed", "kind": "array", "execution_usable": True, "shape": [6, 8]}
+    config = {"image_role": "processed", "reference_region": [0, 4, 0, 3]}
+    source = {
+        "reference_region": config["reference_region"],
+        "provenance": {"complete_arrays": True},
+    }
+
+    def check():
+        write_json(files["g", "gpa"], source)
+        return verifier.check_strain_fields(files, step, config, {"filtered": image})
+
+    result = check()
+    assert result["image_artifact_id"] == "filtered"
+    assert (result["valid_count"], result["total_count"]) == (40, 48)
+    assert result["reference_coverage"]["g1"] == {
+        "box": [0, 4, 0, 3],
+        "valid_count": 9,
+        "total_count": 12,
+    }
+    image["shape"] = [12, 16]
+    with pytest.raises(verifier.EvidenceError, match="do_not_cover_consumed_image"):
+        check()
+    image["shape"] = [6, 8]
+    config["image_role"] = "raw"
+    with pytest.raises(verifier.EvidenceError, match="do_not_cover_consumed_image"):
+        check()
+    config["image_role"] = "processed"
+    source["reference_region"] = [0, 4, 1, 4]
+    with pytest.raises(verifier.EvidenceError, match="reference_differs_from_request"):
+        check()
+    for box in ([0, 60, 0, 80], [-3, 6, 0, 8], [0, True, 0, 8], [4, 3, 1, 5]):
+        source["reference_region"] = config["reference_region"] = box
+        with pytest.raises(verifier.EvidenceError, match="invalid_gpa_reference_bounds"):
+            check()
+
+    source["reference_region"] = config["reference_region"] = None
+    config["absolute_reference"] = source["provenance"]["absolute_reference_accepted"] = True
+    assert check()["reference_coverage"] == {}
+    box1, box2 = [0, 5, 0, 3], [1, 4, 2, 5]
+    config["reference_regions"] = [box1, box2]
+    refs = source["provenance"]["reference_regions"] = {"g1": box1, "g2": box2}
+    assert check()["reference_coverage"]["g2"]["valid_count"] == 9
+    refs["g1"], refs["g2"] = box2, box1
+    with pytest.raises(verifier.EvidenceError, match="reference_differs_from_request"):
+        check()
+    refs["g1"], refs["g2"] = box1, box2
+    box2[1] = 3
+    with pytest.raises(verifier.EvidenceError, match="reference_without_valid_pixels"):
         check()
 
 
