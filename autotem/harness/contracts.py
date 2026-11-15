@@ -89,10 +89,12 @@ class OperationContext:
     """Only registered artifacts and a run-local output directory reach handlers."""
 
     def __init__(
-        self, store, run_id: str, step_id: str, request: dict, inputs: dict[str, str] | None = None
+        self, store, run_id: str, step_id: str, request: dict, inputs: dict[str, str] | None = None,
+        *, workspace: Path | None = None
     ):
         self.store, self.run_id, self.step_id, self.request = store, run_id, step_id, request
         self.inputs = inputs or {}
+        self.workspace = workspace
         self.consumed_artifacts: dict[str, str] = {}
         self.output_dir = store.run_dir(run_id) / "operations" / step_id
         self.output_dir.mkdir(parents=True, exist_ok=True)

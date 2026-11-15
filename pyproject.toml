@@ -67,6 +67,7 @@ include = ["autotem*"]
 
 [tool.setuptools.package-data]
 "autotem.harness" = [
+  "resources/openclaw/*.cjs",
   "resources/skill/*.md",
   "resources/skill/agents/*.yaml",
   "resources/skill/references/*.md",

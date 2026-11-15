@@ -325,7 +325,11 @@ def build_parser() -> argparse.ArgumentParser:
     read.add_argument("artifact_id")
     read.add_argument("--offset", type=int, default=0)
     read.add_argument("--limit", type=int, default=100)
-    sub.add_parser("stdio", help="JSONL bridge (not MCP protocol).")
+    stdio = sub.add_parser("stdio", help="JSONL bridge (not MCP protocol).")
+    stdio.add_argument(
+        "--workspace-only", type=Path, metavar="PROJECT",
+        help="Restrict analysis inputs and container reads to this project.",
+    )
     sub.add_parser("mcp", help="Optional real MCP stdio server; needs the mcp extra.")
     probe = sub.add_parser("host-probe")
     probe.add_argument("host", choices=("codex", "openclaw", "workbuddy"))
@@ -400,7 +404,7 @@ def main(argv: list[str] | None = None) -> int:
         from autotem.harness import Harness
 
         with contextlib.redirect_stdout(sys.stderr):
-            harness = Harness(Path(args.root))
+            harness = Harness(Path(args.root), workspace=getattr(args, "workspace_only", None))
         if args.command == "stdio":
             return serve_stdio(harness)
         aliases = {

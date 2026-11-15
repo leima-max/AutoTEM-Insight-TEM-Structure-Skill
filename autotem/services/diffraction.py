@@ -561,9 +561,11 @@ def _physical(diffraction: DiffractionResult) -> None:
 
 
 def _snapshot_cifs(ctx, candidate_paths):
+    from autotem.harness.workspace import workspace_file
+
     paths, evidence = [], []
     for number, raw_path in enumerate(candidate_paths):
-        path = Path(raw_path)
+        path = workspace_file(Path(raw_path), getattr(ctx, "workspace", None))
         if "://" in raw_path or str(path.drive).startswith("\\\\") or not path.is_file():
             raise HarnessError("INVALID_CANDIDATE", "CIF candidates must be existing local files")
         if path.stat().st_size > 8 * 1024 * 1024:

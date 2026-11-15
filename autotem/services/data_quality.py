@@ -22,6 +22,7 @@ from autotem.harness.contracts import (
     ServiceResult,
     StrictParameters,
 )
+from autotem.harness.workspace import workspace_file
 from autotem.io.metadata import normalize_metadata
 from autotem.io.readers import (
     _to_jsonable,
@@ -199,7 +200,9 @@ def _selection(array: Any, p: InputParameters) -> np.ndarray:
     return image_array(array)
 
 
-def _read_selected(path: Path, p: InputParameters) -> tuple[np.ndarray, dict, dict]:
+def _read_selected(
+    path: Path, p: InputParameters, *, workspace: Path | None = None
+) -> tuple[np.ndarray, dict, dict]:
     """Readers never choose a first dataset/frame/channel on the user's behalf."""
     suffix = path.suffix.lower()
     metadata: dict = {}
@@ -216,6 +219,22 @@ def _read_selected(path: Path, p: InputParameters) -> tuple[np.ndarray, dict, di
         except ImportError as exc:
             raise HarnessError("DEPENDENCY_UNAVAILABLE", "HDF/EMD input requires h5py") from exc
         with h5py.File(path, "r") as handle:
+            if workspace is not None and p.dataset_path:
+                # Do not dereference user-selected soft/external links, including links
+                # in intermediate groups. Normal hard-linked datasets remain selectable.
+                group = handle
+                for part in p.dataset_path.strip("/").split("/"):
+                    if not isinstance(group, h5py.Group):
+                        break
+                    link = group.get(part, getlink=True)
+                    if isinstance(link, (h5py.ExternalLink, h5py.SoftLink)):
+                        raise HarnessError(
+                            "WORKSPACE_INPUT_RESTRICTED",
+                            "Choose an internal HDF dataset or export a self-contained NPY.",
+                        )
+                    if link is None:
+                        break
+                    group = group[part]
             choices = []
             handle.visititems(
                 lambda name, item: (
@@ -238,6 +257,11 @@ def _read_selected(path: Path, p: InputParameters) -> tuple[np.ndarray, dict, di
             if selected.lstrip("/") not in choices:
                 raise HarnessError("INVALID_SELECTION", "HDF dataset_path is not a numeric image")
             item = handle[selected]
+            if workspace is not None and (item.is_virtual or item.external):
+                raise HarnessError(
+                    "WORKSPACE_INPUT_RESTRICTED", "This HDF dataset uses external or virtual "
+                    "storage. Export its pixels as a self-contained HDF dataset or NPY.",
+                )
             selection = {"dataset_path": selected, "source_shape": list(item.shape)}
             metadata = {**_to_jsonable(dict(handle.attrs)), **_to_jsonable(dict(item.attrs))}
             # Index on disk before materializing large multidimensional data.
@@ -347,6 +371,9 @@ def _read_selected(path: Path, p: InputParameters) -> tuple[np.ndarray, dict, di
             raise HarnessError("INVALID_SELECTION", "SER images use dataset_index or frame")
         if p.dataset_index is not None and p.frame is not None:
             raise HarnessError("INVALID_SELECTION", "Use either dataset_index or frame for SER")
+        if workspace is not None:
+            # ncempy.fileSER opens an adjacent EMI using this exact naming convention.
+            workspace_file(path.with_name(path.stem[:-2] + ".emi"), workspace)
         with ser.fileSER(str(path)) as handle:
             count = int(handle.head["ValidNumberElements"])
             index = p.dataset_index if p.dataset_index is not None else p.frame
@@ -367,7 +394,8 @@ def _read_selected(path: Path, p: InputParameters) -> tuple[np.ndarray, dict, di
             "EMI is acquisition metadata; select its associated SER image file",
         )
     elif suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif"}:
-        with Image.open(path) as handle:
+        formats = ("PNG", "JPEG", "TIFF", "BMP", "GIF") if workspace is not None else None
+        with Image.open(path, formats=formats) as handle:
             frame = select_image_page(handle, p.frame, p.channel)
             if p.selection_indices is not None:
                 raise HarnessError(
@@ -388,7 +416,7 @@ def _read_selected(path: Path, p: InputParameters) -> tuple[np.ndarray, dict, di
 
 
 def read_selected_input(
-    path: Path, params: dict, *, dataset_id: str
+    path: Path, params: dict, *, dataset_id: str, workspace: Path | None = None
 ) -> tuple[np.ndarray, TEMDataset]:
     """Read one explicit 2D selection. The caller assigns its persisted array reference."""
     p = validated(InputParameters, params)
@@ -396,7 +424,7 @@ def read_selected_input(
     if not io_source.is_file():
         raise HarnessError("INPUT_NOT_FOUND", "Input snapshot is not a regular file")
     try:
-        array, metadata, selection = _read_selected(io_source, p)
+        array, metadata, selection = _read_selected(io_source, p, workspace=workspace)
     except HarnessError:
         raise
     except (ValueError, OSError, KeyError, TypeError) as exc:
@@ -475,7 +503,9 @@ def load_input(ctx: OperationContext, params: dict) -> ServiceResult:
     supplied.setdefault("modality", ctx.request.get("modality", "unknown"))
     path = Path(ctx.input_path)
     try:
-        array, dataset = read_selected_input(path, supplied, dataset_id=f"{ctx.run_id}:selected")
+        array, dataset = read_selected_input(
+            path, supplied, dataset_id=f"{ctx.run_id}:selected", workspace=getattr(ctx, "workspace", None)
+        )
     except NeedsInput as exc:
         fields = exc.details["fields"]
         evidence_id = ctx.emit_json(
