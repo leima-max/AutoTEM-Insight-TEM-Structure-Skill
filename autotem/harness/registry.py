@@ -75,8 +75,14 @@ def _cached_dependency(name: str) -> dict:
         "importlib.import_module(n) if s else None"
     )
     options = ["-I"] if sys.flags.isolated else []
+    # The MCP server owns stdin. A Windows child can block at interpreter startup
+    # when it inherits that live protocol pipe, even before executing the import.
     result = subprocess.run(
-        [sys.executable, *options, "-c", code, name], capture_output=True, text=True, timeout=8
+        [sys.executable, *options, "-c", code, name],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=8,
     )
     if result.returncode:
         missing = "ModuleNotFoundError" in result.stderr and "No module named" in result.stderr

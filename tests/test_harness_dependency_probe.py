@@ -41,6 +41,7 @@ def test_only_timeouts_are_retried(monkeypatch, module, returncode, stdout, stde
     assert registry.probe_dependency(module) == expected
     assert registry.probe_dependency(module) == expected
     assert child.call_count == 2
+    assert all(attempt.kwargs["stdin"] == subprocess.DEVNULL for attempt in child.call_args_list)
 
 
 def test_shared_dependency_times_out_once_per_catalog(monkeypatch):
