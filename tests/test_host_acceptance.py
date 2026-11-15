@@ -301,6 +301,58 @@ def test_j03_roi_or_unlabeled_percentage_is_not_a_whole_image_measurement(covera
         check_coverage(coverage_capture("a" * 32, [1471]), text)
 
 
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        ("none", None),
+        ("wrong_count", "differs_from_registered_mask"),
+        ("wrong_percent", "differs_from_registered_mask"),
+        ("roi_only", "whole_image_gpa_coverage_not_observed"),
+        ("separate_paragraph", "no_local_mask_reference"),
+        ("two_masks", "no_local_mask_reference"),
+        ("wrong_path", "mask_link_path_mismatch"),
+        ("other_run", "citation_mixes_runs"),
+    ],
+)
+def test_j03_narrated_counts_require_a_linked_full_image_mask(coverage_capture, change, error):
+    run = coverage_capture("a" * 32, [1471, 1471])
+    other = coverage_capture("b" * 32, [1471])
+    masks = [i for i, a in run["artifacts"].items() if a["role"] == "gpa.quality_mask"]
+    mask = masks[0]
+    path = run["_directory"] / run["artifacts"][mask]["file"]
+    if change == "wrong_path":
+        path = path.parent / "unregistered" / path.name
+    scope = "参考框内" if change == "roi_only" else "全图"
+    count = "1,470" if change == "wrong_count" else "1,471"
+    percent = "100" if change == "wrong_percent" else "73.55"
+    statement = f"**{scope} 2,000 个像素中，{count} 个有效，占 {percent}%。**"
+    roi = " 参考框内 100 个像素全部有效，框外有效率为 72.16%。"
+    gap = "\n\n" if change == "separate_paragraph" else " "
+    answer = statement + roi + gap + f"掩膜 `artifact_id` 为 [{mask}](<{path}>)。"
+    if change == "two_masks":
+        answer += f"另一次掩膜编号 {masks[1]}。"
+    if change == "other_run":
+        answer += f"运行 {other['run_id']}。"
+    runs = {r["run_id"]: r for r in (run, other)}
+    args = (
+        answer,
+        [{"quote": answer, "artifact_ids": [mask]}],
+        runs,
+        {mask},
+        {(run["run_id"], "g0")},
+    )
+    if error:
+        with pytest.raises(verifier.EvidenceError, match=error):
+            verifier.check_gpa_coverage_answer(*args)
+    else:
+        proof = verifier.check_gpa_coverage_answer(*args)
+        assert list(proof["masks"]) == [mask]
+        assert [q["as_displayed"].strip("* ") for q in proof["quantities"]] == [
+            "全图 2,000 个像素中，1,471 个有效",
+            "73.55%",
+        ]
+
+
 def test_j03_coverage_binds_one_compared_step_and_actual_report(coverage_capture):
     first = coverage_capture("a" * 32, [1471, 500])
     second = coverage_capture("b" * 32, [2000])

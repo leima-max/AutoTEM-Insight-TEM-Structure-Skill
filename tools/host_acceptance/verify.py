@@ -837,6 +837,11 @@ def matches_displayed(number, scale, expected):
 
 
 _PIXELS = r"(?:\d{1,3}(?:,\d{3})+|\d+)"
+_NARRATED_FULL_PIXELS = re.compile(
+    rf"^[\s*_]*(?:全图|整幅图像)\s*(?:共有?|包含|含有|有)?\s*(?P<total>{_PIXELS})"
+    rf"\s*个?(?:像素|像元)中\s*[，,]\s*(?:有\s*)?(?P<valid>{_PIXELS})"
+    r"\s*个?(?:像素|像元)?(?:为|是)?有效(?:像素|像元)?(?=[\s*_]*(?:[，,]|$))"
+)
 _COVERAGE_NUMBER = re.compile(
     rf"(?P<valid>{_PIXELS})\s*(?:/|／|\bof\b|\bout of\b)\s*(?P<total>{_PIXELS})"
     r"|(?P<percent>[+-]?\d+(?:\.\d+)?)\s*[%％]|(?P<fraction>(?<![\d.])[01]\.\d+)(?![\w.%％])",
@@ -877,6 +882,27 @@ def gpa_coverage_statements(answer):
     clauses = re.compile(r"(?:[^，,]|,(?=\d{3}(?!\d)))+")
     section = None
     for sentence in sentences.finditer(answer):
+        sentence_text = sentence[0]
+        counts = _NARRATED_FULL_PIXELS.match(sentence_text)
+        if counts:
+            yield (
+                sentence.start() + counts.start(),
+                sentence.start() + counts.end(),
+                counts,
+                sentence_text,
+            )
+            ratio_label = re.match(
+                r"[ ]*[，,]\s*(?:约)?占(?:比(?:为)?)?\s*", sentence_text[counts.end() :]
+            )
+            if ratio_label:
+                percent = _COVERAGE_NUMBER.match(sentence_text, counts.end() + ratio_label.end())
+                if percent and percent["percent"] is not None:
+                    yield (
+                        sentence.start() + percent.start(),
+                        sentence.start() + percent.end(),
+                        percent,
+                        sentence_text,
+                    )
         heading = sentence[0].strip().strip("*").strip()
         if heading.startswith("#") or heading.endswith(("：", ":")):
             scopes = list(_GPA_SCOPE.finditer(heading))
@@ -1118,6 +1144,51 @@ def adjacent_gpa_masks(blocks, position, runs, evidence, cited, compared):
     return first, repeat
 
 
+_EXPLICIT_GPA_MASK = re.compile(
+    r"(?:^|[。；.;])\s*掩膜\s*(?:`?artifact_id`?)?\s*(?:为|是|=|：|:)?\s*"
+    r"\[(?P<id>[0-9a-f]{32})\]\(\s*<?(?P<path>[^<>)\n]+)>?\s*\)",
+    re.I,
+)
+
+
+def narrative_mask_in_paragraph(blocks, start, runs, evidence, cited):
+    """Bind a narrated whole-image count to its sole explicit direct mask link in that paragraph."""
+    paragraph = next((b[0] for b in blocks if b.start() <= start < b.end()), "")
+    if re.search(
+        r"(?:另[一份个次张幅]*|不同|其他)(?:样本|样品|运行|图像)"
+        r"|\b(?:another|different|separate)\s+(?:sample|image|run)\b",
+        paragraph,
+        re.I,
+    ):
+        return None
+    links = list(_EXPLICIT_GPA_MASK.finditer(paragraph))
+    if len(links) != 1:
+        return None
+    link = links[0]
+    mask_id = link["id"]
+    if mask_id not in evidence or mask_id not in cited:
+        return None
+    mentioned = set(_ID.findall(paragraph))
+    if mentioned.intersection(evidence) != {mask_id}:
+        return None
+    run_id = evidence[mask_id]["run_id"]
+    run = runs[run_id]
+    require(
+        mentioned.intersection(runs) <= {run_id}
+        and not any(
+            mentioned.intersection(other["artifacts"])
+            for rid, other in runs.items()
+            if rid != run_id
+        ),
+        "gpa_coverage_citation_mixes_runs",
+    )
+    require(
+        Path(link["path"].strip()) == run["_directory"] / run["artifacts"][mask_id]["file"],
+        "gpa_mask_link_path_mismatch",
+    )
+    return mask_id
+
+
 def one_cited_gpa_mask(covering, mentioned, returned, cited, sources, evidence):
     observed(covering, "gpa_coverage_claim_has_no_linked_citation")
     size = min(len(c["quote"]) for c in covering)
@@ -1159,6 +1230,10 @@ def check_gpa_coverage_answer(final, claims, runs, returned, compared):
                     break
         mentioned = set(_ID.findall(sentence))
         pair = ()
+        if _NARRATED_FULL_PIXELS.match(sentence) and not mentioned.intersection(sources):
+            direct = narrative_mask_in_paragraph(blocks, start, runs, evidence, cited)
+            if direct:
+                mentioned.add(direct)
         if not mentioned.intersection(sources):
             pair = adjacent_gpa_masks(blocks, start, runs, evidence, cited, compared)
         if pair:
@@ -1184,9 +1259,9 @@ def check_gpa_coverage_answer(final, claims, runs, returned, compared):
         )
         require((run_id, step) in compared, "gpa_coverage_step_was_not_compared")
         valid, total = measured["valid_pixels"], measured["total_pixels"]
-        if number["percent"] is not None:
+        if number.groupdict().get("percent") is not None:
             ok = matches_displayed(number["percent"], 1, 100 * valid / total)
-        elif number["fraction"] is not None:
+        elif number.groupdict().get("fraction") is not None:
             ok = matches_displayed(number["fraction"], 1, valid / total)
         else:
             ok = (int(number["valid"].replace(",", "")), int(number["total"].replace(",", ""))) == (
