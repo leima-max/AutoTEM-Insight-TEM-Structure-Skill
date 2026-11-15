@@ -20,7 +20,12 @@ from autotem.harness.compiler import compile_legacy_recipe
 from autotem.harness.contracts import HarnessError
 from autotem.io import read_image
 from autotem.preprocessing.quality import load_dataset_array
-from autotem.reporting.harness_evidence import claim_html, delivery_index
+from autotem.reporting.harness_evidence import (
+    _diffraction_html,
+    claim_html,
+    delivery_index,
+    render_harness_html,
+)
 
 pytestmark = pytest.mark.smoke
 
@@ -126,7 +131,38 @@ def test_incomplete_request_exports_diagnostic_and_retains_pending_result(tmp_pa
     by_id = {row["step_id"]: row for row in report["claim_evidence"]}
     assert by_id["scale"]["error"]["code"] == "NEEDS_INPUT"
     assert by_id["denoise"]["artifacts_by_role"] == {}
-    assert "denoise" in files["report_html"].read_text(encoding="utf-8")
+    page = files["report_html"].read_text(encoding="utf-8")
+    assert "Undelivered required steps · scale, denoise" in page
+    assert "<h2>Diffraction measurements</h2>" not in page
+    assert page.index("scale, denoise") < page.index("Step parameters and provenance")
+
+
+@pytest.mark.parametrize("has_peak_map", [True, False])
+def test_html_spacings_bind_direction_to_source_peak_only_when_recorded(has_peak_map):
+    first = {"value": .16, "unit": "nm", "method": "FFT", "uncertainty": None}
+    second = {**first, "value": .25, "uncertainty": .002}
+    result = {
+        "d_spacings": [first, second],
+        "g_vectors": [
+            {"source_peak_index": 0, "angle": {"value": 42, "unit": "deg"}},
+            {"source_peak_index": 1, "angle": {"value": 90, "unit": "deg"}},
+            {"source_peak_index": 3, "angle": {"value": 0, "unit": "deg"}},
+        ],
+        "provenance": {"d_by_peak": [None, first, None, second]} if has_peak_map else {},
+        "phase_candidates": [{"name": "X<1", "matched_spot_count": 4}],
+        "warnings": ["<reference needed>"],
+    }
+    artifact = {"artifact_id": "abc", "step_id": "indexed", "path": "results/abc.json"}
+    page = _diffraction_html(result, artifact)
+    assert "0.16 nm" in page and "0.25 nm" in page
+    assert "Not evaluated" in page and "0.002 nm" in page
+    assert "X&lt;1 · 4 matched spots" in page and "&lt;reference needed&gt;" in page
+    assert '<a href="abc.json">abc</a>' in page
+    assert "42 deg" not in page
+    assert ("<td>1</td><td>90 deg</td><td>0.16 nm" in page) == has_peak_map
+    assert ("<td>3</td><td>0 deg</td><td>0.25 nm" in page) == has_peak_map
+    if not has_peak_map:
+        assert " deg" not in page
 
 
 def test_two_strain_methods_keep_complete_arrays_and_choose_plan_order(tmp_path):
@@ -249,6 +285,17 @@ def test_missing_committed_id_is_reported_and_optional_failure_cannot_satisfy_a_
     assert report["completeness"]["unmet_required_steps"] == ["missing"]
     assert report["completeness"]["optional_skipped"] == ["opt"]
     assert report["strain_results"]["primary"] is None
+
+    orphan = {"step_id": "missing", "role": "peak_table", "artifact_id": "orphan",
+              "execution_usable": True, "kind": "table", "path": "orphan.csv",
+              "sha256": "0" * 64, "operation_status": "completed"}
+    delivery = delivery_index(run, state, [orphan], lambda aid: None)
+    manifest = {**delivery, "artifacts": [orphan], "run": {"status": "failed", "run_id": "run"},
+                "report_type": "diagnostic", "scientific_accuracy": "not_evaluated",
+                "result_index": {}}
+    page = render_harness_html(manifest, lambda aid: None)
+    assert 'href="orphan.csv"' in page  # Available for inspection in the full evidence register.
+    assert "<h2>Data tables</h2>" not in page
 
 
 def test_minimal_legacy_and_registered_facades_agree_on_disk_input(tmp_path, capsys):

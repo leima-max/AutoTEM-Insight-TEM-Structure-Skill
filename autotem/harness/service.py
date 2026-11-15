@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import csv
 import hashlib
-import html
 import importlib.metadata
 import inspect
 import json
@@ -990,7 +989,7 @@ class Harness:
         return result
 
     def export_report(self, run_id: str, formats: list[str] | None = None) -> dict:
-        from autotem.reporting.harness_evidence import claim_html, delivery_index
+        from autotem.reporting.harness_evidence import delivery_index, render_harness_html
 
         formats = ["json", "html"] if formats is None else formats
         if not set(formats) <= {"json", "html", "pdf"} or not formats:
@@ -1040,52 +1039,7 @@ class Harness:
         if "json" in formats:
             generated.append(self.store.write_json(run_id, "_report", "report_manifest", manifest))
         if "html" in formats:
-            figures = "".join(
-                f'<figure><img width="600" style="max-width:100%" '
-                f'src="{html.escape(Path(a["path"]).name)}" alt="{html.escape(a["role"])}">'
-                f"<figcaption>{html.escape(a['role'])}</figcaption></figure>"
-                for a in evidence
-                if a["kind"] == "image"
-            )
-            summaries = ""
-            for role in ("atom_distances", "diffraction", "atomic_intensity", "gpa", "atom_strain"):
-                artifact_id = latest.get(role)
-                if artifact_id:
-                    value = self.store.load_json(artifact_id)
-                    summaries += (
-                        f"<h2>{html.escape(role)}</h2><pre>"
-                        + html.escape(json.dumps(value, ensure_ascii=False, indent=2)[:50000])
-                        + "</pre><p>Bounded summary; complete JSON is linked "
-                        "in the evidence table.</p>"
-                    )
-            rows = "".join(
-                f"<tr><td>{html.escape(a['role'])}</td><td>{a['kind']}</td>"
-                f"<td>{html.escape(a['operation_status'])}</td>"
-                f'<td><a href="{html.escape(Path(a["path"]).name)}">'
-                f"{a['artifact_id']}</a></td><td>{a['sha256']}</td></tr>"
-                for a in evidence
-            )
-            page = (
-                "<!doctype html><html><head><meta charset='utf-8'>"
-                "<title>AutoTEM evidence report</title>"
-                "</head><body><h1>AutoTEM "
-                + manifest["report_type"]
-                + " report</h1><p>"
-                + html.escape(state["status"])
-                + " · scientific accuracy: not_evaluated</p>"
-                + claim_html(manifest, evidence)
-                + "<pre>"
-                + html.escape(json.dumps(state, ensure_ascii=False, indent=2))
-                + "</pre><table><tr><th>Role</th><th>Type</th><th>Step status</th>"
-                + "<th>Evidence</th><th>SHA256</th></tr>"
-                + rows
-                + "</table>"
-                + summaries
-                + figures
-                + "</body></html>"
-            )
-            # Reports live in artifacts; use ../artifacts links from that directory.
-            page = page.replace('href="artifacts/', 'href="')
+            page = render_harness_html(manifest, self.store.load_json)
             generated.append(
                 self.store._publish(
                     run_id,
