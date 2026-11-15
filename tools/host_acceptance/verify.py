@@ -2463,7 +2463,13 @@ def has_inventory(text, host=None):
         ):
             continue
         if host == "openclaw" and isinstance(listing, dict) and "groups" in listing:
-            if openclaw_plugin_inventory(listing):
+            # The field command emits the unwrapped successful tools.catalog payload.
+            if (
+                listing is event
+                and "error" not in event
+                and event.get("ok", True) is True
+                and openclaw_plugin_inventory(listing)
+            ):
                 return True
             continue
         if isinstance(listing, dict) and TOOLS <= inventory_rows(listing.get("tools")):

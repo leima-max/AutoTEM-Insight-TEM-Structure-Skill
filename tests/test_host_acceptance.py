@@ -1306,6 +1306,12 @@ def test_openclaw_catalog_requires_the_named_plugin_group_and_tool_ids(tmp_path)
     assert report["observed_tools"] == ["list_capabilities"]
     assert not verifier.has_inventory(json.dumps(catalog), "codex")
     assert not verifier.has_inventory(json.dumps({**catalog, "agentId": ""}), "openclaw")
+    for failed in (
+        {"ok": False, "error": {"code": "GATEWAY_FAILURE"}, "result": catalog},
+        {**catalog, "error": {"code": "GATEWAY_FAILURE"}},
+        {**catalog, "ok": False},
+    ):
+        assert not verifier.has_inventory(json.dumps(failed), "openclaw")
     for groups in (
         [{**group, "source": "core"}],
         [{**group, "pluginId": "other"}],
