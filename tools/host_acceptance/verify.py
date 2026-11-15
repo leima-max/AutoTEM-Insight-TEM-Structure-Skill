@@ -2489,7 +2489,222 @@ def evidence_text(path, ref, name, evidence):
     return recognized or ""
 
 
-def host_observations(spec, base, turns, calls, result):
+def app_server_grant(base, ref, turn, project, spec):
+    """Bind a first-call Codex approval to both pipes of one fresh app-server session."""
+    files = {
+        key: capture_file(base, ref.get(key))
+        for key in (
+            "server_trace",
+            "client_trace",
+            "launch",
+            "process_end",
+            "operator_decision",
+        )
+    }
+    require(
+        len(set(files.values())) == len(files),
+        "app_server_capture_files_mismatch",
+    )
+    originals = {key: path.read_bytes() for key, path in files.items()}
+
+    def rows(key):
+        return [(i, unique_json(line)) for i, line in enumerate(originals[key].splitlines(), 1)]
+
+    def one(matches):
+        matches = list(matches)
+        require(len(matches) == 1, "app_server_event_missing_or_ambiguous")
+        return matches[0]
+
+    def method(stream, name):
+        return [(i, e) for i, e in stream if e.get("method") == name]
+
+    def response(stream, rpc):
+        return one(
+            (i, e) for i, e in stream if "method" not in e and "id" in e and same_json(e["id"], rpc)
+        )
+
+    sent, received = rows("client_trace"), rows("server_trace")
+    session = turn["session"]
+    require(
+        ref.get("session_id") == session and project is not None,
+        "app_server_session_or_project_missing",
+    )
+    # RPC IDs restart at zero. The client must have *created* this thread and
+    # sent this exact prompt; a decision read from another connection is insufficient.
+    new_thread, request = one(method(sent, "thread/start"))
+    thread_reply, reply = response(received, request["id"])
+    thread = reply["result"]
+    new_turn, request_turn = one(method(sent, "turn/start"))
+    turn_reply, reply = response(received, request_turn["id"])
+    turn_id = reply["result"]["turn"]["id"]
+    require(
+        new_thread < new_turn
+        and thread_reply < turn_reply
+        and not method(sent, "thread/resume")
+        and thread["thread"]["id"] == request_turn["params"]["threadId"] == session
+        and Path(thread["cwd"]) == Path(request["params"]["cwd"]) == project
+        and thread.get("approvalsReviewer") == "user",
+        "app_server_thread_binding_mismatch",
+    )
+    prompt = one(request_turn["params"]["input"])
+    require(
+        prompt.get("type") == "text" and prompt["text"].strip() == turn["prompt"],
+        "app_server_prompt_mismatch",
+    )
+    turn_start, begun = one(method(received, "turn/started"))
+    turn_end, ended = one(method(received, "turn/completed"))
+    require(
+        begun["params"]["threadId"] == ended["params"]["threadId"] == session
+        and begun["params"]["turn"]["id"] == ended["params"]["turn"]["id"] == turn_id
+        and ended["params"]["turn"]["status"] == "completed",
+        "app_server_turn_mismatch",
+    )
+    starts = [
+        (i, e)
+        for i, e in method(received, "item/started")
+        if e["params"]["item"].get("type") == "mcpToolCall"
+        and e["params"]["item"].get("server") == "autotem"
+    ]
+    observed(starts and turn["calls"], "missing_first_app_server_tool")
+    start, event = starts[0]
+    first = event["params"]["item"]
+    tool, arguments, item_id = first["tool"], first["arguments"], first["id"]
+    done, completion = one(
+        (i, e)
+        for i, e in method(received, "item/completed")
+        if e["params"]["item"].get("id") == item_id
+    )
+    last = completion["params"]["item"]
+    call = turn["calls"][0]
+    require(
+        first["status"] == "inProgress"
+        and first.get("error") is None
+        and first.get("result") is None
+        and last["status"] == "completed"
+        and last["type"] == "mcpToolCall"
+        and last["server"] == "autotem"
+        and last["error"] is None
+        and all(last["result"].get(k, False) is False for k in ("is_error", "isError"))
+        and tool in TOOLS
+        and tool == last["tool"] == call["tool"]
+        and same_json(arguments, last["arguments"])
+        and same_json(arguments, call["arguments"])
+        and same_json(envelope(tool, last["result"]), call["response"])
+        and call["response"]["ok"],
+        "app_server_first_tool_mismatch",
+    )
+    window = [(i, e) for i, e in received if start < i < done]
+    asked, ask = one((i, e) for i, e in window if "id" in e and "method" in e)
+    rpc = ask["id"]
+    require(
+        type(rpc) in (str, int)
+        and sum("method" in e and "id" in e and same_json(e["id"], rpc) for _, e in received) == 1,
+        "app_server_rpc_reused",
+    )
+    params = ask["params"]
+    meta = params.get("_meta", {})
+    require(
+        ask["method"] == "mcpServer/elicitation/request"
+        and params.get("mode") == "form"
+        and params.get("serverName") == "autotem"
+        and meta.get("codex_approval_kind") == "mcp_tool_call"
+        and meta.get("tool_name") == tool
+        and same_json(meta.get("tool_params"), arguments)
+        and params.get("requestedSchema") == {"type": "object", "properties": {}},
+        "not_native_tool_permission",
+    )
+    require(
+        all(
+            (e["params"]["threadId"], e["params"]["turnId"]) == (session, turn_id)
+            for e in (event, ask, completion)
+        ),
+        "app_server_item_session_mismatch",
+    )
+    answered, answer = response(sent, rpc)
+    require(
+        new_turn < answered
+        and answer.get("result") == {"action": "accept", "content": {}}
+        and "error" not in answer,
+        "app_server_permission_not_accepted",
+    )
+    resolved, resolution = one(
+        (i, e)
+        for i, e in method(received, "serverRequest/resolved")
+        if same_json(e["params"].get("requestId"), rpc)
+    )
+    require(resolution["params"]["threadId"] == session, "app_server_resolution_session_mismatch")
+    # These status notifications originate in the host, outside the server-owned form.
+    flags = [
+        (i, e["params"]["status"])
+        for i, e in method(window, "thread/status/changed")
+        if e["params"]["threadId"] == session
+    ]
+    wait = one(
+        i for i, state in flags if state == {"type": "active", "activeFlags": ["waitingOnApproval"]}
+    )
+    release = one(i for i, state in flags if state == {"type": "active", "activeFlags": []})
+    require(
+        turn_reply < turn_start < start < wait < asked < resolved < release < done < turn_end
+        and not any(start < line < done for line, _ in starts[1:]),
+        "app_server_approval_out_of_order",
+    )
+    launch = unique_json(originals["launch"])
+    exit_record = unique_json(originals["process_end"])
+    require(
+        stamp(launch["utc"]) == stamp(spec["started_at"])
+        and stamp(exit_record["utc"]) == stamp(spec["ended_at"])
+        and stamp(launch["utc"]) * 1000 <= event["emittedAtMs"]
+        and resolution["emittedAtMs"] <= stamp(exit_record["utc"]) * 1000
+        and type(exit_record.get("exit_code")) is int
+        and exit_record["exit_code"] == 0
+        and exit_record.get("turn_status") == "completed"
+        and exit_record.get("session") == session,
+        "app_server_process_window_mismatch",
+    )
+    argv = launch["argv"]
+    setting = f"mcp_servers.autotem.tools.{tool}.approval_mode="
+    modes = [b[len(setting) :] for a, b in pairwise(argv) if a == "-c" and b.startswith(setting)]
+    require(
+        Path(launch["project"]) == project
+        and Path(argv[0]).stem.lower() == "codex"
+        and argv[-3:] == ["app-server", "--listen", "stdio://"]
+        and modes == ['"prompt"'],
+        "app_server_prompt_mode_not_observed",
+    )
+    choice = unique_json(originals["operator_decision"])
+    require(
+        choice.get("actor") in {"user", "field_operator_on_user_authorization"}
+        and isinstance(choice.get("scope"), str)
+        and choice["scope"].strip()
+        and choice.get("choice") == "allow_this_call"
+        and choice.get("native_item_id") == item_id
+        and choice.get("tool") == tool
+        and same_json(choice.get("rpc_id"), rpc)
+        and event["emittedAtMs"] <= stamp(choice["utc"]) * 1000 <= resolution["emittedAtMs"],
+        "app_server_operator_decision_mismatch",
+    )
+    return {
+        "actor": choice["actor"],
+        "scope": choice["scope"],
+        "tool": tool,
+        "item_id": item_id,
+        "request_id": rpc,
+        "session_id": session,
+        "turn_id": turn_id,
+        "server_lines": {
+            "started": start,
+            "waiting": wait,
+            "request": asked,
+            "resolved": resolved,
+            "released": release,
+            "completed": done,
+        },
+        "client_reply_line": answered,
+        "sha256": {key: hashlib.sha256(content).hexdigest() for key, content in originals.items()},
+    }
+
+
+def host_observations(spec, base, turns, calls, result, *, project=None):
     """Recognize effective access separately from first consent and full inventory."""
     evidence = result["evidence"]
     checks = result["checks"]
@@ -2509,6 +2724,15 @@ def host_observations(spec, base, turns, calls, result):
         if not source.get(name):
             continue
         ref = source[name]
+        if (
+            name == "authorization"
+            and isinstance(ref, dict)
+            and ref.get("format") == "codex-app-server-stdio"
+        ):
+            require(spec["host"] == "codex", "capture_format_host_mismatch")
+            evidence["authorization"] = app_server_grant(base, ref, turns[0], project, spec)
+            checks["first_authorization"] = "passed"
+            continue
         file = capture_file(base, ref if isinstance(ref, str) else ref["original_evidence"])
         evidence[name + "_sha256"] = digest(file)
         transcript = None
@@ -2795,7 +3019,7 @@ def verify(spec_path, *, bundle=None, root=None, project=None):
                 raise
             checks["quoted_gpa_coverage_consistency"] = "passed"
         checks["answer_return"] = "passed"
-        host_observations(spec, base, turns + children, calls, result)
+        host_observations(spec, base, turns + children, calls, result, project=project)
         observed(runtime is not None, "no_verified_release_binding")
         if spec["case_id"] == "J15" and variant in {None, "executed"}:
             observed(
