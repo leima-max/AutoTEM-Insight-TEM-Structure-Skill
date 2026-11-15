@@ -239,6 +239,29 @@ def codex_mcp_response(item, started):
     return response
 
 
+def unsupported_resource_discovery(item, started, server):
+    """Codex reports unsupported protocol discovery alongside named tool calls."""
+    methods = {
+        "list_mcp_resources": "resources/list",
+        "list_mcp_resource_templates": "resources/templates/list",
+    }
+    method = methods.get(item["tool"])
+    if method is None or started is None:
+        return False
+    # Only skip the paired native probe and its specific method-not-found reply.
+    # A transport failure, a different target, or a hidden Harness result stays visible.
+    return (
+        started.get("tool") == item["tool"]
+        and started.get("status") == "in_progress"
+        and started.get("arguments") == item.get("arguments") == {"server": server}
+        and started.get("result") is None and started.get("error") is None
+        and item.get("status") == "failed" and item.get("result") is None
+        and item.get("error") == {
+            "message": f"{method} failed: {method} failed for `{server}`: Mcp error: -32601: Method not found"
+        }
+    )
+
+
 def read_turn(base, turn, host, capture_format, server):
     prompt_file = capture_file(base, turn.get("prompt"))
     trace_file = capture_file(base, turn.get("trace"))
@@ -303,14 +326,15 @@ def read_turn(base, turn, host, capture_format, server):
                         delegation_events.append(json.dumps(item, ensure_ascii=False))
                     if item["type"] == "mcp_tool_call" and item.get("server") == server:
                         tool = item["tool"]
+                        started = started_calls.pop(item_id, None)
+                        if unsupported_resource_discovery(item, started, server):
+                            continue
                         require(tool in TOOLS, "unexpected_tool_in_autotem_namespace")
                         calls.append(
                             {
                                 "tool": tool,
                                 "arguments": item["arguments"],
-                                "response": codex_mcp_response(
-                                    item, started_calls.pop(item_id, None)
-                                ),
+                                "response": codex_mcp_response(item, started),
                                 "line": line_no,
                             }
                         )

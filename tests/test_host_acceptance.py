@@ -791,6 +791,36 @@ def test_distinct_codex_polls_can_repeat_the_same_call(tmp_path):
     assert report["checks"]["case_execution"] == "passed"
 
 
+@pytest.mark.parametrize("probe,method", [
+    ("list_mcp_resources", "resources/list"),
+    ("list_mcp_resource_templates", "resources/templates/list"),
+])
+def test_codex_resource_discovery_is_visible_but_never_counts_as_a_domain_call(tmp_path, probe, method):
+    _, _, trace, events = sample(tmp_path)
+    start = {"id": "protocol", "type": "mcp_tool_call", "server": "autotem", "tool": probe,
+             "arguments": {"server": "autotem"}, "status": "in_progress", "result": None, "error": None}
+    end = {**start, "status": "failed", "error": {
+        "message": f"{method} failed: {method} failed for `autotem`: Mcp error: -32601: Method not found"}}
+    events[2:2] = [{"type": "item.started", "item": start}, {"type": "item.completed", "item": end}]
+
+    def read():
+        trace.write_text("\n".join(map(json.dumps, events)), encoding="utf-8")
+        return verifier.read_turn(tmp_path, {"prompt": "user.txt", "trace": trace.name},
+                                  "codex", "codex-exec-jsonl", "autotem")
+
+    turn = read()
+    assert [c["tool"] for c in turn["calls"]] == ["validate_plan"]
+    assert turn["trace_sha256"] == verifier.digest(trace)
+    del events[4]  # Without the actual Harness call this capture contains only discovery.
+    assert read()["calls"] == []
+    for change in ({"tool": "run_analysis"}, {"arguments": {"server": "other"}},
+                   {"error": {"message": "connection closed"}}, {"result": {"content": []}},
+                   {"id": "not-started"}):
+        events[3]["item"] = {**end, **change}
+        with pytest.raises(verifier.EvidenceError, match="unexpected_tool_in_autotem_namespace"):
+            read()
+
+
 def test_unattempted_blocked_and_missing_proof_distinct(tmp_path):
     record, spec, _, _ = sample(tmp_path)
     partial = verifier.verify(record, root=tmp_path)
