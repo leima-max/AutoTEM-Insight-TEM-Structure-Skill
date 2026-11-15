@@ -85,12 +85,16 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def stream_sha(stream):
+    digest = hashlib.sha256()
+    for block in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(block)
+    return digest.hexdigest()
+
+
 def file_sha(path):
     with path.open("rb") as stream:
-        digest = hashlib.sha256()
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-        return digest.hexdigest()
+        return stream_sha(stream)
 
 
 def relative(value):
@@ -702,8 +706,7 @@ def pack_operator(kit, release, release_index, output):
     source = safe_file(release, manifest["source"]["archive"])
     with source.open("rb") as frozen:
         require(
-            hashlib.file_digest(frozen, "sha256").hexdigest()
-            == index["release"]["source_archive_sha256"],
+            stream_sha(frozen) == index["release"]["source_archive_sha256"],
             "Changed release source archive",
         )
         with ZipFile(frozen) as archive:

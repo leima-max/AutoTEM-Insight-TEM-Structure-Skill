@@ -11,6 +11,8 @@ from string import Formatter
 from tempfile import NamedTemporaryFile
 from zipfile import BadZipFile, ZipFile
 
+from autotem.installation.release import sha256 as sha
+
 HERE = Path(__file__).resolve().parent
 GPA = {"gpa_answered", "gpa_unanswered", "gpa_invalid_reply"}
 MEASUREMENT_CARDS = {"J01", "J02", "J03", "J04", "J05", "J06", "J07", "J08", "J09"}
@@ -18,11 +20,6 @@ MEASUREMENT_CARDS = {"J01", "J02", "J03", "J04", "J05", "J06", "J07", "J08", "J0
 
 def read(path):
     return json.loads(path.read_bytes())
-
-
-def sha(path):
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def require(condition, message):
