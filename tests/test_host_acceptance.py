@@ -352,6 +352,105 @@ def test_j03_coverage_binds_one_compared_step_and_actual_report(coverage_capture
         claim([("有效覆盖率 74%", [report])])
 
 
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        ("none", None),
+        ("wrong_count", "differs_from_registered_mask"),
+        ("wrong_percent", "differs_from_registered_mask"),
+        ("different_pixels", "identical_gpa_masks_with_different_content"),
+        ("different_run", "citation_mixes_runs"),
+        ("foreign_artifact", "citation_mixes_runs"),
+        ("reversed_steps", "not_first_and_repeat"),
+        ("different_settings", "not_first_and_repeat"),
+        ("other_path", "mask_link_path_mismatch"),
+        ("detached", "no_linked_citation"),
+        ("other_sample", "no_linked_citation"),
+        ("next_section", "no_linked_citation"),
+        ("one_link", "no_linked_citation"),
+        ("unreturned", "no_linked_citation"),
+        ("missing_identity_claim", "no_linked_citation"),
+    ],
+)
+def test_adjacent_citations_for_a_repeated_gpa_result(coverage_capture, change, error):
+    import numpy as np
+
+    def pair(run_id):
+        run = coverage_capture(run_id, [1471, 1471])
+        raw = run["_directory"] / "image.npy"
+        np.save(raw, np.arange(2000, dtype="f4").reshape(40, 50))
+        run["artifacts"]["raw-id"] = {
+            "role": "raw",
+            "step_id": "load",
+            "file": raw.name,
+            "sha256": verifier.digest(raw),
+            "execution_usable": True,
+        }
+        run["_request"] = {
+            "steps": [
+                {"id": s["step_id"], "parameters": {"image_role": "raw"}} for s in run["steps"]
+            ]
+        }
+        for measured in run["strain_validity"]:
+            measured["image_artifact_id"] = "raw-id"
+        masks = [i for i, a in run["artifacts"].items() if a["role"] == "gpa.quality_mask"]
+        return run, masks
+
+    run, masks = pair("a" * 32)
+    runs = {run["run_id"]: run}
+    paths = [run["_directory"] / run["artifacts"][i]["file"] for i in masks]
+    if change == "different_pixels":
+        data = np.load(paths[1], allow_pickle=False)
+        shifted = np.roll(data, 1, axis=0)
+        assert int(data.sum()) == int(shifted.sum()) and not np.array_equal(data, shifted)
+        np.save(paths[1], shifted)
+        run["artifacts"][masks[1]]["sha256"] = verifier.digest(paths[1])
+    if change == "different_settings":
+        run["_request"]["steps"][1]["parameters"]["quality_percentile"] = 50
+    if change in {"different_run", "foreign_artifact"}:
+        other, others = pair("b" * 32)
+        runs[other["run_id"]] = other
+        if change == "different_run":
+            paths[1] = other["_directory"] / other["artifacts"][others[1]]["file"]
+    if change == "reversed_steps":
+        paths.reverse()
+    if change == "other_path":
+        paths[0] = paths[0].parent / "unregistered" / paths[0].name
+    count = "1,470" if change == "wrong_count" else "1,471"
+    percent = "100" if change == "wrong_percent" else "73.55"
+    result = f"两次诊断性 GPA 均保留 **{count} / 2,000 个有效像素（{percent}%）**。"
+    if change != "missing_identity_claim":
+        result += "两次掩膜完全相同。"
+    cite = f"下表统计首次 GPA 掩膜内像素。[首次掩膜]({paths[0]})"
+    if change != "one_link":
+        cite += f" · [复算掩膜]({paths[1]})"
+    if change in {"other_sample", "next_section"}:
+        cite = ("另一个样本：" if change == "other_sample" else "## Other section\n") + cite
+    if change == "foreign_artifact":
+        cite += " " + next(i for i, a in other["artifacts"].items() if a["role"] == "report_html")
+    gap = "\n\n中间另有说明。\n\n" if change == "detached" else "\n\n"
+    final = (
+        result
+        + gap
+        + cite
+        + "\n\n框内 **1,024 / 1,024** 个像素有效，图像最外圈 **0 / 284** 个像素有效。"
+    )
+    ids = {p.stem for p in paths if p.stem in cite}
+    if change == "unreturned":
+        ids.discard(paths[1].stem)
+    compared = {(r["run_id"], s["step_id"]) for r in runs.values() for s in r["steps"]}
+    args = (final, [{"quote": cite, "artifact_ids": sorted(ids)}], runs, ids, compared)
+    if error:
+        exc = verifier.NotEvaluated if error == "no_linked_citation" else verifier.EvidenceError
+        with pytest.raises(exc, match=error):
+            verifier.check_gpa_coverage_answer(*args)
+    else:
+        proof = verifier.check_gpa_coverage_answer(*args)
+        assert set(proof["masks"]) == set(masks)
+        assert [q["as_displayed"] for q in proof["quantities"]] == ["1,471 / 2,000", "73.55%"]
+        assert all(q["first_and_repeat_mask_ids"] == masks for q in proof["quantities"])
+
+
 def test_j03_report_and_result_must_link_to_the_registered_mask(coverage_capture):
     run = coverage_capture("a" * 32, [1471])
     arts = run["artifacts"]

@@ -14,6 +14,7 @@ import sys
 from datetime import datetime, timezone
 from decimal import Decimal
 from html.parser import HTMLParser
+from itertools import pairwise
 from pathlib import Path
 
 MATRIX = json.loads(Path(__file__).with_name("matrix.json").read_text("utf-8"))
@@ -829,13 +830,14 @@ _COVERAGE_AFTER_LABEL = re.compile(
 )
 _COVERAGE_AFTER_VALUE = re.compile(
     r"^[\s*_]*(?:(?:of\s+)?(?:(?:all|the)\s+)*(?:image\s+)?pixels?\s+(?:are|were)\s+valid"
-    r"|[个的]?(?:像素|像元)(?:为|是)?有效)",
+    r"|[个的]?(?:像素|像元)(?:为|是)?有效|个有效(?:像素|像元))",
     re.I,
 )
 _GPA_SCOPE = re.compile(
     r"(?P<image>全图|整幅(?:图像)?|整张图|整个图像|全场|原图所有|"
     r"\b(?:overall|whole[- ]image|full[- ](?:image|frame)|all\s+(?:image\s+)?pixels)\b)"
-    r"|(?P<region>参考(?:区域?|框)|局部|选区|\b(?:roi|reference (?:region|box)|local region)\b)",
+    r"|(?P<region>参考(?:区域?|框)|框[内中]|(?:最)?外圈|边缘|局部|选区|"
+    r"\b(?:roi|reference (?:region|box)|local region|image edges?|outermost ring)\b)",
     re.I,
 )
 
@@ -1003,8 +1005,113 @@ def gpa_coverage_sources(run, cited):
     return evidence, sources
 
 
+_REPEATED_MASK_LINK = re.compile(
+    r"\[(?P<label>首次|第一次|初次|复算|重复|第二次|first|original|repeat(?:ed)?|second)"
+    r"\s*(?:GPA\s*)?(?:质量|有效性?)?(?:掩膜|mask)\]\(\s*<?(?P<path>[^<>)\n]+)>?\s*\)",
+    re.I,
+)
+
+
+def adjacent_gpa_masks(blocks, position, runs, evidence, cited, compared):
+    """Resolve a joint result to two named mask links in the immediately following paragraph."""
+    pair = next(
+        ((a[0], b[0]) for a, b in pairwise(blocks) if a.start() <= position < a.end()),
+        None,
+    )
+    if not pair:
+        return ()
+    result, citations = pair
+    if not re.search(
+        r"(?:两次|两组|两张|两个)(?:的|得到的)?(?:质量|有效性?)?掩膜(?:完全|逐像素)?(?:一致|相同)"
+        r"|\bboth (?:quality )?masks (?:are|were) (?:identical|the same)\b",
+        result,
+        re.I,
+    ):
+        return ()
+    if re.search(
+        r"^\s*#{1,6}\s|(?:另[一份个次张]*|不同|其他)(?:样本|样品|运行|图像)"
+        r"|\b(?:another|different|separate)\s+(?:sample|image|run)\b",
+        citations,
+        re.I | re.M,
+    ):
+        return ()
+    links = list(_REPEATED_MASK_LINK.finditer(citations))
+    if len(links) != 2:
+        return ()
+    by_label = {}
+    for link in links:
+        path = Path(link["path"].strip())
+        aid = path.stem
+        if aid not in cited or aid not in evidence:
+            return ()
+        run = runs[evidence[aid]["run_id"]]
+        require(
+            path == run["_directory"] / run["artifacts"][aid]["file"], "gpa_mask_link_path_mismatch"
+        )
+        label = link["label"].lower()
+        which = "first" if label in {"首次", "第一次", "初次", "first", "original"} else "repeat"
+        by_label[which] = aid
+    if set(by_label) != {"first", "repeat"}:
+        return ()
+    first, repeat = by_label["first"], by_label["repeat"]
+    require(first != repeat, "gpa_repeat_requires_distinct_registered_masks")
+    run_id = evidence[first]["run_id"]
+    mentioned = set(_ID.findall(result + "\n" + citations))
+    require(
+        evidence[repeat]["run_id"] == run_id
+        and mentioned.intersection(runs) <= {run_id}
+        and not any(
+            mentioned.intersection(r["artifacts"]) for rid, r in runs.items() if rid != run_id
+        ),
+        "gpa_coverage_citation_mixes_runs",
+    )
+    observed(
+        mentioned.intersection(evidence) <= {first, repeat}, "gpa_coverage_claim_has_ambiguous_mask"
+    )
+    run = runs[run_id]
+    steps = [evidence[i]["step_id"] for i in (first, repeat)]
+    recorded = [s for s in run["_request"]["steps"] if s["id"] in steps]
+    images = {
+        s["step_id"]: run["artifacts"][s["image_artifact_id"]]["sha256"]
+        for s in run["strain_validity"]
+        if s["step_id"] in steps
+    }
+    require(
+        all((run_id, step) in compared for step in steps)
+        and [s["id"] for s in recorded] == steps
+        and images[steps[0]] == images[steps[1]]
+        and recorded[0]["parameters"] == recorded[1]["parameters"],
+        "gpa_masks_not_first_and_repeat_of_same_parameters",
+    )
+    require(
+        evidence[first]["mask_sha256"] == evidence[repeat]["mask_sha256"],
+        "answer_claims_identical_gpa_masks_with_different_content",
+    )
+    return first, repeat
+
+
+def one_cited_gpa_mask(covering, mentioned, returned, cited, sources, evidence):
+    observed(covering, "gpa_coverage_claim_has_no_linked_citation")
+    size = min(len(c["quote"]) for c in covering)
+    refs = {i for c in covering if len(c["quote"]) == size for i in c["artifact_ids"]} & cited
+    inline = mentioned & returned
+    if inline:
+        refs &= inline
+    elif len(evidence) > 1:
+        observed(
+            sum(m["run_id"] in mentioned for m in evidence.values()) == 1,
+            "gpa_coverage_claim_has_no_local_mask_reference",
+        )
+    resolved = [sources[i] for i in refs if i in sources]
+    observed(resolved and all(resolved), "gpa_coverage_claim_has_no_linked_mask")
+    ids = set.intersection(*resolved)
+    require(ids, "gpa_coverage_citations_disagree")
+    observed(len(ids) == 1, "gpa_coverage_claim_has_ambiguous_mask")
+    return next(iter(ids)), refs
+
+
 def check_gpa_coverage_answer(final, claims, runs, returned, compared):
-    """Check each whole-image claim against one cited mask from a compared GPA step."""
+    """Check each whole-image claim against its cited GPA mask or identical pair."""
     statements = list(gpa_coverage_statements(final))
     observed(statements, "whole_image_gpa_coverage_not_observed")
     evidence, sources = {}, {}
@@ -1013,7 +1120,8 @@ def check_gpa_coverage_answer(final, claims, runs, returned, compared):
         measurements, linked = gpa_coverage_sources(run, cited)
         evidence.update(measurements)
         sources.update(linked)
-    quantities = []
+    quantities, used = [], set()
+    blocks = list(re.finditer(r"\S.*?(?=\r?\n[ \t]*\r?\n|\Z)", final, re.S))
     for start, end, number, sentence in statements:
         covering = []
         for claim in claims:
@@ -1021,25 +1129,25 @@ def check_gpa_coverage_answer(final, claims, runs, returned, compared):
                 if occurrence.start() <= start and end <= occurrence.end():
                     covering.append(claim)
                     break
-        observed(covering, "gpa_coverage_claim_has_no_linked_citation")
-        size = min(len(c["quote"]) for c in covering)
-        refs = {i for c in covering if len(c["quote"]) == size for i in c["artifact_ids"]} & cited
         mentioned = set(_ID.findall(sentence))
-        inline = mentioned & returned
-        if inline:
-            refs &= inline
-        elif len(evidence) > 1:
-            # A detached annotation cannot choose a run/step for ambiguous host prose.
-            observed(
-                sum(m["run_id"] in mentioned for m in evidence.values()) == 1,
-                "gpa_coverage_claim_has_no_local_mask_reference",
+        pair = ()
+        if not mentioned.intersection(sources):
+            pair = adjacent_gpa_masks(blocks, start, runs, evidence, cited, compared)
+        if pair:
+            mask_id, refs = pair[0], set(pair)
+            same_run = runs[evidence[mask_id]["run_id"]]["artifacts"]
+            require(
+                all(
+                    i in same_run and (i not in sources or sources[i] & refs)
+                    for c in covering
+                    for i in c["artifact_ids"]
+                ),
+                "gpa_coverage_citations_disagree",
             )
-        resolved = [sources[i] for i in refs if i in sources]
-        observed(resolved and all(resolved), "gpa_coverage_claim_has_no_linked_mask")
-        ids = set.intersection(*resolved)
-        require(ids, "gpa_coverage_citations_disagree")
-        observed(len(ids) == 1, "gpa_coverage_claim_has_ambiguous_mask")
-        mask_id = next(iter(ids))
+        else:
+            mask_id, refs = one_cited_gpa_mask(
+                covering, mentioned, returned, cited, sources, evidence
+            )
         measured = evidence[mask_id]
         run_id, step = measured["run_id"], measured["step_id"]
         require(
@@ -1058,15 +1166,17 @@ def check_gpa_coverage_answer(final, claims, runs, returned, compared):
                 total,
             )
         require(ok, "answer_gpa_coverage_differs_from_registered_mask")
-        quantities.append(
-            {
-                "as_displayed": number[0],
-                "cited_artifacts": sorted(refs),
-                "mask_artifact_id": mask_id,
-            }
-        )
+        item = {
+            "as_displayed": number[0],
+            "cited_artifacts": sorted(refs),
+            "mask_artifact_id": mask_id,
+        }
+        if pair:
+            item["first_and_repeat_mask_ids"] = list(pair)
+        quantities.append(item)
+        used.update(pair or [mask_id])
     return {
-        "masks": {i: evidence[i] for i in sorted({q["mask_artifact_id"] for q in quantities})},
+        "masks": {i: evidence[i] for i in sorted(used)},
         "quantities": quantities,
     }
 
