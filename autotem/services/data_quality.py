@@ -504,7 +504,8 @@ def load_input(ctx: OperationContext, params: dict) -> ServiceResult:
     path = Path(ctx.input_path)
     try:
         array, dataset = read_selected_input(
-            path, supplied, dataset_id=f"{ctx.run_id}:selected", workspace=getattr(ctx, "workspace", None)
+            path, supplied, dataset_id=f"{ctx.run_id}:selected",
+            workspace=getattr(ctx, "workspace", None)
         )
     except NeedsInput as exc:
         fields = exc.details["fields"]

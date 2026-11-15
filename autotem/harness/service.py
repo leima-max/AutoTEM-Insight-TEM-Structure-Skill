@@ -139,7 +139,8 @@ class Harness:
     def _check_workspace_plugins(self, enabled_plugins):
         if self.workspace is not None and enabled_plugins:
             raise HarnessError(
-                "WORKSPACE_INPUT_RESTRICTED", "Additional operation plugins require a reviewed service."
+                "WORKSPACE_INPUT_RESTRICTED",
+                "Additional operation plugins require a reviewed service."
             )
 
     def inspect_input(self, path: str, **selection) -> dict:

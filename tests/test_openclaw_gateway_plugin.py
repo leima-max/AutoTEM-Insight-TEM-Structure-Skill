@@ -27,12 +27,17 @@ def test_installed_openclaw_gateway_files_are_exact_opt_in_and_rollback(tmp_path
     assert {tool["name"]: tool["parameters"] for tool in tools} == TOOL_SCHEMAS
     assert {tool["name"]: tool["description"] for tool in tools} == TOOL_DESCRIPTIONS
     assert all(tool["hostName"] == "autotem__" + tool["name"] for tool in tools)
-    assert manifest["toolMetadata"] == {name: {"optional": True} for name in manifest["contracts"]["tools"]}
+    assert manifest["toolMetadata"] == {
+        name: {"optional": True} for name in manifest["contracts"]["tools"]
+    }
     assert example["tools"]["alsoAllow"] == manifest["contracts"]["tools"]
     assert example["plugins"]["entries"] == {PLUGIN_ID: {"enabled": True}}
     assert example["plugins"]["load"]["paths"] == [str(directory)]
     assert binding["python"] == spec["jsonl_command"][0] and Path(binding["project"]) == project
-    assert spec["gateway_plugin"]["activation"] == "operator_opt_in" and not (project / ".openclaw").exists()
+    assert (
+        spec["gateway_plugin"]["activation"] == "operator_opt_in"
+        and not (project / ".openclaw").exists()
+    )
     assert rollback_host(project, result["installation_id"], dry_run=False)["ok"]
     assert not (directory / "index.cjs").exists()
 
@@ -54,7 +59,9 @@ def test_native_factories_require_matching_unrestricted_workspace(tmp_path):
         db.executemany("INSERT INTO runs VALUES (?,?,?)", [
             ("a" * 32, str(other / "outside.npy"), '{"steps":[]}'),
             ("b" * 32, str(project / "local.npy"),
-             json.dumps({"steps": [{"parameters": {"cif_candidate_paths": [str(other / "other.cif")]}}]})),
+             json.dumps({"steps": [
+                 {"parameters": {"cif_candidate_paths": [str(other / "other.cif")]}}
+             ]})),
         ])
     script = r"""
 const assert = require("node:assert/strict");
@@ -90,12 +97,16 @@ for (const key of ["autotem__submit_analysis", "autotem__validate_plan"]) {
   assert.throws(() => tool.execute("test", answered(other)), /outside/);
   const noSpawn = new AbortController();
   noSpawn.abort();
-  assert.throws(() => tool.execute("test", answered(project+"/permitted.cif"),noSpawn.signal), /abort/i);
-  const homeSpellings = ["~/outside.npy","~someone/else.npy","./~/outside.npy","././~someone/else.npy"];
-  if (process.platform === "win32") homeSpellings.push("~\\outside.npy","~someone\\else.npy",".\\.\\~\\outside.npy");
+  assert.throws(() => tool.execute("test", answered(project+"/permitted.cif"),noSpawn.signal),
+    /abort/i);
+  const homeSpellings = ["~/outside.npy","~someone/else.npy","./~/outside.npy",
+    "././~someone/else.npy"];
+  if (process.platform === "win32") homeSpellings.push("~\\outside.npy","~someone\\else.npy",
+    ".\\.\\~\\outside.npy");
   for (const value of homeSpellings) {
     for (const caller of [{}, {run_id:"a".repeat(32)}, {parent_run_id:"a".repeat(32)}]) {
-      assert.throws(() => tool.execute("test", {...caller,plan:{input_path:value}}), /home expansion/);
+      assert.throws(() => tool.execute("test", {...caller,plan:{input_path:value}}),
+        /home expansion/);
     }
   }
   if (process.platform === "win32") for (const alias of ["hop./x","hop /x","hop../x",
@@ -105,7 +116,8 @@ for (const key of ["autotem__submit_analysis", "autotem__validate_plan"]) {
     assert.throws(() => tool.execute("test",{plan:{input_path:"normal.npy",steps:[
       {parameters:{cif_candidate_paths:[alias]}}]}}), /Windows device/);
   }
-  assert.throws(() => tool.execute("test", {plan:{input_path:project+"/~folder/inside.npy"}}, noSpawn.signal), /abort/i);
+  assert.throws(() => tool.execute("test", {plan:{input_path:project+"/~folder/inside.npy"}},
+    noSpawn.signal), /abort/i);
 }
 for (const key of ["run_id","parent_run_id"]) {
   for (const fill of ["a","b"]) assert.throws(() => submit.execute("test",
@@ -114,9 +126,11 @@ for (const key of ["run_id","parent_run_id"]) {
 const factory = registered.get("autotem__inspect_input");
 const context = {workspaceDir:project,agentId:"researcher",sessionKey:"agent:researcher:main"};
 const cfg = {tools:{fs:{workspaceOnly:false}},
-             agents:{list:[{id:"Researcher",default:true,tools:{fs:{workspaceOnly:true}},sandbox:{mode:"non-main"}}]}};
+             agents:{list:[{id:"Researcher",default:true,tools:{fs:{workspaceOnly:true}},
+               sandbox:{mode:"non-main"}}]}};
 for (const agentId of ["Researcher", "researcher", undefined]) {
-  assert.throws(() => factory({...context,agentId,config:cfg}).execute("test",{path:other}), /outside/);
+  assert.throws(() => factory({...context,agentId,config:cfg}).execute("test",{path:other}),
+    /outside/);
 }
 assert.equal(factory({...context,sessionKey:"agent:researcher:other",config:cfg}),null);
 cfg.agents.list[0].sandbox.mode = "all";
@@ -172,7 +186,8 @@ require(entry).register({registerTool(factory, options) {
   const pending = tools.autotem__submit_analysis.execute("submit",{plan:{}},submission.signal);
   submission.abort();
   await assert.rejects(pending, (err) => /ABORTED/.test(err.message)
-    && err.message.includes("Submission status is unknown") && err.message.includes("existing idempotency key"));
+    && err.message.includes("Submission status is unknown")
+    && err.message.includes("existing idempotency key"));
   behavior = 'console.error("SYNTHETIC_PRIVATE_DIAGNOSTIC");process.exit(19)';
   await assert.rejects(tools.autotem__list_capabilities.execute("error",{}), (err) =>
     err.message.includes("EXIT_19") && !err.message.includes("SYNTHETIC_PRIVATE_DIAGNOSTIC"));
@@ -189,9 +204,12 @@ require(entry).register({registerTool(factory, options) {
     assert.deepEqual(sent.user_input.response.answers.cif_candidate_paths.value,[expected]);
     assert.equal(sent.input_path,plan.input_path);
     assert.deepEqual(plan.steps[0].parameters.cif_candidate_paths,[cif]);
-    assert.throws(() => scoped[name].execute("plugin",{plan:{...plan,enabled_plugins:["external"]}}),/built-in/);
+    assert.throws(() => scoped[name].execute("plugin",
+      {plan:{...plan,enabled_plugins:["external"]}}),
+      /built-in/);
   }
-  assert.throws(() => scoped.autotem__list_capabilities.execute("plugin",{enabled_plugins:["external"]}),/built-in/);
+  assert.throws(() => scoped.autotem__list_capabilities.execute("plugin",
+    {enabled_plugins:["external"]}),/built-in/);
 })().catch((err) => { console.error(err); process.exitCode=1; });
 """
     subprocess.run([node, "-e", driver, directory / "index.cjs", project],
@@ -201,8 +219,8 @@ require(entry).register({registerTool(factory, options) {
 def test_workspace_container_reads_enforce_selected_hdf_storage_and_ser_companion(tmp_path):
     import h5py
     import numpy as np
-    from PIL import Image
     from ncempy.io import ser
+    from PIL import Image
 
     from autotem.harness.contracts import HarnessError
     from autotem.harness.workspace import workspace_file
@@ -235,11 +253,15 @@ def test_workspace_container_reads_enforce_selected_hdf_storage_and_ser_companio
         received, _, _ = _read_selected(mixed, InputParameters(dataset_path=key))
         np.testing.assert_array_equal(received, pixels)
     for path, key in [(mixed, "local"), (other, "image")]:
-        received, _, _ = _read_selected(path, InputParameters(dataset_path=key), workspace=path.parent)
+        received, _, _ = _read_selected(
+            path, InputParameters(dataset_path=key), workspace=path.parent
+        )
         np.testing.assert_array_equal(received, pixels)
     tiff = project / "take.tif"
     Image.fromarray(pixels).save(tiff)
-    np.testing.assert_array_equal(_read_selected(tiff, InputParameters(), workspace=project)[0], pixels)
+    np.testing.assert_array_equal(
+        _read_selected(tiff, InputParameters(), workspace=project)[0], pixels
+    )
     # Use a normal SER header read fixture; the assertion concerns ncempy's next I/O.
     from unittest.mock import patch
 
@@ -250,7 +272,9 @@ def test_workspace_container_reads_enforce_selected_hdf_storage_and_ser_companio
          patch.object(ser, "read_emi", return_value={}) as emi:
         local = project / "capture.emi"
         local.write_bytes(b"local metadata")
-        np.testing.assert_array_equal(_read_selected(fake, InputParameters(), workspace=project)[0], pixels)
+        np.testing.assert_array_equal(
+            _read_selected(fake, InputParameters(), workspace=project)[0], pixels
+        )
         emi.assert_called_once_with(local)
         local.unlink()
         alias = project / "outside"
@@ -276,6 +300,7 @@ def test_workspace_container_reads_enforce_selected_hdf_storage_and_ser_companio
 
 def test_queued_workspace_policy_is_specific_to_each_job(tmp_path, monkeypatch):
     import numpy as np
+
     from autotem.harness import Harness
     from autotem.harness.workspace import job_workspace
 

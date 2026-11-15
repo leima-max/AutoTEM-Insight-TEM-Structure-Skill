@@ -39,7 +39,10 @@ def host_install_next_action(host: str, *, mcp_available: bool, codex_configured
             "可查看可用能力。也可运行 jsonl_command，逐行发送 UTF-8 JSON 请求。"
         )
         if host == "openclaw":
-            action += "若要经 OpenClaw 网关调用，按本项目 autotem-host/openclaw/gateway-config.example.json 启用所需工具。"
+            action += (
+                "若要经 OpenClaw 网关调用，按本项目 "
+                "autotem-host/openclaw/gateway-config.example.json 启用所需工具。"
+            )
         return action
     if host == "workbuddy":
         action = (
