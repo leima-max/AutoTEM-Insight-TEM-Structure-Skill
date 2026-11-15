@@ -332,6 +332,33 @@ def test_wheel_must_match_exact_source_bytes(tmp_path):
         release.verify_source_wheel(path, index)
 
 
+@pytest.mark.parametrize("state", ["original", "changed", "missing", "extra", "historical"])
+def test_wheel_data_files_match_the_declarations_of_that_release(tmp_path, state):
+    path = wheel(tmp_path, release.APP)
+    content = b"print('shipped diffraction preview')"
+    index = {
+        "files": {
+            "autotem/__init__.py": hashlib.sha256(b"# source\n").hexdigest(),
+            "apps/preview.py": hashlib.sha256(content).hexdigest(),
+            "examples/apps/preview.py": hashlib.sha256(b"other").hexdigest(),
+        }
+    }
+    project = b'[tool.setuptools.data-files]\n"share/autotem-insight/apps" = ["apps/*.py"]'
+    member = "autotem_insight-1.0.data/data/share/autotem-insight/apps/"
+    with zipfile.ZipFile(path, "a") as z:
+        if state not in ("missing", "historical"):
+            z.writestr(member + "preview.py", b"wrong" if state == "changed" else content)
+        if state == "extra":
+            z.writestr(member + "extra.py", content)
+    if state == "historical":
+        release.verify_source_wheel(path, index, b'[project]\nname = "autotem-insight"')
+    elif state == "original":
+        release.verify_source_wheel(path, index, project)
+    else:
+        with pytest.raises(ValueError, match="mismatch|inventory differs"):
+            release.verify_source_wheel(path, index, project)
+
+
 def test_zipapp_must_match_snapshot_and_fixed_entrypoint(tmp_path):
     fixture = {
         "autotem/__init__.py": b"# init",

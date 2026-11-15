@@ -191,7 +191,7 @@ def collect_wheels(
     run_pip(["wheel", "--use-pep517", "--no-deps", *common, "-w", str(built), "."], source, scratch)
     own, = built.glob("*.whl")
     wheel_identity(own)
-    verify_source_wheel(own, index)
+    verify_source_wheel(own, index, (source / "pyproject.toml").read_bytes())
     # The complete dependency graph is resolved, including the selected root extra.
     run_pip(["download", *common, "-d", str(directory), str(own) + root_extra(profile)],
             scratch, scratch)

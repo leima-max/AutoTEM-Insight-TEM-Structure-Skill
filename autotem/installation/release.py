@@ -218,10 +218,33 @@ def verify_snapshot(archive: zipfile.ZipFile, index_name: str) -> dict:
     return index
 
 
-def verify_source_wheel(wheel_path: Path, index: dict) -> None:
+def verify_source_wheel(wheel_path: Path, index: dict, pyproject: bytes | None = None) -> None:
     expected = {name: h for name, h in index["files"].items() if name.startswith("autotem/")}
+    distribution, version, *_ = wheel_path.name.split("-")
+    data_prefix = f"{distribution}-{version}.data/data/"
+    if pyproject is not None:
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # Development interpreters before 3.11.
+            import tomli as tomllib
+
+        config = tomllib.loads(pyproject.decode("utf-8-sig"))
+        destinations = config.get("tool", {}).get("setuptools", {}).get("data-files", {})
+        for destination, patterns in destinations.items():
+            folder = data_prefix + portable_path(destination) + "/"
+            for pattern in patterns:
+                sources = [
+                    n for n in index["files"] if PurePosixPath("/" + n).match("/" + pattern)
+                ]
+                if not sources:
+                    raise ValueError(f"Missing archived wheel data source: {pattern}")
+                for source in sources:
+                    path = folder + PurePosixPath(source).name
+                    if path in expected:
+                        raise ValueError(f"Duplicate wheel data destination: {path}")
+                    expected[path] = index["files"][source]
     with zipfile.ZipFile(wheel_path) as wheel:
-        names = [name for name in wheel.namelist() if name.startswith("autotem/")]
+        names = [name for name in wheel.namelist() if name.startswith(("autotem/", data_prefix))]
         if not expected or len(names) != len(expected) or set(names) != set(expected):
             raise ValueError("AutoTEM wheel inventory differs from archived sources")
         for name in names:
@@ -309,6 +332,7 @@ def _verify(root: Path, profile: str | None) -> VerifiedRelease:
         raise ValueError("Invalid source archive layout")
     with zipfile.ZipFile(files[archive_name]) as archive:
         index = verify_snapshot(archive, source["inventory_member"])
+        pyproject = archive.read("pyproject.toml") if "pyproject.toml" in index["files"] else None
         policy = unique_json(archive.read(f"configs/release/{profile}.json"))
         sources = unique_json(archive.read(portable_path(policy["wheel_sources"])))
     if sources["schema_version"] != SCHEMA:
@@ -387,7 +411,7 @@ def _verify(root: Path, profile: str | None) -> VerifiedRelease:
         raise ValueError("Wheelhouse index does not match the release")
     if app_wheel is None or wheels[APP][0] != manifest["package_version"]:
         raise ValueError("AutoTEM wheel does not match the release")
-    verify_source_wheel(app_wheel, index)
+    verify_source_wheel(app_wheel, index, pyproject)
     return VerifiedRelease(
         app_wheel, root / directory, root / lock_name, manifest["release_id"],
         hashlib.sha256(manifest_bytes).hexdigest(), "mcp" in PROFILE_EXTRAS[profile],
