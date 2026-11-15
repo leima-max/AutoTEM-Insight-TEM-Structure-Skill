@@ -254,9 +254,12 @@ def unsupported_resource_discovery(item, started, server):
         started.get("tool") == item["tool"]
         and started.get("status") == "in_progress"
         and started.get("arguments") == item.get("arguments") == {"server": server}
-        and started.get("result") is None and started.get("error") is None
-        and item.get("status") == "failed" and item.get("result") is None
-        and item.get("error") == {
+        and started.get("result") is None
+        and started.get("error") is None
+        and item.get("status") == "failed"
+        and item.get("result") is None
+        and item.get("error")
+        == {
             "message": f"{method} failed: {method} failed for `{server}`: Mcp error: -32601: Method not found"
         }
     )
@@ -289,6 +292,7 @@ def read_turn(base, turn, host, capture_format, server):
                     phase = "active"
                 elif kind == "turn.completed":
                     require(phase == "active", "host_turn_event_out_of_order")
+                    observed(not started_calls, "unfinished_host_mcp_call")
                     phase = "completed"
                 elif kind == "turn.failed":
                     raise NotEvaluated("host_turn_failed")
