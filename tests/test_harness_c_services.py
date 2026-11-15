@@ -432,6 +432,7 @@ def test_intensity_is_from_raw_and_rejects_unsafe_group_members(context):
     assert [r["atom_index"] for r in rows] == list(range(len(direct.raw_sum)))
     np.testing.assert_allclose([r["raw_sum_au"] for r in rows], direct.raw_sum)
     assert [r["saturated"] for r in rows] == direct.saturation_flag.tolist()
+    assert [r["saturation_status"] for r in rows] == direct.saturation_status
     assert [r["trusted"] for r in rows] == output["trusted_atom_mask"]
     grouped = atomic.intensity_groups(context, {}).outputs["intensity_groups"]
     assert all(label == -1 for label in grouped["labels"])
@@ -440,6 +441,25 @@ def test_intensity_is_from_raw_and_rejects_unsafe_group_members(context):
 def test_intensity_lattice_groups_execute(context):
     result = atomic.intensity_groups(context, {"grouping": "lattice", "mode": "sum_parity"})
     assert len(result.outputs["intensity_groups"]["summaries"]) == 2
+
+
+def test_unassessed_saturation_preserves_relative_grouping_and_warns_on_old_input(context):
+    output = context.value("atomic_intensity")
+    rows = context.tables[output["table_artifact_id"]]
+    assert {r["saturation_status"] for r in rows} == {"not_evaluated"}
+    assert output["saturation_status"] == [r["saturation_status"] for r in rows]
+    assert all(r["trusted"] and not r["saturated"] for r in rows)
+    metadata = context.array_metadata["atomic_intensity.trusted_atom_mask"]
+    assert metadata["saturation_threshold"] is None
+    assert "relative intensity grouping" in metadata["trusted_scope"]
+    assert any("saturation was not evaluated" in w for w in output["warnings"])
+    # Previously stored payloads have neither the per-column status nor the warning.
+    output.pop("saturation_status")
+    output["metadata"].pop("trusted_scope")
+    output["warnings"] = []
+    result = atomic.intensity_groups(context, {})
+    assert sum(row["count"] for row in result.outputs["intensity_groups"]["summaries"]) == len(rows)
+    assert any("saturation was not evaluated" in w for w in result.warnings)
 
 
 def test_sublattice_lattice_groups_preserve_subpixel_coordinate_revision(context):

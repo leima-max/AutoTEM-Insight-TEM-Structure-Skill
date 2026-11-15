@@ -14,6 +14,7 @@ from autotem.atomic.displacement import compute_atomic_displacement_from_basis
 from autotem.atomic.distance_statistics import compute_distance_statistics
 from autotem.atomic.gaussian_refinement import refine_atom_coordinates
 from autotem.atomic.intensity_quantification import (
+    SATURATION_THRESHOLD_MISSING,
     AtomicColumnIntensityResult,
     cluster_atomic_column_intensities,
     group_atomic_column_intensities_by_lattice,
@@ -729,11 +730,18 @@ def intensity(ctx: OperationContext, params: dict) -> ServiceResult:
     result = checked_call(
         quantify_atomic_column_intensity, raw, coords, **p.model_dump(exclude={"coordinate_role"})
     )
+    qc_metadata = {
+        "saturation_threshold": p.saturation_threshold,
+        "trusted_scope": (
+            "Eligible for relative intensity grouping after validity, edge and overlap checks. "
+            "Saturation is checked only with a supplied threshold."
+        ),
+    }
     payload = save_dataclass(
         ctx,
         "atomic_intensity",
         result,
-        metadata={"image_role": "raw", "unit": "a.u."},
+        metadata={"image_role": "raw", "unit": "a.u.", **qc_metadata},
         field_metadata={
             "coordinates_yx": {"unit": "pixel"},
             "atom_area_px": {"unit": "pixel^2"},
@@ -750,8 +758,14 @@ def intensity(ctx: OperationContext, params: dict) -> ServiceResult:
     trusted = (
         result.valid_atom_mask & ~result.edge_flag & ~result.overlap_flag & ~result.saturation_flag
     )
+    saturation_status = result.saturation_status
+    payload["saturation_status"] = saturation_status
     payload["trusted_atom_mask"] = trusted.tolist()
-    ctx.emit_array("atomic_intensity.trusted_atom_mask", trusted)
+    ctx.emit_array(
+        "atomic_intensity.trusted_atom_mask",
+        trusted,
+        metadata={**payload["metadata"], "unit": "boolean"},
+    )
     payload["table_artifact_id"] = ctx.emit_table(
         "atom_intensity_table",
         clean_json(
@@ -769,6 +783,7 @@ def intensity(ctx: OperationContext, params: dict) -> ServiceResult:
                     "overlap": result.overlap_flag[i],
                     "saturated": result.saturation_flag[i],
                     "trusted": trusted[i],
+                    "saturation_status": saturation_status[i],
                 }
                 for i, (y, x) in enumerate(result.coordinates_yx)
             ]
@@ -778,6 +793,7 @@ def intensity(ctx: OperationContext, params: dict) -> ServiceResult:
             "coordinate_role": p.coordinate_role,
             "coordinates_sha256": payload["metadata"]["coordinates_sha256"],
             "normalization": p.normalization,
+            **qc_metadata,
             "interpretation": (
                 "Relative column intensity. Quantitative Z and composition unverified."
             ),
@@ -815,6 +831,8 @@ def intensity_groups(ctx: OperationContext, params: dict) -> ServiceResult:
             mode=p.mode,
             valid_lattice_mask=mask,
         )
+    if result.provenance.get("parameters", {}).get("saturation_threshold") is None:
+        grouped.warnings.append(SATURATION_THRESHOLD_MISSING)
     return ServiceResult(
         {"intensity_groups": save_dataclass(ctx, "intensity_groups", grouped)},
         [*grouped.warnings, "Intensity groups are not quantitative chemical composition"],

@@ -170,6 +170,21 @@ def test_upload_detection_replacement_removal_csv_and_canvas(app_driver) -> None
     assert not app.get("download_button")
 
 
+def test_intensity_download_distinguishes_unassessed_saturation(app_driver) -> None:
+    app_driver.set_upload(_tiff_bytes())
+    app = app_driver.new_app().run()
+    next(button for button in app.button if button.label == "Run Atomic Column Intensity").click()
+    app.run()
+    _assert_success(app)
+    download = app_driver.downloads["Download atomic-column intensity CSV"]
+    lines = download["data"].decode("utf-8").splitlines()
+    assert lines[0] == "intensity_unit,a.u."
+    rows = list(csv.DictReader(lines[1:]))
+    assert len(rows) == len(app.session_state["edited_coords"]) == 4
+    flags = {(r["saturation_flag"], r["saturation_status"]) for r in rows}
+    assert flags == {("0", "not_evaluated")}
+
+
 def test_upload_sessions_have_independent_temporary_files(app_driver) -> None:
     app_driver.set_upload(_tiff_bytes())
     first_app = app_driver.new_app().run()
