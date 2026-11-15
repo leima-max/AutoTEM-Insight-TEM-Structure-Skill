@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import subprocess
@@ -309,53 +310,202 @@ def jobs(folder, frames, base):
     }
 
 
+def budget_request(source, budget, index):
+    return {
+        "input_path": str(source),
+        "steps": [
+            step("load", "input.load") if index == 0 else step(f"qa{index - 1}", "quality.assess")
+        ],
+        "budgets": {"run_seconds": budget},
+    }
+
+
+def budget_measurements(trace):
+    """Check a single run's public call sequence, including the observed enforcement."""
+    calls, budget = trace["calls"], trace["budget_seconds"]
+    states = []
+    enforced = False
+    for i, call in enumerate(calls):
+        require(
+            not enforced and call["request"] == budget_request(trace["input"], budget, i),
+            "Unexpected cumulative-budget request",
+        )
+        require(
+            call["append_to"] == (states[0]["run_id"] if states else None), "Different budget run"
+        )
+        if "rejection" in call:
+            require(
+                states
+                and states[-1]["status"] == "completed"
+                and states[-1]["execution_seconds"] >= budget
+                and call["rejection"]["code"] == "RUN_BUDGET_EXHAUSTED"
+                and "state" not in call,
+                f"Unexpected append rejection: {call['rejection']}",
+            )
+            enforced = True
+            continue
+        state = call["state"]
+        rid = states[0]["run_id"] if states else state["run_id"]
+        jobs = state["jobs"]
+        require(
+            rid == state["run_id"]
+            and state["job_id"] == call["submitted_job_id"]
+            and state["job_id"] not in {s["job_id"] for s in states}
+            and [j["job_id"] for j in jobs] == [s["job_id"] for s in states] + [state["job_id"]]
+            and jobs[-1]["run_id"] == rid
+            and jobs[-1]["status"] == state["status"]
+            and jobs[-1]["ended"] is not None
+            and math.isfinite(state["execution_seconds"])
+            and state["execution_seconds"] > (states[-1]["execution_seconds"] if states else 0)
+            and (not states or states[-1]["execution_seconds"] < budget),
+            "Cumulative budget reset or repeated job",
+        )
+        states.append(state)
+        if state["status"] == "timed_out":
+            error = state["error"] or {}
+            require(
+                error.get("code") == "TIMEOUT"
+                and error.get("message") == "Run budget exceeded"
+                and state["execution_seconds"] >= budget,
+                f"Unexpected timeout: {error}",
+            )
+            enforced = True
+        else:
+            require(
+                state["status"] == "completed" and state["error"] is None,
+                f"Unexpected budget job result: {state['status']} {state['error']}",
+            )
+    require(enforced, "Cumulative run budget never enforced")
+    return states
+
+
+def retry_budget(charged):
+    # Allow the observed startup charge and additional work under the same immutable budget.
+    return min(90, math.ceil(2.5 * charged))
+
+
 def cumulative(folder, frames, base):
     h = Harness(folder / "harness")
     source = sample(folder)
     budget = 12.0
-    request = {
-        "input_path": str(source),
-        "steps": [step("load", "input.load")],
-        "budgets": {"run_seconds": budget},
-    }
-    first = terminal(h, h.submit_analysis(request)["run_id"])
-    require(
-        first["status"] == "completed" and first["execution_seconds"] > 0,
-        "Need a real completed first job",
-    )
-    last = first
-    observations = [(first["job_id"], first["execution_seconds"], first["status"])]
-    for i in range(48):
-        follow = {**request, "steps": [step(f"qa{i}", "quality.assess")]}
+    attempts = []
+    for number in (1, 2):
+        path = folder / f"budget-attempt-{number}.json"
+        trace = {
+            "budget_seconds": budget,
+            "input": str(source),
+            "input_sha256": digest(source),
+            "calls": [],
+        }
+        rid = None
         try:
-            submitted = h.submit_analysis(follow, run_id=first["run_id"])
-        except HarnessError as exc:
+            for index in range(49):
+                request = budget_request(source, budget, index)
+                call = {"request": request, "append_to": rid}
+                trace["calls"].append(call)
+                try:
+                    submitted = h.submit_analysis(request, run_id=rid)
+                except HarnessError as exc:
+                    call["rejection"] = exc.as_dict()
+                    break
+                require(
+                    rid is None or submitted["run_id"] == rid, "Append returned a different run"
+                )
+                rid = submitted["run_id"]
+                call["submitted_job_id"] = submitted["job_id"]
+                call["state"] = terminal(h, rid)
+                if call["state"]["status"] != "completed":
+                    break
+        finally:
+            save(path, trace)
+        states = budget_measurements(trace)
+        attempts.append({"file": path.name, "sha256": digest(path)})
+        if len(states) >= 2:
+            return {
+                "budget_seconds": budget,
+                "job_measurements": [
+                    [s["job_id"], s["execution_seconds"], s["status"]] for s in states
+                ],
+                "run": record(folder, states[-1]),
+                "attempts": attempts,
+            }
+        budget = retry_budget(states[0]["execution_seconds"])
+    raise ValueError("Cumulative run budget exhausted before a second job in both runs")
+
+
+def recheck_budget(folder, snapshot, check, inventory):
+    attempts = check["attempts"]
+    require(1 <= len(attempts) <= 2, "Missing or unbounded cumulative-budget attempts")
+    budget = 12.0
+    seen = set()
+    with sqlite3.connect(snapshot.resolve().as_uri() + "?mode=ro&immutable=1", uri=True) as db:
+        db.row_factory = sqlite3.Row
+        for number, ref in enumerate(attempts, 1):
+            path = folder / f"budget-attempt-{number}.json"
             require(
-                exc.code == "RUN_BUDGET_EXHAUSTED" and last["execution_seconds"] >= budget,
-                "Unexpected append rejection",
+                ref["file"] == path.name
+                and digest(path)
+                == ref["sha256"]
+                == inventory[path.relative_to(folder.parent).as_posix()],
+                "Budget trace SHA",
             )
-            break
-        current = terminal(h, submitted["run_id"])
+            trace = json.loads(path.read_bytes())
+            require(trace["budget_seconds"] == budget, "Unexpected budget selection")
+            states = budget_measurements(trace)
+            last = states[-1]
+            rid = last["run_id"]
+            require(rid not in seen, "Budget retry must be a fresh run")
+            seen.add(rid)
+            run = db.execute(
+                "SELECT request,source_hash,run_seconds_used,status,error FROM runs WHERE run_id=?",
+                (rid,),
+            ).fetchone()
+            jobs = [
+                dict(j)
+                for j in db.execute("SELECT * FROM jobs WHERE run_id=? ORDER BY created", (rid,))
+            ]
+            require(
+                run
+                and all(s["jobs"] == jobs[: i + 1] for i, s in enumerate(states))
+                and last["jobs"] == jobs
+                and last["execution_seconds"] == run["run_seconds_used"]
+                and last["status"] == run["status"]
+                and last["error"] == (json.loads(run["error"]) if run["error"] else None),
+                "Budget job or final charge differs from the ledger",
+            )
+            saved = json.loads(run["request"])
+            source = folder / Path(trace["input"]).name
+            require(
+                trace["input"] == saved["input_path"]
+                and trace["input_sha256"]
+                == run["source_hash"]
+                == digest(source)
+                == inventory[source.relative_to(folder.parent).as_posix()]
+                and saved["budgets"]["run_seconds"] == budget
+                and [(s["id"], s["operation_id"]) for s in saved["steps"]]
+                == [
+                    (c["request"]["steps"][0]["id"], c["request"]["steps"][0]["operation_id"])
+                    for c in trace["calls"]
+                    if "state" in c
+                ],
+                "Budget inputs or steps differ from submitted work",
+            )
+            if number < len(attempts):
+                require(len(states) == 1, "Multi-job proof must not be replaced by a retry")
+                budget = retry_budget(last["execution_seconds"])
         require(
-            current["execution_seconds"] > last["execution_seconds"]
-            and current["job_id"] != last["job_id"],
-            "Cumulative budget reset or repeated job",
+            seen == {row[0] for row in db.execute("SELECT run_id FROM runs")},
+            "Unreported budget run",
         )
-        observations.append((current["job_id"], current["execution_seconds"], current["status"]))
-        last = current
-        if current["status"] == "timed_out":
-            require(
-                current["error"]["code"] == "TIMEOUT"
-                and current["error"]["message"] == "Run budget exceeded",
-                "Unexpected operation timeout",
-            )
-            break
-        require(current["status"] == "completed", "Unexpected append result")
     require(
-        len(observations) > 1 and last["execution_seconds"] >= budget,
-        "Cumulative run budget never enforced",
+        len(states) >= 2
+        and check["budget_seconds"] == budget
+        and check["run"]["run_id"] == rid
+        and last == json.loads((folder / check["run"]["state_file"]).read_bytes())
+        and check["job_measurements"]
+        == [[s["job_id"], s["execution_seconds"], s["status"]] for s in states],
+        "Cumulative budget proof",
     )
-    return {"budget_seconds": budget, "job_measurements": observations, "run": record(folder, last)}
 
 
 def multi_result(folder, frames, base):
@@ -868,14 +1018,8 @@ def recheck(name, root, check, inventory):
             "Job proof",
         )
     elif name == "cumulative_run_budget":
-        values = [s[1] for s in check["job_measurements"]]
-        require(
-            len(values) >= 2
-            and all(a < b for a, b in zip(values, values[1:], strict=False))
-            and values[-1] >= check["budget_seconds"]
-            and rows[check["run"]["run_id"]][2] == values[-1],
-            "Cumulative budget proof",
-        )
+        require(len(dbs) == 1, "Unexpected budget registries")
+        recheck_budget(folder, dbs[0], check, inventory)
     elif name == "multi_result_reports":
         require(
             check["primary"]["role"] == "atom_strain"
