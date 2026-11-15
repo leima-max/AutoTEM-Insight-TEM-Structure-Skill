@@ -92,6 +92,7 @@ def atomic_variant(f, op, p):
     from autotem.atomic.displacement import compute_atomic_displacement_from_basis
     from autotem.atomic.distance_statistics import compute_distance_statistics
     from autotem.atomic.intensity_quantification import (
+        SATURATION_THRESHOLD_MISSING,
         group_atomic_column_intensities_by_lattice,
         quantify_atomic_column_intensity,
     )
@@ -175,6 +176,9 @@ def atomic_variant(f, op, p):
                 "atomic.displacement", "atomic_displacement.valid_atom_mask"
             ),
         )
+        # The service adds the parent intensity step's detector assessment to its grouped artifact.
+        if kwargs.get("saturation_threshold") is None:
+            result.warnings.append(SATURATION_THRESHOLD_MISSING)
     else:
         raise ValueError(f"No direct comparison for {op}")
     return {

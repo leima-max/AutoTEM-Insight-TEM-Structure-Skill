@@ -6,6 +6,7 @@ import importlib.util
 import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -40,6 +41,63 @@ def test_full_array_controls_and_registration_boundaries():
         "qualify_local_faults.py",
         "qualify_local_state_probe.py",
     }
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("threshold", [None, 100.0])
+def test_grouped_intensity_qualification_checks_the_full_warning_list(threshold):
+    from autotem.atomic.intensity_quantification import SATURATION_THRESHOLD_MISSING
+
+    numerics = load_driver().component("numerics")
+    params = {"metric": "normalized_intensity", "mode": "sum_parity"}
+    grouping_warning = "No valid atom columns are available for intensity grouping."
+    expected = [grouping_warning]
+    if threshold is None:
+        expected.append(SATURATION_THRESHOLD_MISSING)
+    arrays = {
+        "raw": np.zeros((32, 32)),
+        "atomic_displacement.lattice_indices_ij": np.array([[0, 0]]),
+        "atomic_displacement.valid_atom_mask": np.array([False]),
+        "intensity_groups.labels": np.array([0]),
+    }
+    group = {
+        "summaries": [],
+        "confidence": 0.0,
+        "metric": params["metric"],
+        "warnings": expected,
+        "provenance": {
+            "source": "autotem.atomic.intensity_quantification.summarize_atomic_intensity_groups",
+            "method": "lattice_sum_parity",
+            "parameters": {
+                "metric": params["metric"],
+                "valid_count": 0,
+                "group_count": 0,
+                "lattice_group_mode": params["mode"],
+            },
+        },
+    }
+    records = {
+        "refined_atoms": {"atoms": [{"y": 16, "x": 16, "intensity": {"value": 0}}]},
+        "intensity_groups": group,
+    }
+    intensity_params = {"coordinate_role": "refined_atoms", "saturation_threshold": threshold}
+    frame = SimpleNamespace(
+        claims={"atomic.intensity": {"parameters": intensity_params}},
+        value=lambda op, role: records[role],
+        array=lambda op, role: arrays[role],
+    )
+    assert numerics.atomic_variant(frame, "atomic.intensity_groups", params)["direct_fields"] == 6
+    for altered in (
+        expected[:-1],
+        expected[1:],
+        [*expected, SATURATION_THRESHOLD_MISSING],
+        [*expected, "Unexpected warning"],
+        list(reversed(expected)),
+    ):
+        if altered != expected:
+            group["warnings"] = altered
+            with pytest.raises(ValueError):
+                numerics.atomic_variant(frame, "atomic.intensity_groups", params)
 
 
 @pytest.mark.smoke
