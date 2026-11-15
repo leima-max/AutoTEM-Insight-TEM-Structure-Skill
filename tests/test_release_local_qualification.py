@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -124,6 +125,102 @@ def test_sqlite_evidence_freezes_uncheckpointed_wal_and_rejects_stale_certificat
     )
     with pytest.raises(ValueError, match="Incomplete certificate"):
         q.recheck(cert, tmp_path, tmp_path, tmp_path)
+
+
+@pytest.fixture
+def interrupted_artifact(tmp_path):
+    rid, aid = "1" * 32, "a" * 32
+    store = tmp_path / "fault" / "harness"
+    files = store / "runs" / rid / "artifacts"
+    files.mkdir(parents=True)
+    temporary = files / f"{aid}.png.tmp"
+    temporary.write_bytes(b"interrupted write")
+    published = files / ("b" * 32 + ".png")
+    published.write_bytes(b"registered evidence")
+    database = store / "harness.sqlite3"
+    with sqlite3.connect(database) as db:
+        db.executescript(
+            "CREATE TABLE runs(run_id TEXT,status TEXT,active_started REAL,current_step TEXT);"
+            "CREATE TABLE jobs(run_id TEXT,status TEXT,ended REAL);"
+            "CREATE TABLE artifacts(artifact_id TEXT,run_id TEXT,path TEXT);"
+        )
+        db.execute("INSERT INTO runs VALUES (?, 'cancelled', NULL, NULL)", (rid,))
+        db.execute("INSERT INTO jobs VALUES (?, 'cancelled', 2.0)", (rid,))
+        db.execute("INSERT INTO artifacts VALUES (?,?,?)", ("b" * 32, rid, str(published)))
+    return database, temporary, published
+
+
+@pytest.mark.parametrize("status", ["cancelled", "interrupted", "timed_out"])
+def test_support_keeps_registry_and_science_but_excludes_abandoned_stream(
+    tmp_path, interrupted_artifact, status
+):
+    database, temporary, published = interrupted_artifact
+    with sqlite3.connect(database) as db:
+        db.execute("UPDATE runs SET status=?", (status,))
+        db.execute("UPDATE jobs SET status=?", (status,))
+    q = load_driver()
+    manifest = q.supporting_files(tmp_path, ["fault"])
+    assert manifest[published.relative_to(tmp_path).as_posix()] == q.digest(published)
+    assert ("sqlite-snapshots/" + database.relative_to(tmp_path).as_posix()) in manifest
+    assert temporary.relative_to(tmp_path).as_posix() not in manifest
+    assert temporary.read_bytes() == b"interrupted write"
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "running",
+        "unsettled",
+        "different_run",
+        "registered",
+        "registered_path",
+        "crossrun_path",
+        "unknown_type",
+        "wrong_parent",
+        "unknown_name",
+        "hard_link",
+        "final_exists",
+        "directory",
+    ],
+)
+def test_support_rejects_ambiguous_temporary_paths(tmp_path, interrupted_artifact, variant):
+    database, temporary, published = interrupted_artifact
+    if variant in {
+        "running",
+        "unsettled",
+        "different_run",
+        "registered",
+        "registered_path",
+        "crossrun_path",
+    }:
+        with sqlite3.connect(database) as db:
+            if variant == "running":
+                db.execute("UPDATE runs SET status='running',active_started=1,current_step='load'")
+            elif variant == "unsettled":
+                db.execute("INSERT INTO jobs VALUES (?, 'running', NULL)", ("1" * 32,))
+            elif variant == "different_run":
+                db.execute("UPDATE runs SET run_id=?", ("2" * 32,))
+            else:
+                aid = "a" * 32 if variant == "registered" else "c" * 32
+                path = published if variant == "registered" else temporary
+                rid = "2" * 32 if variant == "crossrun_path" else "1" * 32
+                db.execute("INSERT INTO artifacts VALUES (?,?,?)", (aid, rid, str(path)))
+    elif variant == "hard_link":
+        os.link(temporary, tmp_path / "linked-copy")
+    elif variant == "final_exists":
+        temporary.with_suffix("").write_bytes(b"also present")
+    elif variant == "directory":
+        temporary.unlink()
+        temporary.mkdir()
+    else:
+        destination = {
+            "unknown_type": temporary.with_name("a" * 32 + ".exe.tmp"),
+            "wrong_parent": temporary.parent.parent / temporary.name,
+            "unknown_name": temporary.with_name("unrelated.png.tmp"),
+        }[variant]
+        temporary.rename(destination)
+    with pytest.raises(ValueError, match="staging|Staging|temporary"):
+        load_driver().supporting_files(tmp_path, ["fault"])
 
 
 @pytest.mark.smoke
