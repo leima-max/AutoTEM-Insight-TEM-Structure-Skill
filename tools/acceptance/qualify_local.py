@@ -8,8 +8,10 @@ import importlib.util
 import json
 import re
 import sqlite3
+import stat
 import sys
 import traceback
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +20,7 @@ import numpy as np
 from autotem.acceptance.driver import runtime_record, write_json
 from autotem.acceptance.evidence import audit_artifact, digest, require
 from autotem.harness import Harness
+from autotem.harness.service import TERMINAL
 from autotem.harness.store import ARTIFACT_ROWS, Store
 
 BASE_CHECKS = {
@@ -214,16 +217,69 @@ def roles_and_child(science, base, frames, matrix):
     }
 
 
+def check_interrupted_stage(output, snapshots, path):
+    """A killed worker can leave its unpublished stream behind. Keep the original on disk."""
+    relative = path.relative_to(output)
+    match = re.fullmatch(r"([0-9a-f]{32})\.(npy|csv|json|png)\.tmp", path.name)
+    require(
+        match
+        and len(relative.parts) >= 5
+        and relative.parts[-4] == "runs"
+        and re.fullmatch(r"[0-9a-f]{32}", relative.parts[-3])
+        and path.parent.name == "artifacts",
+        f"Unexpected temporary evidence: {relative}",
+    )
+    for part in (path, *path.parents):
+        if part == output:
+            break
+        require(
+            not part.is_symlink()
+            and not getattr(part.lstat(), "st_file_attributes", 0)
+            & stat.FILE_ATTRIBUTE_REPARSE_POINT,
+            f"Linked staging path: {part}",
+        )
+    require(
+        stat.S_ISREG(path.lstat().st_mode)
+        and path.stat().st_nlink == 1
+        and not path.with_suffix("").exists(),
+        f"Ambiguous staging file: {relative}",
+    )
+    store = relative.parents[3]
+    snapshot = snapshots / store / "harness.sqlite3"
+    require(snapshot.is_file(), f"Missing staging registry: {relative}")
+    with closing(
+        sqlite3.connect(snapshot.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+    ) as db:
+        run_id = relative.parts[-3]
+        run = db.execute(
+            "SELECT status,active_started,current_step FROM runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        jobs = db.execute("SELECT status,ended FROM jobs WHERE run_id=?", (run_id,)).fetchall()
+        require(
+            run
+            and run[0] in {"cancelled", "interrupted", "timed_out"}
+            and run[1:] == (None, None)
+            and run[0] in {status for status, _ in jobs}
+            and all(status in TERMINAL and ended is not None for status, ended in jobs),
+            f"Unsettled or unexpected staging run: {relative}",
+        )
+        registered = db.execute("SELECT artifact_id,path FROM artifacts")
+        reserved = {path.absolute(), path.with_suffix("").absolute()}
+        require(
+            all(aid != match[1] and Path(name) not in reserved for aid, name in registered),
+            f"Staging conflicts with registered evidence: {relative}",
+        )
+
+
 def supporting_files(output, fault_names):
     """Freeze mutable SQLite/WAL state through SQLite's backup transaction."""
     snapshots = output / "sqlite-snapshots"
     snapshots.mkdir()
     files = {}
+    stages = []
     for name in sorted(fault_names):
         directory = output / name
         for path in sorted(directory.rglob("*")):
-            if not path.is_file():
-                continue
             relative = path.relative_to(output)
             if {"__pycache__", "cache"}.intersection(relative.parts) or path.suffix in {
                 ".pyc",
@@ -238,12 +294,17 @@ def supporting_files(output, fault_names):
                 "release-libraries.pth",
             }:
                 continue
+            if path.suffix == ".tmp":
+                stages.append(path)
+                continue
+            if not path.is_file():
+                continue
             if path.name == "harness.sqlite3":
                 copy = snapshots / relative
                 copy.parent.mkdir(parents=True, exist_ok=True)
                 with (
-                    sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as src,
-                    sqlite3.connect(copy) as dst,
+                    closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as src,
+                    closing(sqlite3.connect(copy)) as dst,
                 ):
                     src.backup(dst)
                 file = copy
@@ -252,6 +313,8 @@ def supporting_files(output, fault_names):
             else:
                 file = path
             files[file.relative_to(output).as_posix()] = digest(file)
+    for path in stages:
+        check_interrupted_stage(output, snapshots, path)
     return files
 
 
