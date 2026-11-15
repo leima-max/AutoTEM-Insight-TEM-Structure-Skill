@@ -54,7 +54,7 @@ OPERATIONS = {
     "J05": {"diffraction.pattern", "diffraction.metrics"},
     "J06": {"calibration.resolve"},
     "J07": {"input.load"},
-    "J15": {"simulation.diffraction"},
+    "J15": {"simulation.diffraction", "diffraction.match"},
 }
 ROLES = {
     "J01": {"diffraction"},
@@ -1817,6 +1817,99 @@ def has_raw_refined_atomic_measurements(run):
     return False
 
 
+def matched_diffsims_evidence(run):
+    """Find a completed match that consumed this run's explicit-site diffsims result."""
+    artifacts = run["artifacts"]
+    simulated_steps = {
+        s["step_id"]
+        for s in run["steps"]
+        if s["operation_id"] == "simulation.diffraction" and s["status"] == "completed"
+    }
+    for step in run["steps"]:
+        if step["operation_id"] != "diffraction.match" or step["status"] != "completed":
+            continue
+        consumed = step["consumed_artifacts"]
+        sim = artifacts.get(consumed.get("simulation"), {})
+        measured = artifacts.get(consumed.get("diffraction"), {})
+        if (
+            sim.get("step_id") not in simulated_steps
+            or sim.get("role") != "simulation"
+            or measured.get("role") != "diffraction"
+            or not measured.get("execution_usable")
+        ):
+            continue
+        model = unique_json((run["_directory"] / sim["file"]).read_text("utf-8"))
+        adapter = model.get("provenance", {}).get("adapter", {})
+        parameters = [p.get("simulation_parameters", {}) for p in model["patterns"]]
+        outputs = [
+            a
+            for a in artifacts.values()
+            if a["role"] == "diffraction"
+            and a["step_id"] == step["step_id"]
+            and a["execution_usable"]
+        ]
+        images = [
+            a
+            for a in artifacts.values()
+            if a["role"].startswith("simulated_pattern_")
+            and a["step_id"] == sim["step_id"]
+            and a["kind"] == "array"
+            and a["execution_usable"]
+        ]
+        if len(outputs) != 1 or not images:
+            continue
+        output = unique_json((run["_directory"] / outputs[0]["file"]).read_text("utf-8"))
+        match = output.get("provenance", {}).get("phase_matching", {})
+        if (
+            adapter.get("adapter") == "diffsims"
+            and adapter.get("active") is True
+            and parameters
+            and all(
+                p.get("engine") == "diffsims"
+                and p.get("structure_source") == "candidate_atom_sites"
+                and p.get("atom_site_count", 0) > 0
+                for p in parameters
+            )
+            and match.get("method") == "diffsims_template_spot_match"
+            and match.get("active") is True
+        ):
+            return True
+    return False
+
+
+def observed_simulation_fault(calls, runs, variant, codes):
+    # A queue, run or host TIMEOUT does not identify a time limit in the diffsims backend.
+    if variant == "timeout":
+        codes = {"SIMULATION_TIMEOUT"}
+    if any(
+        s["operation_id"] == "simulation.diffraction"
+        and s["status"] in {"failed", "timed_out"}
+        and s["error_code"] in codes
+        for run in runs.values()
+        for s in run["steps"]
+    ):
+        return True
+    if variant == "timeout":
+        return False
+    for call in calls:
+        if call["tool"] not in {"validate_plan", "submit_analysis"} or call["response"]["ok"]:
+            continue
+        error = call["response"]["error"]
+        details = error.get("details") or {}
+        steps = call["arguments"].get("plan", {}).get("steps", [])
+        if (
+            error["code"] in codes
+            and details.get("dependency") == "diffsims"
+            and (
+                error.get("message") == "simulation.diffraction"
+                or details.get("operation_id") == "simulation.diffraction"
+            )
+            and any(s.get("operation_id") == "simulation.diffraction" for s in steps)
+        ):
+            return True
+    return False
+
+
 def check_case(case, calls, runs, turns, excerpts, variant=None):
     completed = [r for r in runs.values() if r["status"] == "completed"]
     if variant is not None:
@@ -1846,6 +1939,11 @@ def check_case(case, calls, runs, turns, excerpts, variant=None):
             and ROLES[case] <= {a["role"] for a in r["artifacts"].values() if a["execution_usable"]}
         ]
         require(candidates, "requested_operations_or_results_missing")
+        if case == "J15":
+            require(
+                any(matched_diffsims_evidence(r) for r in candidates),
+                "missing_linked_diffsims_match",
+            )
         if case == "J03":
             compared = compared_gpa_steps(candidates, completed)
             require(compared, "same_parameter_gpa_comparison_missing")
@@ -1970,7 +2068,13 @@ def check_case(case, calls, runs, turns, excerpts, variant=None):
             "numerical_failure": {"NUMERICAL_FAILURE", "INVALID_METRICS"},
             "timeout": {"TIMEOUT", "SIMULATION_TIMEOUT"},
         }[variant]
-        require(failed_codes & expected, "fault_variant_not_observed")
+        if case == "J15":
+            require(
+                observed_simulation_fault(calls, runs, variant, expected),
+                "simulation_fault_not_observed",
+            )
+        else:
+            require(failed_codes & expected, "fault_variant_not_observed")
         return
     if case in {"J06", "J07", "J08", "J09"}:
         observed(len(turns) >= 2, "missing_actual_followup_user_turn")
