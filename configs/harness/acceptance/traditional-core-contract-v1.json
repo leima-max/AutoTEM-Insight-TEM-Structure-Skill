@@ -59,6 +59,14 @@
         },
         "selection": {
           "type": "object"
+        },
+        "input_mode": {
+          "type": "string",
+          "enum": [
+            "snapshot",
+            "reference"
+          ],
+          "default": "snapshot"
         }
       },
       "required": [
