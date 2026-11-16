@@ -13,10 +13,14 @@ workflow:
   - Check modality/contrast and sampling; detect candidates with traditional LoG/DoG.
   - Refine on raw, preserving candidate versus refined coordinates and fitting limitations.
   - Calculate requested distances/relative intensity/sublattice or displacement using explicit units and priors.
-  - Run GPA/atom strain only with reliable g pair/reference; preserve valid masks and diagnostic limits.
+  - Include requested reference-dependent strain in the complete plan even when the reference is missing; the service must persist needs_input before computation. A coordinate-only request needs no strain step.
+  - For atom strain, refine on raw then submit strain.atom without a guessed reference, or append it to a completed refined run; read the actual numbered evidence and input_request before asking the user.
+  - Direct strain.atom reference_region parameters use selected raw-array local half-open bounds; input replies follow the actual answer_schema coordinates and source_2d bounds without pre-subtracting origin_yx, which the service converts.
+  - Compute GPA/atom strain only with reliable g pair/reference; preserve valid masks and diagnostic limits.
 human_input_conditions: [missing_pixel_scale, unreliable_g_pair, missing_reference_roi, missing_basis_or_model, unresolved_contrast_semantics]
 failure_policy:
-  missing_reference: Return needs_input and the missing raw-coordinate reference fields.
+  missing_reference: Forward the actual persisted needs_input request ID, parent run and numbered evidence; do not return only an invented conversational request.
+  reference_reply: Preserve original reply and untrimmed values with source/basis; validate is read-only, then submit the bound response with parent_run_id and stable idempotency_key to persist acceptance or rejection before child creation.
   low_quality: Return candidate/diagnostic status and warnings rather than claiming quantitative readiness.
 prohibited: [denoised_coordinates_as_raw_measurement, hidden_invalid_mask, unsupported_dl_success, relative_intensity_as_composition, inferred_gt_accuracy]
 return_contract: references/tool-contracts.md

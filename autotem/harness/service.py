@@ -15,6 +15,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
@@ -150,11 +151,14 @@ class Harness:
                 "Additional operation plugins require a reviewed service."
             )
 
-    def inspect_input(self, path: str, **selection) -> dict:
+    def inspect_input(
+        self, path: str, *, input_mode: Literal["snapshot", "reference"] = "snapshot", **selection
+    ) -> dict:
         modality = selection.pop("modality", "unknown")
         result = self.submit_analysis(
             {
                 "input_path": path,
+                "input_mode": input_mode,
                 "modality": modality,
                 "selection": selection,
                 "steps": [{"id": "inspect", "operation_id": "input.load"}],

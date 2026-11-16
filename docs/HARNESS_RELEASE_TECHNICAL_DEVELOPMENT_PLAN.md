@@ -820,3 +820,18 @@ flowchart LR
 官方资料访问日期为 2026-11-12。接口资料用于设计依据，不能替代本机真实版本验收。本次只验证文档结构、链接、示例合同和操作/任务一致性；算法、安装及三宿主执行结论继续以各自带时间的证据为准。
 
 本次文档级自动核查记录见 [documentation validation](../outputs/harness-documentation-20261112/validation.json)，不作为算法、安装或真实宿主通过证明。
+
+
+## 附录 C：J08/J09 修复验收（2026-11-16）
+
+3e822c9 的 Codex 原生现场暴露两处流程缺口：J08 宿主先口头询问参考区，未提交保留应变步骤的计划形成持久补参请求；非法回答没有通过提交接口留下拒绝记录。J09 的引用分析虽未复制源文件，前置 inspect_input 仍按默认快照模式复制。旧版现场判定与原始会话保留，修复版本单独取证。
+
+本次修复范围：
+
+- Skill/Profile 明确按用户请求保留参考依赖步骤，服务在计算前产生 needs_input；坐标提取请求不附加应变。真实补答绑定父 run/request，经 submit_analysis 形成接受或拒绝记录；validate_plan 仍只读，拒绝保持开放请求且不启动子任务。
+- inspect_input 增加顶层 input_mode，可选 snapshot/reference，默认 snapshot 保持兼容；CLI 对应 --input-mode。引用模式保留注册科学数组和预览，不另存原始输入文件；工作区边界与源哈希复核继续生效。
+- J08 非法补答验收要求本次回复对应的持久拒绝记录。J09 引用验收覆盖本场原生工具调用创建的全部 run，包含预检；无关历史 run 不参与判定。
+
+验证顺序为聚焦负例与兼容测试、独立复审、冻结源码和发行包、全量本地回归、安装版核对、原卡 Codex 复验。受影响卡为 J08 answered/unanswered/invalid_reply、J09 snapshot/reference，兼容对照为 J06 calibration 补答和 J04 已给参考区。结果按新源码及包指纹单列；不能将旧版完整矩阵与新版局部复验合并宣布新版 RG3/RG4 全通过。
+
+本附录记录修复范围，不是通过证明。实际回归、现场判定及产品复审存于本次独立证据目录。OpenClaw、WorkBuddy 真实会话及 GitHub 推送按用户要求暂缓；release_ready 仍需全部适用门槛闭合。

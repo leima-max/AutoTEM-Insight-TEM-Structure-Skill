@@ -15,8 +15,23 @@ on raw; keep atoms versus refined_atoms distinct. Compute only requested distanc
 relative intensity, sublattice/displacement or strain supported by reliable inputs.
 GPA needs non-collinear reliable g vectors and reference_region=[y0,y1,x0,x1] in raw
 pixels (or explicit supported absolute reference); 1/nm vectors need pixel_size_nm.
-Missing or unreliable references return human_input_request to the parent, with annotated
-evidence and exact fields/units. Never guess user scientific inputs or quantitative GT.
+When reference-dependent strain is requested, keep that operation in the plan with missing
+reference fields omitted. For atom strain, submit strain.atom after raw refinement (or append
+it to a completed refined run) so the service persists needs_input with numbered evidence
+before computation. Forward the actual input_request ID, parent run and evidence to the
+parent before asking the user; a conversational question alone is not a persisted request.
+Coordinate-only requests need no strain step. Direct strain.atom reference_region parameters
+use selected raw-array local half-open [row_start,row_stop,col_start,col_stop]. A reference
+reply follows the actual request answer_schema coordinates; for frame=source_2d give original
+image bounds without pre-subtracting origin_yx, which the service converts to local pixels.
+ROI and zero-based numbered atom indices are mutually exclusive reference forms, selecting
+at least six atoms spanning two dimensions.
+Preserve a reply's original raw_reply, untrimmed values, source and basis. validate_plan is
+read-only; send a response to an active request through submit_analysis with parent_run_id
+and a stable idempotency_key even when preview rejects the scientific value, so rejection is
+persisted before any child/worker. Read the recorded error and ask for correction without
+clipping or inventing a reference. Valid replies create linked children. Follow tool-contracts
+and the existing bounded sensitive-text policy. Never guess scientific inputs or quantitative GT.
 HRTEM contrast is not automatic atom identity; relative intensity is not composition.
 
 Only use the nine coarse Harness tools. Save/validate a bounded package and submit

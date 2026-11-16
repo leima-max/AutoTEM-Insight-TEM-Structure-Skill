@@ -33,7 +33,16 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "operation_id": STRING,
         }
     ),
-    "inspect_input": _object_schema({"path": STRING, "selection": OBJECT}, ("path",)),
+    "inspect_input": _object_schema(
+        {
+            "path": STRING,
+            "selection": OBJECT,
+            "input_mode": {
+                "type": "string", "enum": ["snapshot", "reference"], "default": "snapshot"
+            },
+        },
+        ("path",),
+    ),
     "validate_plan": _object_schema({"plan": OBJECT, "run_id": STRING}, ("plan",)),
     "submit_analysis": _object_schema(
         {
@@ -77,7 +86,11 @@ TOOL_DESCRIPTIONS = {
         "Discover operations. Use view=summary for availability, then view=parameters with "
         "one operation_id for its exact parameters and scientific limits. Default: full catalog."
     ),
-    "inspect_input": "Inspect authorized input with explicit dataset/frame/channel selection.",
+    "inspect_input": (
+        "Inspect authorized input with explicit dataset/frame/channel selection. "
+        "input_mode defaults to snapshot; reference avoids copying the source file "
+        "while preserving registered scientific arrays, previews and source-hash checks."
+    ),
     "validate_plan": "Validate operations, parameters, dependencies and budgets without analysis.",
     "submit_analysis": "Execute a validated traditional plan; returns a run ID and real status.",
     "get_run_status": "Read persisted execution, science, warnings and human input requirements.",
@@ -149,6 +162,8 @@ def _validate_arguments(tool: str, arguments: object) -> dict[str, Any]:
             len(value) > 16 or any(not isinstance(item, str) or not item for item in value)
         ):
             raise ProtocolError("enabled_plugins must contain at most 16 installed plugin names.")
+    if tool == "inspect_input" and "input_mode" in arguments.get("selection", {}):
+        raise ProtocolError("input_mode must be a top-level tool argument, not a selection.")
     return dict(arguments)
 
 
@@ -204,7 +219,11 @@ def dispatch_request(harness: Any, request: object) -> dict[str, Any]:
             if tool == "list_capabilities":
                 result = harness.list_capabilities(**args) if args else harness.list_capabilities()
             elif tool == "inspect_input":
-                result = harness.inspect_input(args["path"], **args.get("selection", {}))
+                result = harness.inspect_input(
+                    args["path"],
+                    input_mode=args.get("input_mode", "snapshot"),
+                    **args.get("selection", {}),
+                )
             elif tool == "validate_plan":
                 result = harness.validate_plan(**args)
             elif tool == "submit_analysis":
@@ -311,6 +330,10 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser = sub.add_parser("inspect")
     inspect_parser.add_argument("path")
     inspect_parser.add_argument("--selection-json", default="{}")
+    inspect_parser.add_argument(
+        "--input-mode", choices=("snapshot", "reference"), default="snapshot",
+        help="Copy the input source by default; reference keeps the original source path.",
+    )
     for name in ("validate", "submit"):
         child = sub.add_parser(name)
         child.add_argument("--plan", required=True, help="JSON/YAML operation plan.")
@@ -429,7 +452,11 @@ def main(argv: list[str] | None = None) -> int:
         }
         arguments: dict[str, Any] = {}
         if args.command == "inspect":
-            arguments = {"path": args.path, "selection": strict_json(args.selection_json)}
+            arguments = {
+                "path": args.path,
+                "selection": strict_json(args.selection_json),
+                "input_mode": args.input_mode,
+            }
         elif args.command in ("validate", "submit"):
             arguments = {"plan": load_plan(args.plan, args.input)}
             if args.run_id is not None:

@@ -423,15 +423,24 @@ def run_evidence(root, run_id, window, runtime):
                 (run_id,),
             )
         ]
+        parent_responses = [
+            dict(r)
+            for r in db.execute(
+                "SELECT request_id,parent_run_id,child_run_id,response,validation,adopted_values "
+                "FROM input_responses WHERE parent_run_id=?",
+                (run_id,),
+            )
+        ]
         question_records = {
             row["request_id"]: {
                 "step_id": row["step_id"],
                 "operation_id": row["operation_id"],
+                "status": row["status"],
                 "fields": unique_json(row["fields"]),
                 "evidence": unique_json(row["evidence_artifact_ids"]),
             }
             for row in db.execute(
-                "SELECT request_id,step_id,operation_id,fields,evidence_artifact_ids "
+                "SELECT request_id,step_id,operation_id,status,fields,evidence_artifact_ids "
                 "FROM input_requests WHERE run_id=?",
                 (run_id,),
             )
@@ -591,6 +600,7 @@ def run_evidence(root, run_id, window, runtime):
         "physical_measurements": physical_measurements,
         "strain_validity": science,
         "_replies": replies,
+        "_parent_responses": parent_responses,
         "requested_fields": {
             key: [field["name"] for field in item["fields"]]
             for key, item in question_records.items()
@@ -1910,6 +1920,91 @@ def observed_simulation_fault(calls, runs, variant, codes):
     return False
 
 
+def persisted_reference_rejection(turns, parents):
+    """Bind an observed rejected submit to the parent's safe, durable reply record."""
+    for turn in turns[1:]:
+        for call in turn["calls"]:
+            if call["tool"] != "submit_analysis" or call["response"]["ok"]:
+                continue
+            args = call["arguments"]
+            plan = args.get("plan")
+            if not isinstance(plan, dict):
+                continue
+            user_input = plan.get("user_input", {})
+            if not isinstance(user_input, dict):
+                continue
+            reply = user_input.get("response")
+            if not isinstance(reply, dict) or reply.get("source") != "user":
+                continue
+            for parent in parents:
+                if args.get("parent_run_id") != parent["run_id"]:
+                    continue
+                question = parent["_questions"].get(reply.get("request_id"), {})
+                if question.get("status") != "open":
+                    continue
+                schemas = {
+                    name: schema
+                    for field in question["fields"]
+                    for name, schema in field["answer_schema"].items()
+                }
+                answers = reply.get("answers", {})
+                if (
+                    not isinstance(answers, dict)
+                    or not answers
+                    or not answers.keys() <= schemas.keys()
+                ):
+                    continue
+                safe = {}
+                for name, answer in answers.items():
+                    if not isinstance(answer, dict):
+                        break
+                    value = answer.get("value")
+                    if type(value) in (int, float, bool) or (
+                        isinstance(value, list)
+                        and len(value) <= 32
+                        and all(type(v) in (int, float) for v in value)
+                    ):
+                        safe[name] = {"value": value}
+                        if answer.get("unit") in schemas[name].get("units", []):
+                            safe[name]["unit"] = answer["unit"]
+                else:
+                    # A redacted/unsupported value is not evidence that the numeric
+                    # user selection was durably preserved. Never require raw text.
+                    if not safe or safe.keys() != answers.keys():
+                        continue
+                    expected = {
+                        "request_id": reply["request_id"],
+                        "source": "user",
+                        "answers": safe,
+                    }
+                    first_jobs = {
+                        j["job_id"]
+                        for c in turns[0]["calls"]
+                        if c["response"]["ok"]
+                        and isinstance(c["response"]["result"], dict)
+                        and c["response"]["result"].get("run_id") == parent["run_id"]
+                        for j in (
+                            c["response"]["result"].get("jobs", [])
+                            or [{"job_id": c["response"]["result"].get("job_id")}]
+                        )
+                        if j.get("job_id")
+                    }
+                    if not first_jobs or first_jobs != {j["job_id"] for j in parent["jobs"]}:
+                        continue
+                    for row in parent["_parent_responses"]:
+                        if (
+                            row["request_id"] == reply["request_id"]
+                            and row["parent_run_id"] == parent["run_id"]
+                            and row["child_run_id"] is None
+                            and unique_json(row["adopted_values"]) == {}
+                            and unique_json(row["validation"])
+                            == {"status": "rejected", "code": call["response"]["error"]["code"]}
+                            and same_json(unique_json(row["response"] or "null"), expected)
+                        ):
+                            return True
+    return False
+
+
 def check_case(case, calls, runs, turns, excerpts, variant=None):
     completed = [r for r in runs.values() if r["status"] == "completed"]
     if variant is not None:
@@ -2045,6 +2140,10 @@ def check_case(case, calls, runs, turns, excerpts, variant=None):
                     ),
                     "missing_rejected_reply",
                 )
+                require(
+                    persisted_reference_rejection(turns, parents),
+                    "missing_persisted_rejected_reply",
+                )
             return
     if case in {"J11", "J15"} and variant in {
         "invalid_file",
@@ -2076,6 +2175,13 @@ def check_case(case, calls, runs, turns, excerpts, variant=None):
         else:
             require(failed_codes & expected, "fault_variant_not_observed")
         return
+    if case == "J09" and variant == "reference":
+        # verify() loaded only runs created by this capture's native calls,
+        # including inspection; an unrelated project run is not in this set.
+        require(
+            all(r["_request"]["input_mode"] == "reference" for r in runs.values()),
+            "reference_journey_created_snapshot",
+        )
     if case in {"J06", "J07", "J08", "J09"}:
         observed(len(turns) >= 2, "missing_actual_followup_user_turn")
         parents = {

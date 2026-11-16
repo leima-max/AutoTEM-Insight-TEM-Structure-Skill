@@ -70,8 +70,27 @@ class CompareParameters(CParameters):
 
 
 class AtomStrainParameters(CoordinatesParameters):
-    reference_region: list[int] | None = None
-    reference_atom_indices: list[int] | None = None
+    reference_region: list[int] | None = Field(
+        default=None,
+        description=(
+            "Direct operation ROI uses selected raw-array local pixels, half-open "
+            "[row_start,row_stop,col_start,col_stop]. For an input response, instead follow "
+            "the request answer_schema coordinates (source_2d with origin_yx); the service "
+            "converts to local pixels, so do not subtract the origin before replying. It "
+            "must select at least six atoms spanning a two-dimensional lattice; mutually "
+            "exclusive with reference_atom_indices. If neither is supplied, the requested "
+            "strain step returns needs_input with numbered evidence before computation."
+        ),
+    )
+    reference_atom_indices: list[int] | None = Field(
+        default=None,
+        description=(
+            "Zero-based indices from this run's numbered refined-atom evidence; select at "
+            "least six distinct atoms spanning a two-dimensional lattice; mutually exclusive "
+            "with reference_region. If neither is supplied, the requested strain step returns "
+            "needs_input with numbered evidence before computation."
+        ),
+    )
     neighbor_k: int = Field(default=10, ge=4, le=1000)
     direction_tolerance_deg: float = Field(default=18.0, gt=0, lt=90)
     interpolation_grid_step: int = Field(default=1, ge=1, le=1000)
@@ -581,7 +600,13 @@ def definitions() -> list[OperationDefinition]:
             if op == "strain.atom"
             else ("numpy", "scipy", "skimage", "matplotlib", "PIL"),
             scientific_limitations=(LIMITATION,),
-            description="Complete-array diagnostic strain service",
+            description=(
+                "Atom-strain diagnostics; a missing reference produces needs_input with "
+                "numbered refined-atom evidence before strain computation. Include this step "
+                "when strain is requested, even if the user will select a reference later."
+                if op == "strain.atom"
+                else "Complete-array diagnostic strain service"
+            ),
             modality=("HRTEM", "STEM", "HAADF-STEM", "ABF-STEM", "TEM", "unknown"),
         )
         for op, handler, model, inputs, outputs in entries
