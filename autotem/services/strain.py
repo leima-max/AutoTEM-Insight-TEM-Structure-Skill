@@ -73,10 +73,10 @@ class AtomStrainParameters(CoordinatesParameters):
     reference_region: list[int] | None = Field(
         default=None,
         description=(
-            "Direct operation ROI uses selected raw-array local pixels, half-open "
-            "[row_start,row_stop,col_start,col_stop]. For an input response, instead follow "
-            "the request answer_schema coordinates (source_2d with origin_yx); the service "
-            "converts to local pixels, so do not subtract the origin before replying. It "
+            "Direct operation ROI uses zero-based pixels local to the selected raw array, "
+            "with half-open [row_start,row_stop,col_start,col_stop] and exclusive upper bounds. "
+            "For an input response, follow the request answer_schema coordinates. For source_2d, "
+            "supply original-image bounds and let the service subtract origin_yx once. It "
             "must select at least six atoms spanning a two-dimensional lattice; mutually "
             "exclusive with reference_atom_indices. If neither is supplied, the requested "
             "strain step returns needs_input with numbered evidence before computation."
@@ -85,10 +85,10 @@ class AtomStrainParameters(CoordinatesParameters):
     reference_atom_indices: list[int] | None = Field(
         default=None,
         description=(
-            "Zero-based indices from this run's numbered refined-atom evidence; select at "
-            "least six distinct atoms spanning a two-dimensional lattice; mutually exclusive "
-            "with reference_region. If neither is supplied, the requested strain step returns "
-            "needs_input with numbered evidence before computation."
+            "Use the actual zero-based labels from this run's numbered refined-atom evidence. "
+            "Select at least six distinct atoms spanning a two-dimensional lattice. Mutually "
+            "exclusive with reference_region. If neither is supplied, the requested strain "
+            "step returns needs_input with numbered evidence before computation."
         ),
     )
     neighbor_k: int = Field(default=10, ge=4, le=1000)

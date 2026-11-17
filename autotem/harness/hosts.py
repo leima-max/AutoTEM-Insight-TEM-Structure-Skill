@@ -121,30 +121,42 @@ def _mcp_entry(root: Path, harness_root: str | Path, python_executable: str) -> 
     }
 
 
-def _codex_merge(existing: bytes | None, entry: dict) -> bytes:
-    text = existing.decode("utf-8-sig") if existing is not None else ""
-    if text.strip():
-        document = _read_toml(text)
-        servers = document.get("mcp_servers", {})
-        if not isinstance(servers, dict):
-            raise ValueError("Existing mcp_servers is not a table; refusing unsafe merge.")
-        if "autotem" in servers:
-            if servers["autotem"] == entry:
-                return existing
-            raise ValueError(
-                "Project already has a different autotem MCP entry; no overwrite performed."
-            )
-        # Inline tables cannot be extended safely by appending a dotted table.
-        if re.search(r"(?m)^\s*mcp_servers\s*=", text):
-            raise ValueError("Inline mcp_servers config requires a reviewed manual merge.")
-    suffix = (
+def _codex_section(entry: dict) -> str:
+    return (
         "\n\n[mcp_servers.autotem]\n"
         + "\n".join(
             f"{key} = {json.dumps(value, ensure_ascii=False)}" for key, value in entry.items()
         )
         + "\n"
     )
-    merged = text.rstrip() + suffix
+
+
+def _codex_merge(existing: bytes | None, entry: dict, *, owned_sha256: str | None = None) -> bytes:
+    text = existing.decode("utf-8-sig") if existing is not None else ""
+    section = _codex_section(entry)
+    if existing is not None and text.strip():
+        document = _read_toml(text)
+        servers = document.get("mcp_servers", {})
+        if not isinstance(servers, dict):
+            raise ValueError("Existing mcp_servers is not a table; refusing unsafe merge.")
+        if "autotem" in servers:
+            current = servers["autotem"]
+            if current == entry and current["required"] is True:
+                return existing
+            if owned_sha256 is not None and _hash(existing) == owned_sha256:
+                legacy_entry = {key: entry[key] for key in ("command", "args", "cwd")}
+                legacy_entry["startup_timeout_sec"] = 60
+                legacy_section = _codex_section(legacy_entry).encode("utf-8")
+                # Replace only the unchanged section appended by the pre-readiness installer.
+                if current == legacy_entry and existing.endswith(legacy_section):
+                    return existing[:-len(legacy_section)] + section.encode("utf-8")
+            raise ValueError(
+                "Project already has a different autotem MCP entry; no overwrite performed."
+            )
+        # Inline tables cannot be extended safely by appending a dotted table.
+        if re.search(r"(?m)^\s*mcp_servers\s*=", text):
+            raise ValueError("Inline mcp_servers config requires a reviewed manual merge.")
+    merged = text.rstrip() + section
     _read_toml(merged)
     return merged.encode("utf-8")
 
@@ -175,7 +187,7 @@ def _workbuddy_archive(files: dict[str, bytes]) -> bytes:
 
 def _planned_files(
     root: Path, host: str, *, with_mcp: bool, harness_root: str | Path, python_executable: str,
-    managed: bool = False, mcp_available: bool = True,
+    managed: bool = False, mcp_available: bool = True, codex_config_sha256: str | None = None,
 ) -> dict[str, bytes]:
     skill = _resource_files()
     files: dict[str, bytes]
@@ -205,8 +217,6 @@ def _planned_files(
             "args": ["-I", str(root / ".autotem" / "host-entry.py"), "mcp"],
             "cwd": str(root),
         }
-        if host == "codex":
-            entry["startup_timeout_sec"] = 60
     command = [entry["command"], *entry["args"][:-1]]
     host_note = {
         "schema_version": INSTALL_VERSION,
@@ -266,12 +276,14 @@ def _planned_files(
             raise ValueError(
                 "Automatic MCP merge is implemented only for project-local Codex TOML."
             )
+        entry.update(required=True, startup_timeout_sec=180)
         target = _contained(root, ".codex/config.toml")
         if target.is_dir():
             raise _TomlReview("Project TOML path is a directory.", _codex_merge(None, entry))
         try:
             files[".codex/config.toml"] = _codex_merge(
-                target.read_bytes() if target.exists() else None, entry
+                target.read_bytes() if target.exists() else None, entry,
+                owned_sha256=codex_config_sha256,
             )
         except (ValueError, IsADirectoryError) as exc:
             reason = (
@@ -392,18 +404,20 @@ def install_host(
         return {**result, "ok": False, "conflicts": [v["path"] for v in details],
                 "conflict_resolution": info, "next_action": text}
 
+    config = ".codex/config.toml"
+    config_owner = owned.get(config) if managed else None
     try:
         proposed = _planned_files(
             root, host, with_mcp=with_mcp, harness_root=harness_root,
             python_executable=python_executable or sys.executable,
             managed=managed, mcp_available=mcp_available,
+            codex_config_sha256=config_owner[2]["after_sha256"] if config_owner else None,
         )
     except _TomlReview as exc:
-        details = blocked([issue(".codex/config.toml", "compatible_toml", exc.section)])
+        details = blocked([issue(config, "compatible_toml", exc.section)])
         if not managed:  # Preserve the existing Python API exception for invalid TOML merges.
             raise _TomlReview(str(exc) + "\n" + details["next_action"], exc.section) from exc
         return details
-    config = ".codex/config.toml"
     if managed and host == "codex" and not mcp_available and config in owned:
         path = _contained(root, config)
         if not path.is_file() or _hash(path.read_bytes()) != owned[config][2]["after_sha256"]:

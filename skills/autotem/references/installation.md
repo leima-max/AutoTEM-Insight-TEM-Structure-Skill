@@ -8,6 +8,13 @@ The host launches the installed local server; routine analyses do not need a new
 Python shell command for each step. MCP still requires the host's permission to
 launch and use that server. A local handshake is not proof of a real host journey.
 
+Project-local Codex MCP installations set `required = true` and
+`startup_timeout_sec = 180` in `.codex/config.toml`. Codex waits for AutoTEM
+MCP initialization during session startup, with a 180-second startup timeout.
+If required startup fails, retain the Codex diagnostic as a host connection
+failure. After resolving it, reconnect and call `list_capabilities` to verify
+the tool catalog before running an analysis.
+
 When using an approved CLI fallback, read `autotem-host/<host>/adapter.json`
 from the installation's project directory. Use its explicit `python_executable`
 and `jsonl_command`, preserving `-I` and the absolute Harness root. Do not infer
@@ -24,6 +31,9 @@ reload the selected host, authorize the project connector and try
 `list_capabilities`. An old MCP session reporting `HOST_RECONNECT_REQUIRED`
 needs a reconnect. Keep the setup bundle to repair or roll back the installation.
 The rollback action restores the previous project configuration and retains run data.
+A managed upgrade can migrate the previous 60-second Codex configuration when
+it matches the installation receipt. A conflicting project configuration
+requires review through the installer's conflict-resolution instructions.
 
 For the developer wheel route, use the stdlib-only installer:
 

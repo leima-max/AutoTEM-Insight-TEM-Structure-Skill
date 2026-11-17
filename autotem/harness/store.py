@@ -437,6 +437,8 @@ class Store:
                         field["answer_schema"][name]["coordinates"] = {
                             "frame": "source_2d",
                             "order": "[y0,y1,x0,x1], exclusive upper bounds",
+                            "index_base": 0,
+                            "upper_bound": "exclusive",
                             "origin_yx": meta.get("selection", {}).get("roi_origin_yx", [0, 0]),
                             "shape_yx": meta["shape"],
                         }

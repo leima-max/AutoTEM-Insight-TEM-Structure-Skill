@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,14 @@ def result(harness, name, **arguments):
     return envelope["result"]
 
 
+def test_atomic_native_template_matches_documented_codex_mirror():
+    repo = Path(__file__).resolve().parents[1]
+    name = "autotem_atomic_strain.toml"
+    package = repo / "autotem/harness/resources/skill/references/hosts/codex" / name
+    documented = repo / "configs/harness/hosts/codex" / name
+    assert documented.read_bytes() == package.read_bytes()
+
+
 @pytest.mark.parametrize("view", ["summary", "parameters", "full"])
 def test_atom_reference_gate_is_discoverable(tmp_path, view):
     (entry,) = result(
@@ -37,6 +46,7 @@ def test_atom_reference_gate_is_discoverable(tmp_path, view):
         roi = fields["reference_region"]["description"]
         assert "half-open" in roi and "row_start" in roi and "selected raw" in roi
         assert "local" in roi and "answer_schema" in roi
+        assert "zero-based" in roi and "exclusive upper bounds" in roi
         for name in ("reference_region", "reference_atom_indices"):
             description = fields[name]["description"]
             assert "six" in description and "two-dimensional" in description
@@ -143,11 +153,14 @@ def test_valid_reference_reply_creates_child_without_mutating_parent(tmp_path):
 
 
 def test_out_of_bounds_reply_is_persisted_without_child_or_job(tmp_path, monkeypatch):
-    h, plan, parent = setup_atoms(tmp_path)
+    h, plan, parent = setup_atoms(tmp_path, selection={"roi": [8, 56, 12, 72]})
     parent_id = parent["run_id"]
     (request,) = parent["input_requests"]
     reply = reply_plan(
-        plan, request, [8, 1000, 8, 68], "Rows 8 through 999 and columns 8 through 67, inclusive"
+        plan,
+        request,
+        [16, 57, 20, 60],
+        "Original image zero-based rows 16 through 56 and columns 20 through 59, inclusive",
     )
     preview = tool(h, "validate_plan", plan=reply)
     assert not preview["ok"] and preview["error"]["code"] == "INVALID_INPUT_RESPONSE"
@@ -168,7 +181,7 @@ def test_out_of_bounds_reply_is_persisted_without_child_or_job(tmp_path, monkeyp
     (refusal,) = reopened["input_responses"]  # stable retries do not duplicate rejection
     assert refusal["child_run_id"] is None
     assert refusal["validation"] == {"status": "rejected", "code": "INVALID_INPUT_RESPONSE"}
-    assert refusal["response"]["answers"]["reference_region"]["value"] == [8, 1000, 8, 68]
+    assert refusal["response"]["answers"]["reference_region"]["value"] == [16, 57, 20, 60]
     assert "raw_reply" not in refusal["response"]  # existing safe rejection storage policy
     assert h.store.role(parent_id, "atom_strain") is None
     with h.store.connect() as db:
@@ -203,21 +216,37 @@ def test_requested_strain_can_append_to_completed_refinement(tmp_path):
     assert h.store.role(state["run_id"], "atom_strain") is None
 
 
-def test_reference_reply_uses_source_coordinates_and_converts_origin_once(tmp_path):
+@pytest.mark.parametrize("legacy_question", [False, True], ids=["current", "legacy"])
+def test_reference_reply_uses_source_coordinates_and_converts_origin_once(
+    tmp_path, legacy_question
+):
     h, plan, parent = setup_atoms(tmp_path, selection={"roi": [8, 56, 12, 72]})
     assert parent["status"] == "needs_input", parent
     (request,) = parent["input_requests"]
     spec = request["fields"][0]["answer_schema"]["reference_region"]["coordinates"]
     assert spec["frame"] == "source_2d"
     assert spec["origin_yx"] == [8, 12]
-    source_region = [16, 40, 20, 60]
-    expected_local = [8, 32, 8, 48]
-    reply = reply_plan(
-        plan,
-        request,
-        source_region,
-        "Original image rows 16 through 39, columns 20 through 59, inclusive",
-    )
+    assert spec["shape_yx"] == [48, 60]
+    if legacy_question:
+        # Recreate a saved question from before these two descriptive keys existed.
+        spec.pop("index_base", None)
+        spec.pop("upper_bound", None)
+        with h.store.connect() as db:
+            db.execute(
+                "UPDATE input_requests SET fields=? WHERE request_id=?",
+                (json.dumps(request["fields"]), request["request_id"]),
+            )
+        reopened = result(Harness(h.root), "get_run_status", run_id=parent["run_id"])
+        assert reopened["input_requests"] == [request]
+    else:
+        assert spec["index_base"] == 0
+        assert spec["upper_bound"] == "exclusive"
+    source_region = [17, 39, 21, 59]
+    expected_local = [9, 31, 9, 47]
+    raw_reply = "Original image one-based rows 18 through 39, columns 22 through 59, inclusive"
+    reply = reply_plan(plan, request, source_region, raw_reply)
+    basis = "User selected a one-based inclusive source-image ROI from the numbered evidence"
+    reply["user_input"]["response"]["basis"] = basis
     preview = result(h, "validate_plan", plan=reply)
     assert preview["plan"]["steps"][-1]["parameters"]["reference_region"] == expected_local
     child = result(
@@ -230,6 +259,9 @@ def test_reference_reply_uses_source_coordinates_and_converts_origin_once(tmp_pa
     )
     assert child["status"] == "completed", child
     (accepted,) = child["input_responses"]
+    assert accepted["response"]["raw_reply"] == raw_reply
+    assert accepted["response"]["source"] == "user"
+    assert accepted["response"]["basis"] == basis
     assert accepted["response"]["answers"]["reference_region"]["value"] == source_region
     assert (
         accepted["adopted_values"]["reference_region"]["parameters"]["reference_region"]
@@ -239,5 +271,7 @@ def test_reference_reply_uses_source_coordinates_and_converts_origin_once(tmp_pa
         h.store.get_run(child["run_id"])["request"]["steps"][-1]["parameters"]["reference_region"]
         == expected_local
     )
-    measured = h.store.load_json(h.store.role(child["run_id"], "atom_strain"))
-    assert measured["provenance"]["reference_atom_count"] >= 6
+    coords = h.store.load_array(h.store.role(child["run_id"], "atom_strain.coordinates_yx"))
+    mask = h.store.load_array(h.store.role(child["run_id"], "atom_strain.reference_atom_mask"))
+    selected = {tuple(point) for point in np.rint(coords[mask]).astype(int)}
+    assert selected == {(y, x) for y in (12, 20, 28) for x in (16, 24, 32, 40)}

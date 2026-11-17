@@ -20,12 +20,14 @@ reference fields omitted. For atom strain, submit strain.atom after raw refineme
 it to a completed refined run) so the service persists needs_input with numbered evidence
 before computation. Forward the actual input_request ID, parent run and evidence to the
 parent before asking the user; a conversational question alone is not a persisted request.
-Coordinate-only requests need no strain step. Direct strain.atom reference_region parameters
-use selected raw-array local half-open [row_start,row_stop,col_start,col_stop]. A reference
-reply follows the actual request answer_schema coordinates; for frame=source_2d give original
-image bounds without pre-subtracting origin_yx, which the service converts to local pixels.
-ROI and zero-based numbered atom indices are mutually exclusive reference forms, selecting
-at least six atoms spanning two dimensions.
+Coordinate-only requests need no strain step. Direct strain reference ROIs are zero-based,
+half-open [y0,y1,x0,x1] in the selected array. A reference reply follows the actual request
+answer_schema coordinates. For frame=source_2d, give original-image bounds and let the
+service subtract origin_yx once. Use the actual zero-based IDs in the run's numbered evidence.
+ROI and atom IDs are mutually exclusive reference forms, selecting at least six atoms spanning
+two dimensions. Clarify any unspecified natural-language index base, endpoint inclusion or
+frame before computing strain with a supplied range. Use a request ID only if the service
+returned it. Convert explicit conventions as shown in tool-contracts.
 Preserve a reply's original raw_reply, untrimmed values, source and basis. validate_plan is
 read-only; send a response to an active request through submit_analysis with parent_run_id
 and a stable idempotency_key even when preview rejects the scientific value, so rejection is

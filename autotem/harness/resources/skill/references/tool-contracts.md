@@ -31,27 +31,45 @@ For requested reference-dependent strain, keep the operation in the complete pla
 its reference is missing. In particular, raw refinement followed by `strain.atom` without
 reference values produces numbered evidence and a persisted `needs_input` before strain
 computation. A completed refinement package may instead append the requested strain step
-with a new step ID and `run_id`. Do not add strain to coordinate-only requests. Do not end
-with a reference question until the actual run has supplied its `input_requests`.
+with a new step ID and `run_id`. A coordinate-only request needs no strain step. When the
+user needs evidence to choose a missing reference, ask after the run supplies its
+`input_requests`.
 
 When a run returns `needs_input`, read its `input_requests`. Give the full parent
 `run_id`, request ID and relevant `evidence_artifact_ids`. End the current turn by asking
 for one of its `answer_options` with the allowed unit and measurement basis. For atom
-strain choose either a half-open `[row_start,row_stop,col_start,col_stop]` ROI or zero-based
-indices from that request's numbered evidence, mutually exclusive, selecting at least six
-atoms spanning a two-dimensional lattice. Direct `strain.atom` operation parameters use
-selected raw-array local pixels. In contrast, reference replies must follow the actual
-request's `answer_schema.reference_region.coordinates`: for `frame=source_2d`, supply the
-original-image bounds, preserving `origin_yx` for the service to convert. Do not pre-subtract
-that origin or submit already-local bounds as source coordinates. For example, origin
-`[8,12]` and a reply `[16,40,20,60]` are adopted as local `[8,32,8,48]` once. Never invent or
-trim the reference.
+strain choose either an ROI or the actual zero-based IDs printed in that request's numbered
+evidence. The two forms are mutually exclusive. Select at least six atoms spanning a
+two-dimensional lattice.
+
+Numeric reference ROIs are zero-based, half-open `[y0,y1,x0,x1]` with exclusive upper bounds.
+Direct strain parameters use pixels local to the selected image array. Reference replies
+follow the actual request's `answer_schema.reference_region.coordinates`. With `frame=source_2d`,
+submit canonical bounds in the original image. The service subtracts `origin_yx` once. With
+origin `[8,12]`, source bounds `[16,40,20,60]` become local bounds `[8,32,8,48]`. New requests
+state `index_base: 0` and `upper_bound: exclusive`. Older saved requests use the same numeric
+convention from their existing `order` and `frame`.
+
+For a natural-language row/column range, confirm any unspecified starting base, upper-bound
+inclusion or frame before adopting it. When a range was already supplied, ask for clarification
+before computation. Mention a request ID only if the service returned it. Convert explicit
+conventions to the numeric ROI in the intended frame.
+
+| User's stated convention for `[a,b,c,d]` | Canonical `[y0,y1,x0,x1]` |
+| --- | --- |
+| Zero-based, half-open | `[a,b,c,d]` |
+| Zero-based, inclusive | `[a,b+1,c,d+1]` |
+| One-based, half-open | `[a-1,b-1,c-1,d-1]` |
+| One-based, inclusive | `[a-1,b,c-1,d]` |
+
+For example, one-based inclusive rows 3 through 5 and columns 7 through 9 become
+`[2,5,6,9]`. The same range in zero-based inclusive numbering is rows 2 through 4 and
+columns 6 through 8. Machine-form ROI tuples use the numeric convention directly. Preserve
+the user's original text, source and stated basis with the converted, unclipped bounds.
 
 The next user message supplies the input. Preserve its original `raw_reply`, actual request
-ID, source, basis and untrimmed values in the complete replacement plan. Convert explicit
-units or inclusive endpoints according to the documented contract while preserving the
-original text; never clip out-of-bounds values. For example, a user who reports 20 pm per
-pixel from the acquisition record supplies this `plan.user_input`:
+ID, source, basis and untrimmed values in the complete replacement plan. For a scale of
+20 pm per pixel from the acquisition record, supply this `plan.user_input`:
 
 ```json
 {"response":{"request_id":"<request_id from parent>","source":"user","basis":"Acquisition record","raw_reply":"20 pm per pixel from the acquisition record","answers":{"pixel_size_nm":{"value":20,"unit":"pm/pixel"}}}}
