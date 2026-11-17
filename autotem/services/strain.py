@@ -86,9 +86,10 @@ class AtomStrainParameters(CoordinatesParameters):
         default=None,
         description=(
             "Use the actual zero-based labels from this run's numbered refined-atom evidence. "
-            "Select at least six distinct atoms spanning a two-dimensional lattice. Mutually "
-            "exclusive with reference_region. If neither is supplied, the requested strain "
-            "step returns needs_input with numbered evidence before computation."
+            "Select at least six distinct atoms spanning a two-dimensional lattice. This "
+            "option is mutually exclusive with reference_region. If neither is supplied, "
+            "the requested strain step returns needs_input with numbered evidence "
+            "before computation."
         ),
     )
     neighbor_k: int = Field(default=10, ge=4, le=1000)
