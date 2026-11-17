@@ -868,7 +868,10 @@ def test_codex_resource_discovery_is_visible_but_never_counts_as_a_domain_call(
         **start,
         "status": "failed",
         "error": {
-            "message": f"{method} failed: {method} failed for `autotem`: Mcp error: -32601: Method not found"
+            "message": (
+                f"{method} failed: {method} failed for `autotem`: "
+                "Mcp error: -32601: Method not found"
+            )
         },
     }
     events[2:2] = [{"type": "item.started", "item": start}, {"type": "item.completed", "item": end}]

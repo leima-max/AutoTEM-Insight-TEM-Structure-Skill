@@ -7,8 +7,8 @@ from zipfile import ZipFile
 
 import pytest
 
-from tools.release import contract_freeze as freeze
 from autotem.harness.cli import TOOL_SCHEMAS
+from tools.release import contract_freeze as freeze
 
 
 @pytest.fixture(scope="module")

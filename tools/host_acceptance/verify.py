@@ -260,7 +260,10 @@ def unsupported_resource_discovery(item, started, server):
         and item.get("result") is None
         and item.get("error")
         == {
-            "message": f"{method} failed: {method} failed for `{server}`: Mcp error: -32601: Method not found"
+            "message": (
+                f"{method} failed: {method} failed for `{server}`: "
+                "Mcp error: -32601: Method not found"
+            )
         }
     )
 

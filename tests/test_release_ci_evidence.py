@@ -199,9 +199,12 @@ def test_shipped_app_sources_use_their_git_line_endings_on_windows(tmp_path):
     (tmp_path / ".gitattributes").write_bytes((ROOT / ".gitattributes").read_bytes())
     shipped = [name for name in build_release.SOURCE_PATHS if name.startswith("apps/")]
     rules = subprocess.check_output(
-        ["git", "-C", tmp_path, "-c", "core.autocrlf=true", "check-attr", "-z", "eol", "--", *shipped]
+        [
+            "git", "-C", tmp_path, "-c", "core.autocrlf=true",
+            "check-attr", "-z", "eol", "--", *shipped,
+        ]
     ).decode().split("\0")[:-1]
-    assert dict(zip(rules[::3], rules[2::3])) == dict.fromkeys(shipped, "lf")
+    assert dict(zip(rules[::3], rules[2::3], strict=False)) == dict.fromkeys(shipped, "lf")
 
 
 def test_windows_release_triggers_on_source_suite_git_inputs():
