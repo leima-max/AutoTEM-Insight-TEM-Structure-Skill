@@ -3,6 +3,74 @@
 AutoTEM-Insight provides a reusable TEM analysis workflow scaffold with shared schemas,
 calibration, diffraction analysis, reporting, and validation hooks.
 
+## Target Local Product
+
+The final product is a local **AutoTEM Skill + domain subagent profiles + Local
+Harness + scientific algorithms/models + visualization workbench** bundle.
+The user's existing Codex, OpenClaw, WorkBuddy, or another compatible agent acts
+as the main agent; AutoTEM does not rebuild chat, intent recognition, or generic
+task planning. Host capabilities are verified per adapter, not assumed identical.
+
+The Skill will instruct the host to start or reuse the local frontend and open
+the current analysis run automatically. The workbench will browse registered
+intermediate images/arrays/tables/model evidence, support manual parameter/ROI/
+peak/atom adjustments, and create versioned, dependency-aware recomputations.
+Raw data and earlier results remain immutable; display settings do not alter
+scientific measurements.
+
+The workbench and interactive revisions remain development targets. The headless
+classical Harness below is executable. Existing Streamlit UIs support debugging.
+
+- [Local product goals, architecture and acceptance](docs/autotem-local-product-spec.md)
+- [Complete technical development guide](docs/PROJECT_TECHNICAL_DEVELOPMENT_GUIDE.md)
+- [Headless Harness release and end-to-end development plan (2026-11-12)](docs/HARNESS_RELEASE_TECHNICAL_DEVELOPMENT_PLAN.md)
+- [Product/technical review and implemented fixes (2026-10-05)](docs/PRODUCT_TECHNICAL_REVIEW_2026-10-05.md)
+- [Requirement traceability and acceptance scenarios](docs/product-acceptance-matrix.md)
+- [Development stages](docs/development.md)
+- [AI/DL implementation plan](docs/ai-dl-model-complete-implementation-plan.md)
+- [Per-model data, training and evaluation manual](docs/ai-dl-model-babysitter-operation-manual.md)
+
+## Headless Classical Harness
+
+The Windows x64 candidate provides an offline setup for the `traditional-core-mcp`
+profile, including project-local CPython and a hash-locked wheelhouse.
+[Windows installation and acceptance](docs/harness-windows-release.md)
+
+The registered execution path provides 37 implemented operations and 12 reserved
+extension slots, nine coarse tools, three domain profiles, immutable artifacts,
+SQLite jobs/events, and optional MCP stdio. No frontend or deep-learning runtime
+is required. See [implementation and acceptance status](docs/harness-implementation-status.md),
+[host installation/rollback](docs/harness-host-adapters.md), and the
+[Skill](skills/autotem/SKILL.md).
+
+Importing the Skill does not install its scientific dependencies. The stdlib-only
+`python -m autotem.bootstrap` installer prepares a project-private environment,
+validates the actual tools and installs the host resources; offline wheels are
+the default, with explicit opt-in for network installation. The maintenance
+`doctor` command reports runtime, transport and host readiness separately.
+See [installation experience and remaining distribution gates](docs/harness-installation-experience.md).
+Configured MCP is preferred for routine host calls; host launch permissions still apply.
+
+```powershell
+python -m autotem.harness.cli --root outputs/harness capabilities
+python -m autotem.harness.cli --root outputs/harness inspect path/to/image.tif
+python -m autotem.harness.cli --root outputs/harness validate --plan configs/harness/haadf-atomic.yaml --input path/to/image.tif
+python -m autotem.harness.cli --root outputs/harness submit --plan configs/harness/haadf-atomic.yaml --input path/to/image.tif
+```
+
+Replace the input with a real file. Fill scientific parameters from supplied
+metadata or user answers; recipes contain no assumed physical calibration.
+Submission returns a run/job ID. Query `status RUN_ID`, list `artifacts RUN_ID`,
+then `export RUN_ID --formats json html pdf`. Missing conditions return structured
+`needs_input`; answers or scientific changes create a child run with `--parent-run-id`.
+The Python entry point is `TEMAnalysisSkill.run_harness(...)`; the compatible
+CLI facade is `autotem analyze ... --harness --workflow ...`.
+
+Current Codex Desktop native delegation has been exercised with all three domain
+profiles. WorkBuddy and OpenClaw adapter resources are supplied; their real user
+journeys remain unverified. Successful execution does not certify scientific
+accuracy, and does not complete the long-term workbench product gate.
+
 ## What Is Available
 
 - B1 calibration baseline: pixel calibration + known-d-spacing diffraction calibration.
@@ -13,8 +81,14 @@ calibration, diffraction analysis, reporting, and validation hooks.
 ## Quick Run
 
 ```powershell
-autotem analyze examples/sample.tif --output outputs/sample_run
+autotem analyze path/to/your_image.tif --output outputs/your_unique_run
 ```
+
+Replace the input path with an existing file. Preserve unique output roots for
+scientific runs. Add `--fail-on-blocking` when automation must return nonzero for
+partial execution or failed quality/acceptance gates. The legacy completion text
+and a zero default exit code may describe a diagnostic report; they do not prove
+scientific accuracy or completed A5/A6 product integration.
 
 ## B1-B5 Diffraction Debug UI
 
@@ -31,6 +105,10 @@ The shorter alias is also available:
 ```powershell
 autotem preview-b --host 127.0.0.1 --port 8501
 ```
+
+The installed preview writes under `outputs/b1_b3_preview` in the current working directory.
+Use `--output-root PATH` to select another destination. A source checkout defaults to its own
+`outputs/b1_b3_preview` directory.
 
 If UI dependencies are missing:
 

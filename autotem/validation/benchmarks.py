@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import operator
 from collections.abc import Callable
 from pathlib import Path
@@ -30,6 +32,7 @@ _OPS: dict[str, Callable[[float, float], bool]] = {
     "<": operator.lt,
     "==": operator.eq,
 }
+_REFERENCE_ERROR_PREFIX = "Benchmark reference error: "
 
 
 def _as_int(value: Any, *, default: int) -> int:
@@ -129,14 +132,13 @@ def _masked_mae_rmse(
 
 def _to_float(value: Any) -> float:
     if isinstance(value, bool):
-        return 1.0 if value else 0.0
+        raise ValueError("Boolean values are not numeric acceptance evidence.")
     if isinstance(value, (int, float)):
-        return float(value)
+        result = float(value)
+        if math.isfinite(result):
+            return result
+        raise ValueError("Acceptance evidence must be finite (NaN/Inf are invalid).")
     raise ValueError(f"Expected numeric value, got: {type(value).__name__}.")
-
-
-def _metric_index(metrics: list[ValidationMetric]) -> dict[str, ValidationMetric]:
-    return {metric.name: metric for metric in metrics}
 
 
 def _default_acceptance_criteria(report: AnalysisReport) -> list[dict[str, object]]:
@@ -187,51 +189,153 @@ def _default_acceptance_criteria(report: AnalysisReport) -> list[dict[str, objec
 
 def _apply_acceptance_criteria(
     metrics: list[ValidationMetric],
-    criteria: list[dict[str, object]],
+    criteria: Any,
 ) -> tuple[list[ValidationMetric], list[str], dict[str, object]]:
+    """Evaluate every requested check; missing or invalid evidence cannot pass.
+
+    ``failed`` retains its comparison-count meaning. ``unevaluated`` and ``errors``
+    separately identify checks that could not be compared; either prevents passing.
+    An omitted unit adopts the metric unit, while an explicit unit must match.
+    """
+    metrics = [metric.model_copy(deep=True) for metric in metrics]
     warnings: list[str] = []
-    index = _metric_index(metrics)
+    index: dict[str, list[ValidationMetric]] = {}
+    for metric in metrics:
+        index.setdefault(metric.name, []).append(metric)
+    errors: list[dict[str, object]] = []
+    results: list[dict[str, object]] = []
     evaluated = 0
     passed = 0
+    requested = len(criteria) if isinstance(criteria, list) else 0
 
-    for row in criteria:
-        metric_name = str(row.get("metric", "")).strip()
-        op_name = str(row.get("op", ">=")).strip()
-        threshold = row.get("threshold")
-        if not metric_name:
-            warnings.append("Benchmark criterion skipped: missing metric name.")
-            continue
-        if op_name not in _OPS:
-            warnings.append(f"Benchmark criterion skipped: unsupported op '{op_name}'.")
-            continue
-        if threshold is None:
-            warnings.append(f"Benchmark criterion skipped: missing threshold for '{metric_name}'.")
-            continue
-        metric = index.get(metric_name)
-        if metric is None:
-            warnings.append(
-                f"Benchmark criterion skipped: metric '{metric_name}' was not produced."
+    def record_error(
+        code: str,
+        message: str,
+        *,
+        criterion_index: int | None = None,
+        metric_name: str = "",
+    ) -> None:
+        evidence: dict[str, object] = {"code": code, "message": message}
+        if criterion_index is not None:
+            evidence["criterion_index"] = criterion_index
+        if metric_name:
+            evidence["metric"] = metric_name
+        errors.append(evidence)
+        warnings.append(f"Benchmark acceptance error: {message}")
+        if criterion_index is not None:
+            results.append({**evidence, "status": "unevaluated", "passed": False})
+
+    if not isinstance(criteria, list):
+        record_error("invalid_criteria", "acceptance_criteria must be a list.")
+        criteria = []
+    elif not criteria:
+        record_error("empty_criteria", "Explicit acceptance_criteria must not be empty.")
+
+    metric_decisions: dict[str, bool] = {}
+    for criterion_index, row in enumerate(criteria):
+        if not isinstance(row, dict):
+            record_error(
+                "invalid_criterion", "Each acceptance criterion must be a mapping.",
+                criterion_index=criterion_index,
             )
             continue
-
+        raw_name = row.get("metric")
+        metric_name = raw_name.strip() if isinstance(raw_name, str) else ""
+        op_name = row.get("op")
+        unknown_fields = set(row).difference({"metric", "op", "threshold", "unit"})
+        if not metric_name or unknown_fields:
+            record_error(
+                "invalid_criterion", "Criterion requires a metric name and known fields.",
+                criterion_index=criterion_index, metric_name=metric_name,
+            )
+            continue
+        if not isinstance(op_name, str) or op_name not in _OPS:
+            record_error(
+                "invalid_operator", f"Unsupported or missing operator for '{metric_name}'.",
+                criterion_index=criterion_index, metric_name=metric_name,
+            )
+            continue
+        try:
+            threshold_value = _to_float(row.get("threshold"))
+        except (ValueError, OverflowError) as exc:
+            record_error(
+                "invalid_threshold", f"Invalid threshold for '{metric_name}': {exc}",
+                criterion_index=criterion_index, metric_name=metric_name,
+            )
+            continue
+        matching_metrics = index.get(metric_name, [])
+        if len(matching_metrics) != 1:
+            record_error(
+                "missing_metric" if not matching_metrics else "ambiguous_metric",
+                f"Metric '{metric_name}' must be produced exactly once.",
+                criterion_index=criterion_index, metric_name=metric_name,
+            )
+            continue
+        metric = matching_metrics[0]
+        raw_unit = row.get("unit", "")
+        if not isinstance(raw_unit, str):
+            record_error(
+                "invalid_unit", f"Criterion unit for '{metric_name}' must be a string.",
+                criterion_index=criterion_index, metric_name=metric_name,
+            )
+            metric_decisions[metric_name] = False
+            metric.passed = False
+            continue
+        unit = raw_unit.strip() or metric.value.unit
+        if unit != metric.value.unit:
+            record_error(
+                "unit_mismatch",
+                f"Unit mismatch for '{metric_name}': metric '{metric.value.unit}', "
+                f"criterion '{unit}'; convert explicitly before comparison.",
+                criterion_index=criterion_index, metric_name=metric_name,
+            )
+            metric_decisions[metric_name] = False
+            metric.passed = False
+            continue
+        try:
+            observed_value = _to_float(metric.value.value)
+        except (ValueError, OverflowError) as exc:
+            record_error(
+                "invalid_metric", f"Invalid observed value for '{metric_name}': {exc}",
+                criterion_index=criterion_index, metric_name=metric_name,
+            )
+            metric_decisions[metric_name] = False
+            metric.passed = False
+            continue
         evaluated += 1
-        threshold_value = _to_float(threshold)
-        observed_value = _to_float(metric.value.value)
         is_passed = bool(_OPS[op_name](observed_value, threshold_value))
         if is_passed:
             passed += 1
-        metric.target = Measurement(value=threshold_value, unit=str(row.get("unit", "")))
-        metric.passed = is_passed
+        metric.target = Measurement(value=threshold_value, unit=unit)
+        metric_decisions[metric_name] = metric_decisions.get(metric_name, True) and is_passed
+        metric.passed = metric_decisions[metric_name]
         metric.details = {
             **metric.details,
-            "acceptance": {"op": op_name, "threshold": threshold_value},
+            "acceptance": {"op": op_name, "threshold": threshold_value, "unit": unit},
         }
+        results.append({
+            "criterion_index": criterion_index,
+            "metric": metric_name,
+            "op": op_name,
+            "threshold": threshold_value,
+            "observed": observed_value,
+            "unit": unit,
+            "status": "passed" if is_passed else "failed",
+            "passed": is_passed,
+        })
 
+    all_passed = requested > 0 and evaluated == requested and passed == requested and not errors
     payload = {
+        "status": "passed" if all_passed else "failed",
+        "requested": requested,
         "evaluated": evaluated,
+        "unevaluated": requested - evaluated,
         "passed": passed,
         "failed": max(evaluated - passed, 0),
-        "all_passed": (passed == evaluated) if evaluated > 0 else True,
+        "error_count": len(errors),
+        "errors": errors,
+        "results": results,
+        "all_passed": all_passed,
     }
     return metrics, warnings, payload
 
@@ -248,11 +352,26 @@ def _append_reference_metrics(
     if not isinstance(reference, dict):
         return warnings
 
+    def unit_error(metric_name: str, expected_unit: str, observed_units: list[str]) -> None:
+        warnings.append(_REFERENCE_ERROR_PREFIX + json.dumps({
+            "code": "reference_unit_mismatch",
+            "metric": metric_name,
+            "expected_unit": expected_unit,
+            "observed_units": observed_units,
+            "action": "metric_not_generated",
+        }, sort_keys=True))
+
     d_spacing_ref = reference.get("d_spacings_nm")
     if isinstance(d_spacing_ref, list):
+        observed_measurements = (
+            report.diffraction.d_spacings if report.diffraction is not None else []
+        )
+        invalid_units = sorted({item.unit for item in observed_measurements if item.unit != "nm"})
+        if invalid_units:
+            unit_error("d_spacing_mean_relative_error", "nm", invalid_units)
         observed = (
-            [float(item.value) for item in report.diffraction.d_spacings]
-            if report.diffraction is not None
+            [float(item.value) for item in observed_measurements]
+            if not invalid_units
             else []
         )
         reference_values = [float(item) for item in d_spacing_ref if isinstance(item, (int, float))]
@@ -267,7 +386,7 @@ def _append_reference_metrics(
                     details={"pair_count": pair_count},
                 )
             )
-        else:
+        elif not invalid_units:
             warnings.append(
                 "Benchmark reference hook skipped d-spacing metric: "
                 "no overlapping observed/reference values."
@@ -375,9 +494,12 @@ def _append_reference_metrics(
 
     atom_ref = reference.get("atom_coordinates")
     if isinstance(atom_ref, list):
+        atom_unit = report.atom_lattice.coordinate_unit if report.atom_lattice is not None else None
+        if atom_unit is not None and atom_unit != "pixel":
+            unit_error("atom_coordinate_rmse", "pixel", [atom_unit])
         observed_coords = (
             [(float(atom.x), float(atom.y)) for atom in report.atom_lattice.atoms]
-            if report.atom_lattice is not None
+            if report.atom_lattice is not None and atom_unit == "pixel"
             else []
         )
         reference_coords: list[tuple[float, float]] = []
@@ -399,7 +521,7 @@ def _append_reference_metrics(
                     },
                 )
             )
-        else:
+        elif atom_unit in {None, "pixel"}:
             warnings.append(
                 "Benchmark reference hook skipped atom RMSE metric: "
                 "observed/reference coordinates unavailable."
@@ -410,6 +532,11 @@ def _append_reference_metrics(
         if report.atom_lattice is None or not report.atom_lattice.atoms:
             warnings.append(
                 "Benchmark reference hook skipped atom distance metric: AtomLattice missing."
+            )
+        elif report.atom_lattice.coordinate_unit != "pixel":
+            unit_error(
+                "atom_nearest_distance_mean_relative_error", "pixel",
+                [report.atom_lattice.coordinate_unit],
             )
         else:
             stats = compute_distance_statistics_from_lattice(report.atom_lattice)
@@ -527,11 +654,15 @@ def run_validation_summary(
     """Return validation metrics and summary payload for `validate` step outputs."""
     parameters = dict(validate_parameters or {})
     metrics, warnings = collect_validation_metrics(report)
-    criteria = parameters.get("acceptance_criteria")
-    if isinstance(criteria, list):
+    if "acceptance_criteria" in parameters:
+        criteria = parameters["acceptance_criteria"]
         metrics, crit_warnings, acceptance = _apply_acceptance_criteria(metrics, criteria)
     else:
-        acceptance = {"evaluated": 0, "passed": 0, "failed": 0, "all_passed": True}
+        acceptance = {
+            "status": "not_evaluated", "requested": 0, "evaluated": 0, "unevaluated": 0,
+            "passed": 0, "failed": 0, "error_count": 0, "errors": [], "results": [],
+            "all_passed": None,
+        }
         crit_warnings = []
     warnings.extend(crit_warnings)
 
@@ -539,7 +670,7 @@ def run_validation_summary(
         "schema_version": report.schema_version,
         "metric_count": len(metrics),
         "acceptance": acceptance,
-        "metrics": [metric.model_dump(mode="json") for metric in metrics],
+        "metrics": [json.loads(metric.model_dump_json()) for metric in metrics],
     }
     return metrics, payload, warnings
 
@@ -568,13 +699,17 @@ def run_benchmark_summary(
         )
     )
 
-    criteria_raw = parameters.get("acceptance_criteria")
-    if isinstance(criteria_raw, list):
-        criteria = criteria_raw
-    else:
-        criteria = _default_acceptance_criteria(report)
+    criteria = (
+        parameters["acceptance_criteria"]
+        if "acceptance_criteria" in parameters
+        else _default_acceptance_criteria(report)
+    )
     metrics, crit_warnings, acceptance = _apply_acceptance_criteria(metrics, criteria)
     warnings.extend(crit_warnings)
+    reference_errors = [
+        json.loads(warning.removeprefix(_REFERENCE_ERROR_PREFIX))
+        for warning in warnings if warning.startswith(_REFERENCE_ERROR_PREFIX)
+    ]
 
     case_id = str(parameters.get("case_id", "default_case"))
     benchmark = BenchmarkResult(
@@ -590,13 +725,15 @@ def run_benchmark_summary(
         ],
         metrics=metrics,
         summary=(
-            f"{acceptance['passed']}/{acceptance['evaluated']} acceptance criteria passed "
+            f"{acceptance['passed']}/{acceptance['requested']} "
+            "requested acceptance criteria passed "
             f"for benchmark case '{case_id}'."
         ),
-        passed=bool(acceptance.get("all_passed", True)),
+        passed=acceptance.get("all_passed") is True,
         provenance={
             "acceptance_criteria": criteria,
             "acceptance_summary": acceptance,
+            "reference_errors": reference_errors,
         },
         warnings=warnings,
     )
@@ -607,7 +744,8 @@ def run_benchmark_summary(
         "summary": benchmark.summary,
         "passed": benchmark.passed,
         "acceptance": acceptance,
+        "reference_errors": reference_errors,
         "metric_count": len(metrics),
-        "metrics": [metric.model_dump(mode="json") for metric in metrics],
+        "metrics": [json.loads(metric.model_dump_json()) for metric in metrics],
     }
     return benchmark, payload, warnings

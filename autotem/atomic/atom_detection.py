@@ -8,6 +8,7 @@ import numpy as np
 from scipy import ndimage as ndi
 
 from autotem.core.models import ArrayReference, AtomLattice, AtomSite, Measurement
+from autotem.io.readers import read_numeric_file
 
 try:
     import tifffile
@@ -228,7 +229,9 @@ def _load_image(
     suffix = path.suffix.lower()
     source = {"type": "file", "path": str(path.resolve()), "suffix": suffix}
 
-    if suffix in {".dm", ".dm3", ".dm4"}:
+    if suffix in {".npy", ".txt", ".csv"}:
+        arr = read_numeric_file(path, mmap_mode="r")
+    elif suffix in {".dm", ".dm3", ".dm4"}:
         arr = _read_dm(path)
     elif suffix in {".tif", ".tiff"}:
         arr = _read_tiff(path)
@@ -428,12 +431,13 @@ def _estimate_confidence(
 
 
 def _save_overlay(image: np.ndarray, coordinates: np.ndarray, path: str) -> None:
-    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
 
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(6, 6), dpi=180)
+    fig = Figure(figsize=(6, 6), dpi=180)
+    ax = fig.subplots()
     ax.imshow(image, cmap="gray")
     if len(coordinates) > 0:
         ax.scatter(coordinates[:, 1], coordinates[:, 0], s=16, c="r", marker="o", linewidths=0.4)
@@ -441,4 +445,3 @@ def _save_overlay(image: np.ndarray, coordinates: np.ndarray, path: str) -> None
     ax.axis("off")
     fig.tight_layout()
     fig.savefig(str(p), bbox_inches="tight")
-    plt.close(fig)

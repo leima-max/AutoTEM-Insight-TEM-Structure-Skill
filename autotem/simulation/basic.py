@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import shutil
+import stat
 import subprocess
 import sys
-import tempfile
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from autotem.core import DiffractionResult, Measurement, SimulationResult
@@ -107,19 +111,60 @@ def _tail_text(text: str, *, limit: int = 2000) -> str:
     return text[-limit:]
 
 
-def _temporary_directory_root() -> str | None:
-    root = os.environ.get("AUTOTEM_TMP_DIR")
-    if root:
-        Path(root).mkdir(parents=True, exist_ok=True)
-        return root
-    if os.name == "nt":
-        windows_root = Path("C:/tmp")
+class _ScratchUnavailable(OSError):
+    """Fail fast when the selected scratch directory cannot be created."""
+
+
+def _temporary_directory_root() -> str:
+    configured = os.environ.get("AUTOTEM_TMP_DIR")
+    root = Path(configured) if configured else Path.cwd() / ".autotem" / "tmp"
+    resolved = root.expanduser().resolve()
+    if not configured:
         try:
-            windows_root.mkdir(parents=True, exist_ok=True)
+            resolved.relative_to(Path.cwd().resolve())
+        except ValueError as exc:
+            raise _ScratchUnavailable("Project scratch path escapes the workspace.") from exc
+    resolved.mkdir(parents=True, exist_ok=True)
+    return str(resolved)
+
+
+@contextmanager
+def _simulation_scratch():
+    # On Windows tempfile.mkdtemp may repeatedly retry PermissionError when
+    # os.access disagrees with a managed policy. One owned mkdir fails promptly.
+    try:
+        root = Path(_temporary_directory_root()).resolve()
+        path = root / ("autotem_diffsims_" + uuid.uuid4().hex)
+        path.mkdir(mode=0o700)
+        owned = path.lstat()
+        identity = (owned.st_dev, owned.st_ino)
+    except OSError as exc:
+        raise _ScratchUnavailable("Simulation scratch is unavailable.") from exc
+    try:
+        yield str(path)
+    finally:
+        # Never delete a replacement directory or a Windows junction. Cleanup
+        # failures are diagnostic and must not replace the scientific result.
+        try:
+            current = path.lstat()
+            reparse = getattr(current, "st_file_attributes", 0) & getattr(
+                stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0
+            )
+            if (
+                path.is_symlink()
+                or reparse
+                or path.resolve() != path
+                or path.parent != root
+                or (current.st_dev, current.st_ino) != identity
+            ):
+                raise OSError("Owned scratch directory was replaced")
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            pass
         except OSError:
-            return None
-        return str(windows_root)
-    return None
+            logging.getLogger(__name__).warning(
+                "B5_SCRATCH_CLEANUP_FAILED: owned simulation scratch was retained."
+            )
 
 
 def _simulate_diffsims_with_timeout(
@@ -129,11 +174,7 @@ def _simulate_diffsims_with_timeout(
     timeout_s: float,
 ) -> SimulationResult:
     timeout = max(1.0, float(timeout_s))
-    with tempfile.TemporaryDirectory(
-        prefix="autotem_diffsims_",
-        dir=_temporary_directory_root(),
-        ignore_cleanup_errors=True,
-    ) as tmp_dir:
+    with _simulation_scratch() as tmp_dir:
         input_path = Path(tmp_dir) / "request.json"
         output_path = Path(tmp_dir) / "response.json"
         stdout_path = Path(tmp_dir) / "stdout.txt"
@@ -154,6 +195,7 @@ def _simulate_diffsims_with_timeout(
                     completed = subprocess.run(
                         [
                             sys.executable,
+                            *(["-I"] if sys.flags.isolated else []),
                             "-m",
                             "autotem.simulation.diffsims_worker",
                             "--input",
@@ -244,11 +286,18 @@ def simulate_from_diffraction(
         )
     timeout = _diffsims_timeout_s(params)
     if timeout is not None:
-        return _simulate_diffsims_with_timeout(
-            diffraction,
-            parameters=params,
-            timeout_s=timeout,
-        )
+        try:
+            return _simulate_diffsims_with_timeout(
+                diffraction,
+                parameters=params,
+                timeout_s=timeout,
+            )
+        except _ScratchUnavailable:
+            return _diffsims_fallback_result(
+                diffraction,
+                warning="BLOCKING: B5 simulation scratch is unavailable; simulation was not run.",
+                reason="temporary_directory_unavailable",
+            )
     return _simulate_diffsims_in_process(diffraction, params)
 
 

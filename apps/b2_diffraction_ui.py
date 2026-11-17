@@ -321,7 +321,9 @@ def _default_output_root() -> Path:
     from_env = os.environ.get(_OUTPUT_ROOT_ENV)
     if from_env:
         return Path(from_env).expanduser().resolve()
-    return _repo_root() / "outputs" / "b1_b3_preview"
+    source = _repo_root()
+    base = source if (source / "pyproject.toml").is_file() else Path.cwd()
+    return base / "outputs" / "b1_b3_preview"
 
 
 def _as_mapping(value: Any) -> dict[str, Any]:

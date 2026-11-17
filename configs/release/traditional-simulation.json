@@ -1,0 +1,63 @@
+{
+  "schema_version": "1.0.0",
+  "profile_id": "traditional-simulation",
+  "implementation": "cpython",
+  "platform": "win32",
+  "architecture": "win-amd64",
+  "python_version": "3.12.10",
+  "seed_pip_version": "25.0.1",
+  "build_inputs_lock": "requirements/release/win-amd64-cp312-simulation-build-inputs.txt",
+  "wheel_sources": "configs/release/win-amd64-cp312-simulation-wheel-sources.json",
+  "python_nupkg": {
+    "filename": "python.3.12.10.nupkg",
+    "url": "https://api.nuget.org/v3-flatcontainer/python/3.12.10/python.3.12.10.nupkg",
+    "size": 14515433,
+    "sha256": "0eb85c2dfccccf1b17352de4c397f69194035b7d37149eacc16f1147d93de3b8",
+    "license_member": "tools/LICENSE.txt"
+  },
+  "requested_scope": {
+    "journeys": [
+      "HRTEM diffraction",
+      "HAADF atom coordinates",
+      "calibration child run",
+      "simulated diffraction and candidate matching"
+    ],
+    "formats_for_first_acceptance": [
+      ".npy",
+      ".tif",
+      ".tiff"
+    ],
+    "required_operations": [
+      "input.load",
+      "quality.assess",
+      "calibration.resolve",
+      "preprocessing.apply",
+      "diffraction.fft",
+      "diffraction.peaks",
+      "diffraction.metrics",
+      "atomic.detect",
+      "atomic.refine",
+      "atomic.distances",
+      "simulation.diffraction",
+      "diffraction.match"
+    ],
+    "host_targets": [
+      "codex",
+      "workbuddy",
+      "openclaw"
+    ],
+    "operation_discovery": "list_capabilities",
+    "optional_backends": [
+      "diffsims"
+    ],
+    "limitations": [
+      "Private evaluation of simulated diffraction and candidate ranking. Validate numerical results and failure branches separately for this profile.",
+      "Redistribution requires review of the actual wheel licenses."
+    ],
+    "transports": [
+      "cli",
+      "jsonl",
+      "mcp"
+    ]
+  }
+}

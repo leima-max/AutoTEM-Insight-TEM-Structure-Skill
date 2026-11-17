@@ -7,7 +7,12 @@ from typing import Any
 
 import numpy as np
 
-from autotem.strain.gpa import DEFAULT_GPA_MASK_SIGMA_PX, GPAFieldResult, compute_gpa_fields
+from autotem.strain.gpa import (
+    DEFAULT_GPA_MASK_SIGMA_PX,
+    GPAFieldResult,
+    compute_gpa_fields,
+    validate_gpa_references,
+)
 
 _STRAIN_FIELDS = {"exx", "exy", "eyx", "eyy", "shear_exy"}
 _COMPARE_FIELDS = ("exx", "exy", "eyx", "eyy", "shear_exy", "wxy", "ux", "uy")
@@ -53,10 +58,20 @@ def compare_gpa_configs(
     backend: str = "gpa",
     sample_step: int = 1,
 ) -> dict[str, Any]:
-    """Run one backend with two parameter sets and compare the result fields."""
+    """Compare only jointly valid samples.
+
+    An empty sampled intersection yields no field statistics or alignment verdict.
+    InsufficientGPAReference identifies a supplied reference ROI needing revision.
+    """
 
     reference = _run_backend(image, reference_config, backend)
+    validate_gpa_references(
+        reference.quality_mask, reference.reference_regions, parameter_group="reference_config"
+    )
     candidate = _run_backend(image, candidate_config, backend)
+    validate_gpa_references(
+        candidate.quality_mask, candidate.reference_regions, parameter_group="candidate_config"
+    )
     return _compare_field_results(
         reference,
         candidate,
@@ -110,8 +125,34 @@ def _compare_field_results(
     valid_a = np.asarray(fields_a.quality_mask, dtype=bool)[::step, ::step]
     valid_b = np.asarray(fields_b.quality_mask, dtype=bool)[::step, ::step]
     compare_mask = valid_a & valid_b
+    result = {
+        "label_a": label_a,
+        "label_b": label_b,
+        "config_a": config_a,
+        "config_b": config_b,
+        "sample_step": step,
+        "quality": {
+            "valid_fraction_a": float(np.mean(valid_a)),
+            "valid_fraction_b": float(np.mean(valid_b)),
+            "intersection_fraction": float(np.mean(compare_mask)),
+            "iou": _mask_iou(valid_a, valid_b),
+        },
+        "phase_masks": {
+            "a": _phase_mask_summary(fields_a, step=step),
+            "b": _phase_mask_summary(fields_b, step=step),
+        },
+    }
     if not np.any(compare_mask):
-        compare_mask = np.ones_like(valid_a, dtype=bool)
+        return {
+            **result,
+            "fields": {},
+            "diagnosis": {
+                "reason": "No sampled pixels are valid in both GPA configurations.",
+                "configs_aligned": None,
+                "max_strain_mae_percent": None,
+                "min_strain_corr": None,
+            },
+        }
 
     arrays_a = _field_arrays(fields_a)
     arrays_b = _field_arrays(fields_b)
@@ -135,21 +176,7 @@ def _compare_field_results(
     max_strain_mae = max(strain_maes) if strain_maes else float("nan")
     min_strain_corr = min(strain_corrs) if strain_corrs else float("nan")
     return {
-        "label_a": label_a,
-        "label_b": label_b,
-        "config_a": config_a,
-        "config_b": config_b,
-        "sample_step": step,
-        "quality": {
-            "valid_fraction_a": float(np.mean(valid_a)),
-            "valid_fraction_b": float(np.mean(valid_b)),
-            "intersection_fraction": float(np.mean(compare_mask)),
-            "iou": _mask_iou(valid_a, valid_b),
-        },
-        "phase_masks": {
-            "a": _phase_mask_summary(fields_a, step=step),
-            "b": _phase_mask_summary(fields_b, step=step),
-        },
+        **result,
         "fields": field_stats,
         "diagnosis": {
             "max_strain_mae_percent": float(max_strain_mae),
@@ -236,12 +263,12 @@ def _corr(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.corrcoef(aa, bb)[0, 1])
 
 
-def _mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+def _mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float | None:
     a = np.asarray(mask_a, dtype=bool)
     b = np.asarray(mask_b, dtype=bool)
     union = a | b
     if not np.any(union):
-        return float("nan")
+        return None
     return float(np.mean(a & b) / np.mean(union))
 
 
@@ -260,12 +287,12 @@ def _phase_mask_summary(fields: GPAFieldResult, *, step: int) -> list[dict[str, 
     return out
 
 
-def _weighted_center(values: np.ndarray) -> tuple[float, float]:
+def _weighted_center(values: np.ndarray) -> tuple[float | None, float | None]:
     arr = np.asarray(values, dtype=np.float64)
     arr = arr - np.nanmin(arr)
     max_value = float(np.nanmax(arr)) if arr.size else 0.0
     if max_value <= 0:
-        return float("nan"), float("nan")
+        return None, None
     yy, xx = np.indices(arr.shape, dtype=np.float64)
     total = float(arr.sum())
     return float((xx * arr).sum() / total), float((yy * arr).sum() / total)

@@ -1,0 +1,25 @@
+schema_version: '1.0.0'
+profile_id: diffraction
+version: '1.0.0'
+software_role: Reciprocal-space measurement and constrained phase hypotheses
+supported_modalities: [TEM, HRTEM, STEM, HAADF-STEM, SAED, NBED]
+execution_mode: sequential
+native_installation_verified: false
+inputs: [dataset, raw, processed, calibration, authorized_candidate_structures]
+outputs: [reciprocal_image, reciprocal_context, center, peak_parameter_suggestions, peaks, peak_diagnostics, phase_candidates, phase_lookup, diffraction, simulation, warnings, human_input_request]
+allowed_operations: [diffraction.fft, diffraction.pattern, diffraction.center, diffraction.peaks.suggest, diffraction.peaks, diffraction.peaks.manual, diffraction.metrics, phase.lookup, diffraction.index, diffraction.match, simulation.diffraction]
+budgets: {max_steps: 16, max_retries: 1, operation_seconds: 120, simulation_seconds: 30, run_seconds: 900}
+workflow:
+  - Reuse inspected data and calibration; compute FFT only for real-space images.
+  - Use directly loaded SAED/NBED pattern context rather than applying FFT again.
+  - Determine center and peaks, then calibrated g-vectors/d-spacing and uncertainty.
+  - Treat peak suggestions as candidates; preserve raw-coordinate manual confirmation evidence.
+  - Use local phase lookup by default; online lookup requires both plan and operation authorization.
+  - Index or simulate only when candidate/scale/dependency prerequisites are satisfied.
+  - Return ranked hypotheses, unmatched evidence and reliable g-pair candidates for GPA.
+human_input_conditions: [missing_reciprocal_scale, missing_candidates, ambiguous_phase, unreliable_center_or_g_pair]
+failure_policy:
+  missing_calibration: No absolute d-spacing or physical phase assignment; preserve pixel candidates.
+  unavailable_simulator: Report unavailable/fallback; do not fabricate a simulation.
+prohibited: [llm_phase_guess, ranking_as_probability, unsupported_operations_as_success, unbounded_simulation]
+return_contract: references/tool-contracts.md

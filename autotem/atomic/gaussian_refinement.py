@@ -68,12 +68,14 @@ def refine_atom_coordinates(
     out_of_bounds_idx: list[int] = []
     fit_failure_idx: list[int] = []
     large_shift_examples: list[tuple[int, float]] = []
+    point_status: list[str] = []
 
     for i, (y0, x0) in enumerate(coords):
         patch_info = _extract_patch(image=image, y=y0, x=x0, radius=window_radius)
         if patch_info is None:
             fit_failures += 1
             out_of_bounds_idx.append(i)
+            point_status.append("out_of_bounds")
             continue
 
         patch, y_min, x_min = patch_info
@@ -92,12 +94,14 @@ def refine_atom_coordinates(
         if result is None:
             fit_failures += 1
             fit_failure_idx.append(i)
+            point_status.append("fit_failed")
             continue
 
         y_ref, x_ref = result
         shift = float(np.hypot(y_ref - y0, x_ref - x0))
         if shift > max_shift:
             rejected_large_shift += 1
+            point_status.append("max_shift_rejected")
             if len(large_shift_examples) < 8:
                 large_shift_examples.append((i, shift))
             continue
@@ -105,6 +109,7 @@ def refine_atom_coordinates(
         refined[i, 0] = y_ref
         refined[i, 1] = x_ref
         success += 1
+        point_status.append("accepted")
 
     displacements = refined - coords
 
@@ -155,6 +160,7 @@ def refine_atom_coordinates(
             "rejected_large_shift": rejected_large_shift,
             "out_of_bounds_idx": out_of_bounds_idx,
             "fit_failure_idx": fit_failure_idx,
+            "point_status": point_status,
             "input_shape": tuple(int(x) for x in image.shape),
         },
     )

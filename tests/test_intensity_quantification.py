@@ -72,6 +72,24 @@ def test_intensity_quantification_validates_radii() -> None:
         )
 
 
+def test_saturation_status_uses_measured_disk_and_inclusive_threshold() -> None:
+    image, coords = _disk_image()
+    # Disk peaks are 60, 110 and 160. The last disk has no finite samples.
+    image[39:46, 17:24] = np.nan
+    unassessed = quantify_atomic_column_intensity(image, coords)
+    assert unassessed.saturation_status == ["not_evaluated"] * 3
+    at_limit = quantify_atomic_column_intensity(image, coords, saturation_threshold=110)
+    assert at_limit.saturation_status == [
+        "below_threshold", "at_or_above_threshold", "not_evaluated"
+    ]
+    assert at_limit.saturation_flag.tolist() == [False, True, False]
+    exceeded = quantify_atomic_column_intensity(image, coords, saturation_threshold=109)
+    assert exceeded.saturation_status[1] == "at_or_above_threshold"
+    for value in (np.inf, -np.inf, np.nan):
+        with pytest.raises(ValueError, match="saturation_threshold must be finite"):
+            quantify_atomic_column_intensity(image, coords, saturation_threshold=value)
+
+
 def test_intensity_clustering_summarizes_groups_by_brightness() -> None:
     image, coords = _disk_image()
     out = quantify_atomic_column_intensity(

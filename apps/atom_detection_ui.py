@@ -351,8 +351,9 @@ def _atomic_intensity_csv(coords: np.ndarray, result: AtomicColumnIntensityResul
         "background_mean,background_median,background_std,"
         "background_subtracted_sum,normalized_intensity,snr,atom_area_px,"
         "background_area_px,nearest_neighbor_distance_px,valid_intensity,"
-        "edge_flag,overlap_flag,saturation_flag\n"
+        "edge_flag,overlap_flag,saturation_flag,saturation_status\n"
     )
+    saturation_status = result.saturation_status
     for idx in range(len(coords)):
         y, x = coords[idx]
         row = [
@@ -376,6 +377,7 @@ def _atomic_intensity_csv(coords: np.ndarray, result: AtomicColumnIntensityResul
             str(int(bool(result.edge_flag[idx]))),
             str(int(bool(result.overlap_flag[idx]))),
             str(int(bool(result.saturation_flag[idx]))),
+            saturation_status[idx],
         ]
         buffer.write(",".join(row) + "\n")
     return buffer.getvalue()
@@ -5492,6 +5494,9 @@ if atomic_intensity_result is not None:
                 "overlap_flag": atomic_intensity_result.overlap_flag[
                     :intensity_preview_count
                 ].astype(np.int32),
+                "saturation_status": atomic_intensity_result.saturation_status[
+                    :intensity_preview_count
+                ],
             }
             st.dataframe(intensity_preview, use_container_width=True)
         atomic_intensity_csv_text = _atomic_intensity_csv(

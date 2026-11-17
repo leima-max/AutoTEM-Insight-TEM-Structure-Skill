@@ -70,10 +70,32 @@ def _as_float(value: Any) -> float | None:
     return None
 
 
-def _measurement_float(measurement: Measurement | None) -> float | None:
+def _measurement_float(
+    measurement: Measurement | None, *, reciprocal: bool = True
+) -> float | None:
+    """Normalize explicit physical values into 1/nm (or nm for lengths)."""
     if measurement is None:
         return None
-    return _as_float(measurement.value)
+    unit = str(measurement.unit).strip().lower().replace(" ", "")
+    unit = unit.replace("å", "angstrom").replace("µ", "u").replace("μ", "u")
+    unit = unit.replace("{", "").replace("}", "").replace("⁻¹", "^-1")
+    if reciprocal:
+        if unit.startswith("1/"):
+            unit = unit[2:]
+        elif unit.startswith("cycles/"):
+            unit = unit[7:]
+        elif unit.endswith("^-1"):
+            unit = unit[:-3]
+        else:
+            return None
+    scale = {"nm": 1.0, "pm": 0.001, "angstrom": 0.1, "um": 1000.0}.get(unit)
+    value = _as_float(measurement.value)
+    if scale is None or value is None:
+        return None
+    value = value / scale if reciprocal else value * scale
+    if not np.isfinite(value) or (not reciprocal and value <= 0.0):
+        return None
+    return value
 
 
 def _gvector_components(g_vector: GVector) -> tuple[float, float] | None:
@@ -93,10 +115,13 @@ def _measured_spots(diffraction: DiffractionResult) -> list[_MeasuredSpot]:
         if components is None:
             continue
         gx, gy = components
-        magnitude = _measurement_float(g_vector.magnitude)
-        if magnitude is None:
+        if g_vector.magnitude is None:
             magnitude = float(np.hypot(gx, gy))
-        if magnitude <= 1e-12:
+        else:
+            magnitude = _measurement_float(g_vector.magnitude)
+            if magnitude is None:
+                continue
+        if not np.isfinite(magnitude) or magnitude <= 1e-12 or np.hypot(gx, gy) <= 1e-12:
             continue
         intensity = 1.0
         peak_index = g_vector.source_peak_index if g_vector.source_peak_index is not None else idx
@@ -131,10 +156,18 @@ def _template_spots(pattern: SimulatedPattern) -> list[_TemplateSpot]:
         if components is None:
             continue
         gx, gy = components
-        magnitude = _measurement_float(spot.magnitude)
-        if magnitude is None:
+        if spot.magnitude is None:
             magnitude = float(np.hypot(gx, gy))
-        if magnitude <= 1e-12:
+        else:
+            magnitude = _measurement_float(spot.magnitude)
+            if magnitude is None:
+                continue
+        if not np.isfinite(magnitude) or magnitude <= 1e-12 or np.hypot(gx, gy) <= 1e-12:
+            continue
+        if (
+            spot.d_spacing is not None
+            and _measurement_float(spot.d_spacing, reciprocal=False) is None
+        ):
             continue
         intensity = float(spot.intensity if spot.intensity is not None else 1.0)
         template.append(
@@ -147,6 +180,40 @@ def _template_spots(pattern: SimulatedPattern) -> list[_TemplateSpot]:
             )
         )
     return template
+
+
+def _withhold_invalid_input_scores(
+    candidates: list[PhaseCandidate], patterns: list[SimulatedPattern]
+) -> tuple[list[PhaseCandidate], list[SimulatedPattern], dict[str, Any]]:
+    """Retain hypotheses but prevent old match scores becoming current evidence."""
+    warning = "Match not evaluated: current physical inputs are invalid; previous scores withheld."
+    safe_candidates = [
+        candidate.model_copy(
+            update={
+                "score": None,
+                "matched_spot_count": None,
+                "mean_d_error": None,
+                "mean_angle_error": None,
+                "warnings": list(dict.fromkeys([*candidate.warnings, warning])),
+            }
+        )
+        for candidate in candidates
+    ]
+    safe_patterns = [
+        pattern.model_copy(
+            update={"score": None, "warnings": list(dict.fromkeys([*pattern.warnings, warning]))}
+        )
+        for pattern in patterns
+    ]
+    provenance = {
+        "candidate_validation": "not_evaluated",
+        "withheld_candidate_scores": [{"name": c.name, "score": c.score} for c in candidates],
+        "withheld_pattern_scores": [
+            {"structure_id": p.structure_id, "score": p.score.model_dump(mode="json")}
+            for p in patterns if p.score is not None
+        ],
+    }
+    return safe_candidates, safe_patterns, provenance
 
 
 def _angle_rad(gx: float, gy: float) -> float:
@@ -517,13 +584,34 @@ def match_diffsims_patterns_to_diffraction(
     """Match diffsims patterns against measured g-vectors and rank phases."""
     warnings: list[str] = []
     measured = _measured_spots(diffraction)
+    rejected_measured_count = len(diffraction.g_vectors) - len(measured)
     if not measured:
+        safe_candidates = list(diffraction.phase_candidates)
+        safe_patterns = patterns
+        score_provenance: dict[str, Any] = {}
+        if rejected_measured_count:
+            safe_candidates, safe_patterns, score_provenance = _withhold_invalid_input_scores(
+                safe_candidates, patterns
+            )
         return PhaseMatchingResult(
-            candidates=list(diffraction.phase_candidates),
-            patterns=patterns,
+            candidates=safe_candidates,
+            patterns=safe_patterns,
             comparison_metrics=[],
-            warnings=["diffsims phase matching skipped: no measured g-vectors available."],
-            provenance={"active": False, "reason": "no_measured_spots"},
+            warnings=[
+                "diffsims phase matching skipped: no valid physical measured g-vectors; "
+                "pixel/unknown units and nonfinite/nonpositive magnitudes cannot be matched."
+            ],
+            provenance={
+                "active": False,
+                "reason": (
+                    "no_valid_physical_measurements"
+                    if diffraction.g_vectors
+                    else "no_measured_spots"
+                ),
+                "rejected_measured_spot_count": rejected_measured_count,
+                "normalized_reciprocal_unit": "1/nm",
+                **score_provenance,
+            },
         )
     if not patterns:
         return PhaseMatchingResult(
@@ -532,6 +620,38 @@ def match_diffsims_patterns_to_diffraction(
             comparison_metrics=[],
             warnings=["diffsims phase matching skipped: no simulated patterns available."],
             provenance={"active": False, "reason": "no_simulated_patterns"},
+        )
+
+    templates = [_template_spots(pattern) for pattern in patterns]
+    rejected_template_count = sum(
+        len(pattern.spots) - len(template)
+        for pattern, template in zip(patterns, templates, strict=True)
+    )
+    if not any(templates):
+        safe_candidates = list(diffraction.phase_candidates)
+        safe_patterns = patterns
+        score_provenance = {}
+        if rejected_template_count:
+            safe_candidates, safe_patterns, score_provenance = _withhold_invalid_input_scores(
+                safe_candidates, patterns
+            )
+        return PhaseMatchingResult(
+            candidates=safe_candidates,
+            patterns=safe_patterns,
+            comparison_metrics=[],
+            warnings=["diffsims phase matching skipped: no valid physical simulated spots."],
+            provenance={
+                "active": False,
+                "reason": "no_valid_physical_simulated_spots",
+                "rejected_simulated_spot_count": rejected_template_count,
+                "normalized_reciprocal_unit": "1/nm",
+                **score_provenance,
+            },
+        )
+    if rejected_measured_count or rejected_template_count:
+        warnings.append(
+            "diffsims phase matching excluded uncalibrated or invalid spots: "
+            f"{rejected_measured_count} measured, {rejected_template_count} simulated."
         )
 
     summaries: dict[str, _MatchSummary] = {}
@@ -559,7 +679,7 @@ def match_diffsims_patterns_to_diffraction(
         best_summary: _MatchSummary | None = None
         empty_template_count = 0
         for pattern_idx, pattern in candidate_patterns:
-            template = _template_spots(pattern)
+            template = templates[pattern_idx]
             if not template:
                 empty_template_count += 1
                 continue
@@ -684,6 +804,9 @@ def match_diffsims_patterns_to_diffraction(
             "method": "diffsims_template_spot_match",
             "measured_spot_count": len(measured),
             "simulated_pattern_count": len(patterns),
+            "normalized_reciprocal_unit": "1/nm",
+            "rejected_measured_spot_count": rejected_measured_count,
+            "rejected_simulated_spot_count": rejected_template_count,
             "d_tolerance_rel": float(d_tolerance_rel),
             "angle_tolerance_deg": float(angle_tolerance_deg),
             "min_matched_spots": int(min_matched_spots),

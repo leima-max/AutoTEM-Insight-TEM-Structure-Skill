@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+from autotem._paths import io_path
 from autotem.core import ArrayReference, TEMDataset
 from autotem.io.converters import to_temdataset
 from autotem.io.metadata import (
@@ -23,7 +24,7 @@ from autotem.io.readers import (
 def load_tem_dataset(input_path: str | Path) -> TEMDataset:
     """Load microscopy input and convert it to the shared TEMDataset model."""
     path = Path(input_path)
-    if not path.exists():
+    if not io_path(path).exists():
         return TEMDataset(
             data=ArrayReference(shape=tuple(), dtype="unknown", uri=str(path)),
             dataset_id=path.stem,

@@ -1,6 +1,7 @@
 workflow:
   name: haadf_atomic
-  description: HAADF-STEM atom coordinates, distance statistics, and strain baseline.
+  description: HAADF-STEM atom candidates with a reserved GPA integration contract.
+  # Distance/refinement/strain APIs exist independently; run_gpa is not integrated here.
   steps:
     - load
     - assess_quality

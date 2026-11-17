@@ -387,7 +387,7 @@ def _write_trend_html(path: Path, trend: dict[str, object]) -> None:
                 reason_text = ""
             alerts_html_rows.append(
                 "<tr class='bad-row'>"
-                f"<td>{case_id}</td>"
+                f"<td>{_html_escape(case_id)}</td>"
                 f"<td>{severity}</td>"
                 f"<td>{reason_text}</td>"
                 "</tr>"
@@ -465,22 +465,37 @@ def _write_suite_html(path: Path, summary: dict[str, object]) -> None:
                 f"<td>{status}</td>"
                 f"<td>{metric_count}</td>"
                 f"<td>{warning_count}</td>"
-                f"<td><code>{report_path}</code></td>"
-                f"<td><code>{benchmark_report_path}</code></td>"
+                f"<td><code>{_html_escape(report_path)}</code></td>"
+                f"<td><code>{_html_escape(benchmark_report_path)}</code></td>"
                 "</tr>"
             )
 
     acceptance = summary.get("acceptance", {})
     if isinstance(acceptance, dict):
         evaluated = int(acceptance.get("evaluated", 0))
+        requested = int(acceptance.get("requested", evaluated))
+        unevaluated = int(acceptance.get("unevaluated", 0))
         passed_checks = int(acceptance.get("passed", 0))
         failed_checks = int(acceptance.get("failed", 0))
         all_passed = bool(acceptance.get("all_passed", False))
+        acceptance_errors = acceptance.get("errors", [])
     else:
         evaluated = 0
+        requested = 0
+        unevaluated = 0
         passed_checks = 0
         failed_checks = 0
         all_passed = False
+        acceptance_errors = []
+    error_items = "".join(
+        f"<li>{_html_escape(error.get('case_id', 'suite'))}: "
+        f"<code>{_html_escape(error.get('code', ''))}</code> "
+        f"{_html_escape(error.get('message', ''))}</li>"
+        for error in acceptance_errors if isinstance(error, dict)
+    )
+    acceptance_error_html = (
+        f"<h2>Acceptance Evidence Errors</h2><ul>{error_items}</ul>" if error_items else ""
+    )
 
     generated_at = datetime.now(timezone.utc).isoformat()
     trend = summary.get("trend", {})
@@ -594,14 +609,16 @@ def _write_suite_html(path: Path, summary: dict[str, object]) -> None:
         "code{font-family:Consolas,monospace;font-size:12px;}"
         "</style></head><body>"
         "<h1>AutoTEM A4 Benchmark Suite Report</h1>"
-        f"<p><strong>Suite:</strong> {summary.get('suite_id', '')}</p>"
-        f"<p><strong>Description:</strong> {summary.get('description', '')}</p>"
+        f"<p><strong>Suite:</strong> {_html_escape(summary.get('suite_id', ''))}</p>"
+        f"<p><strong>Description:</strong> {_html_escape(summary.get('description', ''))}</p>"
         f"<p><strong>Generated (UTC):</strong> {generated_at}</p>"
         f"<p><strong>Cases:</strong> executed={summary.get('cases_executed', 0)}, "
         f"passed={summary.get('cases_passed', 0)}, failed={summary.get('cases_failed', 0)}</p>"
-        f"<p><strong>Acceptance checks:</strong> evaluated={evaluated}, "
+        f"<p><strong>Acceptance checks:</strong> requested={requested}, evaluated={evaluated}, "
+        f"unevaluated={unevaluated}, "
         f"passed={passed_checks}, failed={failed_checks}, "
         f"all_passed=<span class='{'ok' if all_passed else 'bad'}'>{all_passed}</span></p>"
+        f"{acceptance_error_html}"
         f"{trend_delta_html}"
         f"{top_regression_html}"
         f"{trend_alert_html}"
@@ -685,15 +702,17 @@ def run_benchmark_case(
         case_output_dir=case_output_dir,
         skill=skill,
     )
+    benchmark_parameters: dict[str, object] = {
+        "case_id": case.case_id,
+        "reference": case.reference,
+    }
+    if "acceptance_criteria" in case.model_fields_set:
+        benchmark_parameters["acceptance_criteria"] = [
+            criterion.model_dump(mode="json") for criterion in case.acceptance_criteria
+        ]
     benchmark, payload, warnings = run_benchmark_summary(
         report,
-        benchmark_parameters={
-            "case_id": case.case_id,
-            "reference": case.reference,
-            "acceptance_criteria": [
-                criterion.model_dump(mode="json") for criterion in case.acceptance_criteria
-            ],
-        },
+        benchmark_parameters=benchmark_parameters,
         report_base_dir=report_path.parent,
     )
     benchmark_payload = {
@@ -755,6 +774,10 @@ def run_benchmark_suite(
     total_evaluated = 0
     total_passed = 0
     total_failed = 0
+    total_requested = 0
+    total_unevaluated = 0
+    acceptance_errors: list[dict[str, object]] = []
+    acceptance_results: list[dict[str, object]] = []
     for case_result in case_results:
         acceptance = case_result.acceptance
         evaluated = int(acceptance.get("evaluated", 0))
@@ -763,6 +786,24 @@ def run_benchmark_suite(
         total_evaluated += evaluated
         total_passed += passed
         total_failed += failed
+        total_requested += int(acceptance.get("requested", evaluated))
+        total_unevaluated += int(acceptance.get("unevaluated", 0))
+        acceptance_errors.extend(
+            {**error, "case_id": case_result.case_id}
+            for error in acceptance.get("errors", [])
+            if isinstance(error, dict)
+        )
+        acceptance_results.extend(
+            {**result, "case_id": case_result.case_id}
+            for result in acceptance.get("results", [])
+            if isinstance(result, dict)
+        )
+    if not case_results:
+        acceptance_errors.append({
+            "code": "no_enabled_cases",
+            "message": "Benchmark suite has no enabled cases; acceptance was not evaluated.",
+        })
+    all_passed = bool(case_results) and all(item.passed for item in case_results)
 
     summary = {
         "schema_version": suite.schema_version,
@@ -777,10 +818,17 @@ def run_benchmark_suite(
         "cases_passed": sum(1 for item in case_results if item.passed),
         "cases_failed": sum(1 for item in case_results if not item.passed),
         "acceptance": {
+            "status": ("passed" if all_passed else "failed")
+            if case_results else "not_evaluated",
+            "requested": total_requested,
             "evaluated": total_evaluated,
+            "unevaluated": total_unevaluated,
             "passed": total_passed,
             "failed": total_failed,
-            "all_passed": total_failed == 0,
+            "error_count": len(acceptance_errors),
+            "errors": acceptance_errors,
+            "results": acceptance_results,
+            "all_passed": all_passed,
         },
         "cases": [
             {

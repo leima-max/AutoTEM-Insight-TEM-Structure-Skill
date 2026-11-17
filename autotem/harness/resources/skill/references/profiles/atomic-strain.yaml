@@ -1,0 +1,28 @@
+schema_version: '1.0.0'
+profile_id: atomic-strain
+version: '1.0.0'
+software_role: Raw-refined atomic measurements and reference-dependent strain diagnostics
+supported_modalities: [HRTEM, HAADF-STEM, ABF-STEM, STEM]
+execution_mode: sequential
+native_installation_verified: false
+inputs: [dataset, raw, calibration, diffraction, atom_candidates, reference_inputs]
+outputs: [atoms, refined_atoms, atom_distances, atomic_intensity, gpa, atom_strain, warnings, human_input_request]
+allowed_operations: [atomic.detect, atomic.refine, atomic.distances, atomic.regularize, atomic.displacement, atomic.spacing.indexed, atomic.spacing.basis, atomic.spacing.lattice_angle, atomic.spacing.angle, atomic.spacing.picked, atomic.sublattice.auto, atomic.sublattice.model, atomic.sublattice.manual, atomic.intensity, atomic.intensity_groups, strain.gpa, strain.gpa_compare, strain.atom]
+budgets: {max_steps: 24, max_retries: 1, operation_seconds: 120, run_seconds: 900}
+workflow:
+  - Check modality/contrast and sampling; detect candidates with traditional LoG/DoG.
+  - Refine on raw, preserving candidate versus refined coordinates and fitting limitations.
+  - Calculate requested distances/relative intensity/sublattice or displacement using explicit units and priors.
+  - Include requested reference-dependent strain in the complete plan even when the reference is missing; the service must persist needs_input before computation. A coordinate-only request needs no strain step.
+  - For atom strain, refine on raw then submit strain.atom without a guessed reference, or append it to a completed refined run; read the actual numbered evidence and input_request before asking the user.
+  - Direct strain reference ROIs use zero-based half-open [y0,y1,x0,x1] in the selected array. For a source_2d input reply, follow the actual answer_schema and give original-image bounds. The service subtracts origin_yx once.
+  - Use the actual zero-based atom IDs in the run's numbered evidence. Clarify ambiguous natural-language ROI bases, endpoint inclusion or frames before adopting a reference. Convert explicit conventions using the tool contract, preserving original wording and basis.
+  - Compute GPA/atom strain only with reliable g pair/reference; preserve valid masks and diagnostic limits.
+human_input_conditions: [missing_pixel_scale, unreliable_g_pair, missing_reference_roi, missing_basis_or_model, unresolved_contrast_semantics]
+failure_policy:
+  missing_reference: Forward the actual persisted needs_input request ID, parent run and numbered evidence; do not return only an invented conversational request.
+  ambiguous_reference: Ask which coordinate convention the supplied range uses before computation. Use a request ID only if the run returned it.
+  reference_reply: Preserve original reply and untrimmed values with source/basis; validate is read-only, then submit the bound response with parent_run_id and stable idempotency_key to persist acceptance or rejection before child creation.
+  low_quality: Return candidate/diagnostic status and warnings rather than claiming quantitative readiness.
+prohibited: [denoised_coordinates_as_raw_measurement, hidden_invalid_mask, unsupported_dl_success, relative_intensity_as_composition, inferred_gt_accuracy]
+return_contract: references/tool-contracts.md

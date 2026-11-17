@@ -11,6 +11,7 @@ import numpy as np
 from scipy import ndimage as ndi
 
 from autotem.core import Measurement, TEMDataset
+from autotem.io.readers import read_numeric_file
 
 OCRRow = tuple[str, float, float, float]
 OCRReader = Callable[[np.ndarray], list[OCRRow]]
@@ -506,11 +507,8 @@ def _load_dataset_image(dataset: TEMDataset) -> np.ndarray | None:
     if not path.exists() or not path.is_file():
         return None
     suffix = path.suffix.lower()
-    if suffix == ".npy":
-        array = np.load(path, allow_pickle=False)
-        return np.asarray(array, dtype=np.float64) if array.ndim == 2 else None
-    if suffix in {".txt", ".csv"}:
-        array = np.loadtxt(path)
+    if suffix in {".npy", ".txt", ".csv"}:
+        array = read_numeric_file(path)
         return np.asarray(array, dtype=np.float64) if array.ndim == 2 else None
     if suffix in {".tif", ".tiff", ".png", ".jpg", ".jpeg"}:
         try:

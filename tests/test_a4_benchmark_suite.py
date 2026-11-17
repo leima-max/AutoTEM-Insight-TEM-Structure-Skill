@@ -68,6 +68,7 @@ def _build_report(case_id: str, *, modality: str = "unknown") -> AnalysisReport:
             ],
         ),
         atom_lattice=AtomLattice(
+            coordinate_unit="pixel",
             atoms=[
                 AtomSite(x=0.0, y=0.0),
                 AtomSite(x=2.0, y=2.0),
@@ -153,6 +154,91 @@ def _build_regressed_report(case_id: str) -> AnalysisReport:
         report.workflow.steps[0].warnings = ["forced regression"]
     report.warnings = ["forced regression warning"]
     return report
+
+
+def test_a4_suite_propagates_missing_metric_evidence(tmp_path: Path) -> None:
+    report_path = tmp_path / "report.json"
+    write_json(report_path, _build_report("missing"))
+    suite = BenchmarkSuiteSpec(
+        suite_id="missing_metric",
+        cases=[BenchmarkCaseSpec(
+            case_id="missing",
+            report_path=str(report_path),
+            acceptance_criteria=[
+                {"metric": "workflow_no_failed_steps", "op": ">=", "threshold": 1},
+                {"metric": "required_but_absent", "op": ">=", "threshold": 1},
+            ],
+        )],
+    )
+    summary = run_benchmark_suite(suite, suite_root=tmp_path, output_dir=tmp_path / "out")
+    acceptance = summary["acceptance"]
+    assert summary["cases_failed"] == 1
+    assert acceptance["requested"] == 2
+    assert acceptance["evaluated"] == 1
+    assert acceptance["unevaluated"] == 1
+    assert acceptance["failed"] == 0
+    assert acceptance["all_passed"] is False
+    assert acceptance["errors"][0]["case_id"] == "missing"
+    saved = json.loads(Path(str(summary["suite_report_json"])).read_text(encoding="utf-8"))
+    assert saved["acceptance"]["all_passed"] is False
+    assert saved["cases"][0]["acceptance"]["errors"][0]["code"] == "missing_metric"
+    html = Path(str(summary["suite_report_html"])).read_text(encoding="utf-8")
+    assert "requested=2" in html
+    assert "unevaluated=1" in html
+    assert "Acceptance Evidence Errors" in html
+    assert "required_but_absent" in html
+
+
+@pytest.mark.parametrize("criteria", [
+    [],
+    [{"metric": "workflow_no_failed_steps", "op": ">=", "threshold": 1, "unit": "nm"}],
+    [{"metric": "workflow_no_failed_steps", "op": ">=", "threshold": float("inf")}],
+])
+def test_a4_suite_never_passes_unevaluated_criteria(tmp_path: Path, criteria) -> None:
+    report_path = tmp_path / "report.json"
+    write_json(report_path, _build_report("invalid"))
+    suite = BenchmarkSuiteSpec(cases=[BenchmarkCaseSpec(
+        case_id="invalid", report_path=str(report_path), acceptance_criteria=criteria,
+    )])
+    summary = run_benchmark_suite(suite, suite_root=tmp_path, output_dir=tmp_path / "out")
+    assert summary["cases_passed"] == 0
+    assert summary["cases_failed"] == 1
+    assert summary["acceptance"]["evaluated"] == 0
+    assert summary["acceptance"]["all_passed"] is False
+    assert summary["acceptance"]["error_count"] == 1
+
+
+@pytest.mark.parametrize("disabled_case", [False, True])
+def test_a4_suite_without_enabled_cases_is_not_evaluated(
+    tmp_path: Path, disabled_case: bool,
+) -> None:
+    cases = [BenchmarkCaseSpec(case_id="disabled", enabled=False)] if disabled_case else []
+    summary = run_benchmark_suite(
+        BenchmarkSuiteSpec(cases=cases), suite_root=tmp_path, output_dir=tmp_path / "out",
+    )
+    assert summary["cases_executed"] == 0
+    assert summary["acceptance"]["status"] == "not_evaluated"
+    assert summary["acceptance"]["all_passed"] is False
+    assert summary["acceptance"]["errors"][0]["code"] == "no_enabled_cases"
+
+
+def test_a4_suite_omitted_criteria_uses_default_gates(tmp_path: Path) -> None:
+    report_path = tmp_path / "report.json"
+    report = AnalysisReport(
+        workflow=WorkflowConfig(steps=[WorkflowStep(name="load", status="done")]),
+        provenance={"quality_gates": {"passed": True}},
+    )
+    write_json(report_path, report)
+    summary = run_benchmark_suite(
+        BenchmarkSuiteSpec(cases=[
+            BenchmarkCaseSpec(case_id="default", report_path=str(report_path)),
+        ]),
+        suite_root=tmp_path,
+        output_dir=tmp_path / "out",
+    )
+    assert summary["cases_passed"] == 1
+    assert summary["acceptance"]["requested"] == 2
+    assert summary["acceptance"]["all_passed"] is True
 
 
 def test_a4_benchmark_suite_loader_and_schema_export(tmp_path: Path) -> None:
@@ -253,7 +339,7 @@ def test_a4_multi_case_runner_with_existing_reports(tmp_path: Path) -> None:
     ).exists()
 
 
-def test_a4_public_minimal_package_suite_runs(tmp_path: Path) -> None:
+def test_a4_public_minimal_package_suite_blocks_unknown_coordinate_units(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     suite_path = repo_root / "benchmarks" / "suite_public_minimal.yaml"
     assert suite_path.exists()
@@ -264,7 +350,20 @@ def test_a4_public_minimal_package_suite_runs(tmp_path: Path) -> None:
     )
     assert summary["suite_id"] == "public_minimal_suite"
     assert summary["cases_executed"] == 3
-    assert summary["cases_failed"] == 0
+    # The frozen atomic report declares unknown units; matching numbers alone
+    # cannot establish a valid pixel-coordinate benchmark.
+    assert summary["cases_passed"] == 2
+    assert summary["cases_failed"] == 1
+    assert summary["acceptance"]["requested"] == 24
+    assert summary["acceptance"]["evaluated"] == 22
+    assert summary["acceptance"]["unevaluated"] == 2
+    assert summary["acceptance"]["all_passed"] is False
+    assert {error["metric"] for error in summary["acceptance"]["errors"]} == {
+        "atom_coordinate_rmse", "atom_nearest_distance_mean_relative_error",
+    }
+    assert {error["case_id"] for error in summary["acceptance"]["errors"]} == {
+        "c_atomic_strain_public",
+    }
     assert (tmp_path / "public_suite_out" / "benchmark_suite_report.json").exists()
     assert (tmp_path / "public_suite_out" / "benchmark_suite_trend.json").exists()
 

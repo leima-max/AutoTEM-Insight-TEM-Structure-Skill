@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from autotem.core import DiffractionPeak, GVector, IndexedSpot, Measurement
 from autotem.diffraction.b4_indexing import run_b4_indexing
@@ -267,3 +268,134 @@ def test_b4_reads_direct_cif_candidate_paths_with_standard_angstrom_cell(
     assert result.phase_candidates[0].lattice_parameters["atom_sites"][0]["element"] == "X"
     assert any((spot.h, spot.k, spot.l) != (0, 0, 0) for spot in result.indexed_spots)
     assert result.provenance.get("active") is True
+
+
+def _run_physical_unit_case(
+    g_vectors: list[GVector], d_by_peak: list[Measurement | None]
+):
+    peaks, _, _ = _build_b4_inputs()
+    initial = [IndexedSpot(peak_index=i, h=0, k=0, l=0) for i in range(len(peaks))]
+    result = run_b4_indexing(
+        peaks=peaks,
+        g_vectors=g_vectors,
+        d_by_peak=d_by_peak,
+        initial_indexed_spots=initial,
+        candidate_phase_params=[{"name": "cubic", "a": 0.4, "b": 0.4, "c": 0.4}],
+        allowed_phase_names=None,
+        max_hkl=3,
+        d_tolerance_rel=0.08,
+        angle_tolerance_deg=10.0,
+        strict_mode=False,
+    )
+    return result, initial
+
+
+@pytest.mark.parametrize(
+    ("value", "unit"),
+    [(0.4, "pixel"), (0.4, "unknown"), (float("nan"), "nm"),
+     (float("inf"), "nm"), (0.0, "nm"), (-0.4, "nm")],
+)
+def test_b4_rejects_uncalibrated_or_invalid_d_spacings(value, unit) -> None:
+    _, vectors, distances = _build_b4_inputs()
+    distances = [Measurement(value=value, unit=unit) for _ in distances]
+    result, initial = _run_physical_unit_case(vectors, distances)
+
+    assert result.indexed_spots == initial
+    assert not result.phase_candidates
+    assert result.provenance["active"] is False
+    assert result.provenance["reason"] == "no_valid_physical_measurements"
+    assert len(result.provenance["diagnostics"]["rejected_measurements"]) == 4
+    assert result.warnings
+
+
+@pytest.mark.parametrize("unit", ["1/pixel", "unknown", "rad/nm"])
+def test_b4_rejects_g_vectors_without_physical_frequency_units(unit) -> None:
+    _, vectors, distances = _build_b4_inputs()
+    for vector in vectors:
+        vector.gx.unit = unit
+        vector.gy.unit = unit
+    result, initial = _run_physical_unit_case(vectors, distances)
+
+    assert result.indexed_spots == initial
+    assert result.provenance["active"] is False
+    assert not result.phase_candidates
+
+
+@pytest.mark.parametrize(
+    ("length_unit", "reciprocal_unit", "nm_per_unit"),
+    [("angstrom", "1/angstrom", 0.1), ("Å", "Å^-1", 0.1),
+     ("pm", "1/pm", 0.001), ("um", "um^{-1}", 1000.0)],
+)
+def test_b4_normalizes_physical_units_before_matching(
+    length_unit, reciprocal_unit, nm_per_unit
+) -> None:
+    _, vectors, distances = _build_b4_inputs()
+    baseline, _ = _run_physical_unit_case(vectors, distances)
+    for vector in vectors:
+        for measurement in (vector.gx, vector.gy, vector.magnitude):
+            measurement.value *= nm_per_unit
+            measurement.unit = reciprocal_unit
+    for distance in distances:
+        distance.value /= nm_per_unit
+        distance.unit = length_unit
+    converted, _ = _run_physical_unit_case(vectors, distances)
+
+    assert converted.provenance["active"] is True
+    assert converted.phase_candidates[0].score == pytest.approx(baseline.phase_candidates[0].score)
+    assert [(s.h, s.k, s.l) for s in converted.indexed_spots] == [
+        (s.h, s.k, s.l) for s in baseline.indexed_spots
+    ]
+
+
+def test_b4_invalid_peak_keeps_original_indices_without_receiving_hkl() -> None:
+    _, vectors, distances = _build_b4_inputs()
+    distances[1] = Measurement(value=0.4, unit="pixel")
+    result, _ = _run_physical_unit_case(vectors, distances)
+
+    assert result.provenance["active"] is True
+    rejected = next(spot for spot in result.indexed_spots if spot.peak_index == 1)
+    assert (rejected.h, rejected.k, rejected.l) == (0, 0, 0)
+    assert rejected.d_spacing is None
+    assert result.warnings
+
+
+@pytest.mark.parametrize("field", ["gx", "gy", "magnitude"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_b4_rejects_nonfinite_g_vectors(field, value) -> None:
+    _, vectors, distances = _build_b4_inputs()
+    for vector in vectors:
+        getattr(vector, field).value = value
+    result, initial = _run_physical_unit_case(vectors, distances)
+
+    assert result.indexed_spots == initial
+    assert result.provenance["active"] is False
+    assert not result.phase_candidates
+
+
+@pytest.mark.parametrize("has_phases", [False, True])
+@pytest.mark.parametrize("has_vectors", [False, True])
+def test_b4_invalid_physical_inputs_withhold_preexisting_nonzero_hkl(
+    has_phases, has_vectors
+) -> None:
+    peaks, vectors, distances = _build_b4_inputs()
+    distances = [Measurement(value=0.4, unit="pixel") for _ in distances]
+    initial = [IndexedSpot(peak_index=0, h=1, k=0, l=0, confidence=0.95)]
+    result = run_b4_indexing(
+        peaks=peaks, g_vectors=vectors if has_vectors else [], d_by_peak=distances,
+        initial_indexed_spots=initial,
+        candidate_phase_params=(
+            [{"name": "cubic", "a": 0.4, "b": 0.4, "c": 0.4}] if has_phases else []
+        ),
+        allowed_phase_names=None, max_hkl=3, d_tolerance_rel=0.08,
+        angle_tolerance_deg=10.0, strict_mode=False,
+    )
+
+    assert (initial[0].h, initial[0].k, initial[0].l) == (1, 0, 0)
+    assert result.provenance["active"] is False
+    returned_spot = result.indexed_spots[0]
+    assert (returned_spot.h, returned_spot.k, returned_spot.l) == (0, 0, 0)
+    assert result.indexed_spots[0].confidence == 0.0
+    assert result.indexed_spots[0].d_spacing.unit == "pixel"
+    assert result.provenance["diagnostics"]["withheld_initial_hkl"] == [
+        {"peak_index": 0, "hkl": [1, 0, 0]}
+    ]

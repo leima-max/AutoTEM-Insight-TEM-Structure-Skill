@@ -1,0 +1,266 @@
+name: Windows offline release
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.gitattributes'
+      - 'README.md'
+      - 'LICENSE*'
+      - 'LICENSE*/**'
+      - 'NOTICE*'
+      - 'NOTICE*/**'
+      - 'COPYING*'
+      - 'COPYING*/**'
+      - 'autotem/**'
+      - 'apps/atom_detection_ui.py'
+      - 'apps/requirements.txt'
+      - 'apps/b1_b3_preview_ui.py'
+      - 'apps/b2_diffraction_ui.py'
+      # The detached source suite also reads these inputs from its pinned Git checkout.
+      - 'benchmarks/suite_public_minimal.yaml'
+      - 'benchmarks/cases/*/analysis_report.json'
+      - 'examples/diffsims_closed_loop.yaml'
+      - 'examples/materials_project_diffsims_lookup.yaml'
+      - 'skills/autotem/**'
+      - 'configs/harness/**'
+      - 'configs/release/**'
+      - 'configs/**/*.yaml'
+      - 'configs/benchmarks/**'
+      - 'requirements/release/**'
+      - '.github/release-baselines/**'
+      - 'tools/release/**'
+      - 'tools/acceptance/**'
+      - 'tools/setup/**'
+      - 'tools/host_acceptance/**'
+      - 'tests/**'
+      - 'docs/HARNESS_RELEASE_TECHNICAL_DEVELOPMENT_PLAN.md'
+      - 'docs/harness-windows-release.md'
+      - 'docs/harness-report-compatibility.md'
+      - 'docs/harness-host-adapters.md'
+      - 'docs/harness-release-qualification.md'
+      - 'pyproject.toml'
+      - '.github/workflows/windows-release.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  cold-install:
+    runs-on: windows-2022
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build three single-profile bundles from one frozen source
+        id: build
+        run: |
+          & ./tools/release/build_windows_ci.ps1 -Root "$env:RUNNER_TEMP/atci" -ReleaseId "ci-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Verify the native core install, maintenance and registered disk outputs
+        id: cold
+        run: |
+          $ci = "$env:RUNNER_TEMP/atci"
+          $py = "$ci/psf/tools/python.exe"
+          Set-Location $ci
+          & $py -I -B "$ci/frozen/tools/setup/verify_install.py" --bundle "$ci/core" --output "$ci/cold" --extended
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $py -I -B "$ci/frozen/tools/release/check_first_slice.py" --bundle "$ci/core" --evidence "$ci/cold" --out "$ci/cold/first-slice.json"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Qualify the core project and archive its physical evidence
+        id: core
+        run: |
+          $ci = "$env:RUNNER_TEMP/atci"
+          $py = "$ci/psf/tools/python.exe"
+          Set-Location $ci
+          & $py -I -B "$ci/frozen/tools/release/qualify_ci.py" --bundle "$ci/core" --evidence "$ci/cold" --out "$ci/cq"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $py -I -B "$ci/frozen/tools/release/ci_evidence.py" pack --bundle "$ci/core" --evidence "$ci/cold" --qualification "$ci/cq" --out "$ci/archives/core.zip"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Verify stable CLI and JSONL, then archive J01
+        id: cli
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          $ci = "$env:RUNNER_TEMP/atci"
+          $py = "$ci/psf/tools/python.exe"
+          Set-Location $ci
+          & $py -I -B "$ci/frozen/tools/setup/verify_cli_profile.py" --bundle "$ci/cli" --output "$ci/ce"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $py -I -B "$ci/frozen/tools/release/ci_evidence.py" pack --bundle "$ci/cli" --evidence "$ci/ce" --out "$ci/archives/cli.zip"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Qualify the simulation, failure paths and import audit
+        id: sim
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          $ci = "$env:RUNNER_TEMP/atci"
+          $py = "$ci/psf/tools/python.exe"
+          Set-Location $ci
+          & $py -I -B "$ci/frozen/tools/release/qualify_ci.py" --bundle "$ci/sim" --out "$ci/sq"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $py -I -B "$ci/frozen/tools/release/ci_evidence.py" pack --bundle "$ci/sim" --evidence "$ci/sq" --out "$ci/archives/simulation.zip"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Run the full frozen source suite and record its actual selection
+        id: source
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          $ci = "$env:RUNNER_TEMP/atci"
+          & "$ci/psf/tools/python.exe" -I -B "$ci/frozen/tools/release/run_source_tests.py" --bundle "$ci/core" --simulation-bundle "$ci/sim" --support-repo "$env:GITHUB_WORKSPACE" --checkout "$ci/src" --scratch "$ci/st" --out "$ci/source"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Restore the pinned historical Windows release and compare shipped application code
+        id: previous
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          & ./tools/release/build_windows_ci.ps1 -Root "$env:RUNNER_TEMP/atci" -PreparePrevious
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Check the upgrade, host reconnect failure recovery and synthetic J01 histories
+        id: upgrade
+        if: ${{ !cancelled() && steps.previous.outcome == 'success' }}
+        run: |
+          $ci = "$env:RUNNER_TEMP/atci"
+          & "$ci/psf/tools/python.exe" -I -B "$ci/frozen/tools/setup/verify_upgrade.py" --previous-bundle "$ci/previous" --bundle "$ci/core" --project "$ci/up" --output "$ci/upgrade.json"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Interrupt a real activation and recover its pending transaction
+        id: recovery
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          $ci = "$env:RUNNER_TEMP/atci"
+          & "$ci/psf/tools/python.exe" -I -B "$ci/frozen/tools/setup/verify_recovery.py" --bundle "$ci/core" --project "$ci/rp" --output "$ci/rr"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Recheck compatible editions against the original projects and publish the index
+        id: combined
+        if: ${{ !cancelled() && steps.core.outcome == 'success' && steps.cli.outcome == 'success' && steps.sim.outcome == 'success' && steps.source.outcome == 'success' && steps.upgrade.outcome == 'success' && steps.recovery.outcome == 'success' }}
+        run: |
+          $ci = "$env:RUNNER_TEMP/atci"
+          $control = "$ci/cq/project/.autotem"
+          $manifest = (Get-FileHash -LiteralPath "$ci/core/release-manifest.json" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $active = Get-Content -Raw -LiteralPath "$control/active-runtime.json" | ConvertFrom-Json
+          $runtimeId = 'rt-' + $manifest.Substring(0, 20)
+          if ($active.runtime_id -ne $runtimeId -or $active.manifest_sha256 -ne $manifest) { throw 'Wrong active core runtime' }
+          $py = (Resolve-Path -LiteralPath "$control/runtimes/$runtimeId/Scripts/python.exe").Path
+          Set-Location "$ci/cq"
+          & $py -I -B "$ci/frozen/tools/release/qualify_release.py" --bundle "$ci/core" --evidence "$ci/cold" --contract "$ci/cq/contract-freeze.json" --local "$ci/cq/local/local-execution.json" --headless "$ci/cq/headless/headless.json" --simulation "$ci/sq/simulation/simulation.json" "$ci/sim" "$ci/sq/project" --simulation-headless "$ci/sq/headless/headless.json" --simulation-faults "$ci/sq/simulation-faults/faults.json" --upgrade "$ci/upgrade.json" "$ci/previous" "$ci/up" --recovery "$ci/rr/recovery.json" "$ci/rp" --source-tests "$ci/source/source-regression.json" --out "$ci/combined-index.json" --require RG0 --require RG1 --require RG2 --require-check RG4.interrupted_install_recovery --require-check RG4.cross_release_upgrade_recovery --require-check RG4.post_switch_host_failure_recovery --require-check RG5.source_regression
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $py -I -B "$ci/frozen/tools/release/ci_evidence.py" public --archives "$ci/archives/core.zip" "$ci/archives/cli.zip" "$ci/archives/simulation.zip" --index "$ci/combined-index.json" --delivery-evidence "$ci/upgrade.json" "$ci/rr/recovery.json" "$ci/source/source-regression.json" --out "$ci/public-summary.json"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Preserve a native core failure before activation
+        if: ${{ failure() && steps.cold.outcome == 'failure' }}
+        run: |
+          $ci = "$env:RUNNER_TEMP/atci"
+          $attempt = "$ci/cold/installation.json"
+          if (!(Test-Path -LiteralPath $attempt)) { return }
+          $result = Get-Content -Raw -LiteralPath $attempt | ConvertFrom-Json
+          if ($result.case_verdict -ne 'failed' -or $result.checks -contains 'cold_installed_private_cpython') { return }
+          & "$ci/psf/tools/python.exe" -I -B "$ci/frozen/tools/release/qualify_release.py" --bundle "$ci/core" --evidence "$ci/cold" --out "$ci/cold/cold-failure.json"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Upload the public gate summary
+        if: ${{ !cancelled() && steps.combined.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-summary
+          if-no-files-found: error
+          path: ${{ runner.temp }}/atci/public-summary.json
+      - name: Retain purpose-built synthetic evidence and native diagnostics
+        if: ${{ always() && github.event.repository.private }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-synthetic-qualification
+          if-no-files-found: warn
+          compression-level: 1
+          path: |
+            ${{ runner.temp }}/atci/archives/*.zip
+            ${{ runner.temp }}/atci/combined-index.json
+            ${{ runner.temp }}/atci/core/release-manifest.json
+            ${{ runner.temp }}/atci/cli/release-manifest.json
+            ${{ runner.temp }}/atci/sim/release-manifest.json
+            ${{ runner.temp }}/atci/cold/installation.json
+            ${{ runner.temp }}/atci/cold/maintenance.jsonl
+            ${{ runner.temp }}/atci/cold/cold-failure.json
+            ${{ runner.temp }}/atci/cold/first-slice.json
+            ${{ runner.temp }}/atci/cold/science/evidence.json
+            ${{ runner.temp }}/atci/cold/variants/operations.json
+            ${{ runner.temp }}/atci/cq/private-install.json
+            ${{ runner.temp }}/atci/cq/release-index.json
+            ${{ runner.temp }}/atci/cq/local/local-execution.json
+            ${{ runner.temp }}/atci/cq/headless/headless.json
+            ${{ runner.temp }}/atci/ce/cli-profile.json
+            ${{ runner.temp }}/atci/ce/installation.json
+            ${{ runner.temp }}/atci/ce/science.json
+            ${{ runner.temp }}/atci/ce/tool-trace.json
+            ${{ runner.temp }}/atci/sq/private-install.json
+            ${{ runner.temp }}/atci/sq/simulation/simulation.json
+            ${{ runner.temp }}/atci/sq/simulation/variant-evidence.json
+            ${{ runner.temp }}/atci/sq/simulation-faults/faults.json
+            ${{ runner.temp }}/atci/sq/headless/headless.json
+      - name: Retain incomplete synthetic runs for failure diagnosis
+        if: ${{ failure() && github.event.repository.private }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-incomplete-synthetic-runs
+          if-no-files-found: warn
+          include-hidden-files: true
+          path: |
+            ${{ runner.temp }}/atci/cold/science/
+            ${{ runner.temp }}/atci/cold/variants/
+            ${{ runner.temp }}/atci/cold/project/.autotem/runs/harness.sqlite3*
+            ${{ runner.temp }}/atci/cold/project/.autotem/runs/runs/*/raw/*
+            ${{ runner.temp }}/atci/cold/project/.autotem/runs/runs/*/artifacts/*
+            ${{ runner.temp }}/atci/cq/headless/processes/
+            ${{ runner.temp }}/atci/cq/headless/science/
+            ${{ runner.temp }}/atci/cq/headless/variants/
+            ${{ runner.temp }}/atci/sq/simulation/
+            ${{ runner.temp }}/atci/sq/simulation-faults/
+            ${{ runner.temp }}/atci/sq/headless/processes/
+            ${{ runner.temp }}/atci/sq/headless/science/
+            ${{ runner.temp }}/atci/sq/headless/variants/
+            ${{ runner.temp }}/atci/ce/fixtures/
+            ${{ runner.temp }}/atci/ce/project/.autotem/runs/harness.sqlite3*
+            ${{ runner.temp }}/atci/ce/project/.autotem/runs/runs/*/raw/*
+            ${{ runner.temp }}/atci/ce/project/.autotem/runs/runs/*/artifacts/*
+            ${{ runner.temp }}/atci/sq/project/.autotem/runs/harness.sqlite3*
+            ${{ runner.temp }}/atci/sq/project/.autotem/runs/runs/*/raw/*
+            ${{ runner.temp }}/atci/sq/project/.autotem/runs/runs/*/artifacts/*
+      - name: Preserve registered snapshots and artifacts from synthetic maintenance runs
+        if: ${{ !cancelled() && github.event.repository.private && steps.build.outcome == 'success' }}
+        run: |
+          $ci = "$env:RUNNER_TEMP/atci"
+          & "$ci/psf/tools/python.exe" -I -B "$ci/frozen/tools/release/ci_delivery_records.py" --root $ci --out "$ci/registered-delivery.zip"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Retain private maintenance and source regression originals
+        if: ${{ always() && github.event.repository.private }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-private-delivery-records
+          if-no-files-found: warn
+          include-hidden-files: true
+          compression-level: 1
+          path: |
+            ${{ runner.temp }}/atci/registered-delivery.zip
+            ${{ runner.temp }}/atci/previous-failure.json
+            ${{ runner.temp }}/atci/generation-pair.json
+            ${{ runner.temp }}/atci/previous/release-manifest.json
+            ${{ runner.temp }}/atci/upgrade.json
+            ${{ runner.temp }}/atci/up/.upgrade-verifier/*.json
+            ${{ runner.temp }}/atci/up/.upgrade-verifier/*.jsonl
+            ${{ runner.temp }}/atci/up/.upgrade-verifier/maintenance/*.json
+            ${{ runner.temp }}/atci/up/.upgrade-verifier/reconnect/*
+            ${{ runner.temp }}/atci/up/.upgrade-verifier/before_upgrade/*_sha256
+            ${{ runner.temp }}/atci/up/.upgrade-verifier/after_upgrade/*_sha256
+            ${{ runner.temp }}/atci/up/.upgrade-verifier/after_rollback/*_sha256
+            ${{ runner.temp }}/atci/up/fixture/J01 合成 HRTEM.npy
+            ${{ runner.temp }}/atci/up/.autotem/active-runtime.json
+            ${{ runner.temp }}/atci/up/.autotem/installations/*/transaction.json
+            ${{ runner.temp }}/atci/up/.autotem/runtimes/rt-*/.autotem-runtime.json
+            ${{ runner.temp }}/atci/rr/recovery.json
+            ${{ runner.temp }}/atci/rr/native/*
+            ${{ runner.temp }}/atci/rr/observed/*.json
+            ${{ runner.temp }}/atci/rr/science/*
+            ${{ runner.temp }}/atci/rp/fixture/J01 合成 HRTEM.npy
+            ${{ runner.temp }}/atci/rp/.autotem/active-runtime.json
+            ${{ runner.temp }}/atci/rp/.autotem/installations/*/transaction.json
+            ${{ runner.temp }}/atci/rp/.autotem/installations/*/runtime-inventory.json
+            ${{ runner.temp }}/atci/rp/.autotem/runtimes/rt-*/.autotem-runtime.json
+            ${{ runner.temp }}/atci/source/source-regression*
+            ${{ runner.temp }}/atci/source/pytest.log
+            ${{ runner.temp }}/atci/source/environment.log

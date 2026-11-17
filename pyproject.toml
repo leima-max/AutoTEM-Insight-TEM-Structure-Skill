@@ -34,6 +34,10 @@ ui = [
   "streamlit>=1.57",
   "streamlit-drawable-canvas>=0.9.3"
 ]
+mcp = [
+  "mcp>=1.27,<2",
+  "tomli>=2.0; python_version < '3.11'"
+]
 io = [
   "h5py>=3.10",
   "mrcfile>=1.4",
@@ -42,6 +46,9 @@ io = [
 crystallography = [
   "mp-api>=0.41",
   "pymatgen>=2024.5"
+]
+simulation = [
+  "diffsims>=0.7"
 ]
 gpl_adapters = [
   "diffsims>=0.7",
@@ -53,9 +60,25 @@ gpl_adapters = [
 
 [project.scripts]
 autotem = "autotem.cli:main"
+autotem-harness = "autotem.harness.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["autotem*"]
+
+[tool.setuptools.data-files]
+"share/autotem-insight/apps" = ["apps/b1_b3_preview_ui.py", "apps/b2_diffraction_ui.py"]
+"share/autotem-insight/configs" = ["configs/hrtem_fft_phase.yaml"]
+
+[tool.setuptools.package-data]
+"autotem.harness" = [
+  "resources/openclaw/*.cjs",
+  "resources/skill/*.md",
+  "resources/skill/agents/*.yaml",
+  "resources/skill/references/*.md",
+  "resources/skill/references/profiles/*.yaml",
+  "resources/skill/references/recipes/*.yaml",
+  "resources/skill/references/hosts/codex/*.toml"
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

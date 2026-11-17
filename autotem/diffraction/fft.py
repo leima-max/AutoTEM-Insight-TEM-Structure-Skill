@@ -87,7 +87,7 @@ def locate_direct_beam(
         if search_radius_px is not None
         else max(4.0, min(h, w) * 0.15)
     )
-    yy, xx = np.indices(magnitude.shape)
+    yy, xx = np.indices(magnitude.shape, sparse=True)
     rr = np.hypot(xx - geometric[0], yy - geometric[1])
     roi_mask = rr <= radius
     if not np.any(roi_mask):

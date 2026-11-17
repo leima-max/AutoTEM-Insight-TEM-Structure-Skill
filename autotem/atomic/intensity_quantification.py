@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 from scipy.spatial import cKDTree
 
+SATURATION_THRESHOLD_MISSING = "Detector saturation was not evaluated. No threshold was supplied."
+
 
 @dataclass(slots=True)
 class AtomicColumnIntensityResult:
@@ -34,6 +36,14 @@ class AtomicColumnIntensityResult:
     confidence: float
     warnings: list[str]
     provenance: dict[str, Any]
+
+    @property
+    def saturation_status(self) -> list[str]:
+        """Threshold status of finite integration-disk pixels in each measured column."""
+        if self.provenance.get("parameters", {}).get("saturation_threshold") is None:
+            return ["not_evaluated"] * len(self.saturation_flag)
+        measured = np.where(self.saturation_flag, "at_or_above_threshold", "below_threshold")
+        return np.where(self.valid_atom_mask, measured, "not_evaluated").tolist()
 
 
 @dataclass(slots=True)
@@ -83,10 +93,16 @@ def quantify_atomic_column_intensity(
         )
     if normalization not in {"none", "median", "mean"}:
         raise ValueError("normalization must be none, median, or mean.")
+    if saturation_threshold is not None:
+        saturation_threshold = float(saturation_threshold)
+        if not np.isfinite(saturation_threshold):
+            raise ValueError("saturation_threshold must be finite.")
 
     n_atoms = len(coords)
     shape = arr.shape
     warnings: list[str] = []
+    if saturation_threshold is None:
+        warnings.append(SATURATION_THRESHOLD_MISSING)
 
     peak = np.full(n_atoms, np.nan, dtype=np.float64)
     raw_sum = np.full(n_atoms, np.nan, dtype=np.float64)
@@ -148,7 +164,7 @@ def quantify_atomic_column_intensity(
         bg_sub_sum[idx] = raw_sum[idx] - bg_level[idx] * float(atom_values.size)
         snr[idx] = (raw_mean[idx] - bg_level[idx]) / max(bg_std[idx], 1e-12)
         if saturation_threshold is not None:
-            saturation_flag[idx] = bool(np.any(atom_values >= float(saturation_threshold)))
+            saturation_flag[idx] = bool(np.any(atom_values >= saturation_threshold))
         valid[idx] = True
 
     normalized = _normalize_intensity(bg_sub_sum, valid, normalization, warnings)

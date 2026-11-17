@@ -88,14 +88,20 @@ def calibrate_dataset(
     warnings.extend(voltage_warnings)
 
     fft_shape = tuple(int(v) for v in dataset.data.shape) if dataset.data.shape else None
+    direct_pattern = dataset.modality in {"SAED", "NBED"}
+    fft_pixel_nm = None if direct_pattern or pixel_size is None else _to_float(pixel_size.value)
     diffraction_resolved = resolve_diffraction_calibration(
-        pixel_size_nm=None if pixel_size is None else _to_float(pixel_size.value),
+        pixel_size_nm=fft_pixel_nm,
         voltage_kv=voltage_kv,
         parameters=params,
         reference=ref,
         fft_shape=fft_shape,
     )
     warnings.extend(list(diffraction_resolved.get("warnings", [])))
+    if direct_pattern and pixel_size is not None and diffraction_resolved["source"] == "unresolved":
+        warnings.append(
+            "Direct diffraction requires detector/reference calibration; FFT fallback withheld."
+        )
     pair_details = diffraction_resolved.get("reference_pair_details")
 
     if isinstance(pair_details, dict) and isinstance(pair_details.get("pairs"), list):

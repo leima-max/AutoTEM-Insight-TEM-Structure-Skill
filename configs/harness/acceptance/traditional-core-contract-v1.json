@@ -1,0 +1,983 @@
+{
+  "schema_version": "1.0.0",
+  "profile": "traditional-core-mcp",
+  "target": {
+    "abi": "cpython-312",
+    "architecture": "win-amd64",
+    "implementation": "cpython",
+    "platform": "win32",
+    "python_version": "3.12.10"
+  },
+  "seed_pip_version": "25.0.1",
+  "protocol_version": "1.0.0",
+  "core_result_version": "0.1.0",
+  "required_operations": [
+    "input.load", "quality.assess", "calibration.resolve", "preprocessing.apply",
+    "diffraction.fft", "diffraction.peaks", "diffraction.metrics",
+    "atomic.detect", "atomic.refine", "atomic.distances"
+  ],
+  "max_request_bytes": 1048576,
+  "terminal_states": [
+    "cancelled",
+    "completed",
+    "failed",
+    "interrupted",
+    "needs_input",
+    "timed_out"
+  ],
+  "active_states": [
+    "preparing",
+    "queued",
+    "running",
+    "finalizing"
+  ],
+  "tools": {
+    "list_capabilities": {
+      "type": "object",
+      "properties": {
+        "enabled_plugins": {
+          "type": "array"
+        },
+        "view": {
+          "type": "string",
+          "enum": ["full", "summary", "parameters"]
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "inspect_input": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "selection": {
+          "type": "object"
+        },
+        "input_mode": {
+          "type": "string",
+          "enum": [
+            "snapshot",
+            "reference"
+          ],
+          "default": "snapshot"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "additionalProperties": false
+    },
+    "validate_plan": {
+      "type": "object",
+      "properties": {
+        "plan": {
+          "type": "object"
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "plan"
+      ],
+      "additionalProperties": false
+    },
+    "submit_analysis": {
+      "type": "object",
+      "properties": {
+        "plan": {
+          "type": "object"
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "parent_run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "execution_mode": {
+          "type": "string",
+          "enum": [
+            "sequential"
+          ]
+        },
+        "user_request": {
+          "type": "string",
+          "maxLength": 10000
+        },
+        "asynchronous": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "plan"
+      ],
+      "additionalProperties": false
+    },
+    "get_run_status": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "additionalProperties": false
+    },
+    "cancel_run": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "additionalProperties": false
+    },
+    "list_artifacts": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "additionalProperties": false
+    },
+    "read_artifact": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        }
+      },
+      "required": [
+        "artifact_id"
+      ],
+      "additionalProperties": false
+    },
+    "export_report": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "formats": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "json",
+              "html",
+              "pdf"
+            ]
+          },
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "answer_units": {
+    "pixel_size_nm": [
+      "nm/pixel",
+      "pm/pixel",
+      "angstrom/pixel",
+      "um/pixel"
+    ],
+    "diffraction_scale_inv_nm_per_px": [
+      "1/nm/pixel"
+    ],
+    "reference_length": [
+      "nm",
+      "pm",
+      "angstrom",
+      "um"
+    ],
+    "known_d_spacing": [
+      "nm",
+      "pm",
+      "angstrom",
+      "um"
+    ],
+    "reference_pixels": [
+      "pixel"
+    ],
+    "measured_radius_px": [
+      "pixel"
+    ],
+    "g_vectors": [
+      "1/pixel",
+      "fft_pixel",
+      "1/nm"
+    ],
+    "reference_region": [
+      "pixel"
+    ],
+    "reference_regions": [
+      "pixel"
+    ],
+    "roi": [
+      "pixel"
+    ],
+    "angle_deg": [
+      "deg"
+    ],
+    "lattice_angle_deg": [
+      "deg"
+    ]
+  },
+  "formats": {
+    "core_disk": [
+      ".npy",
+      ".tif",
+      ".tiff"
+    ],
+    "reader_branches_outside_release_claim": [
+      ".bmp",
+      ".csv",
+      ".dm3",
+      ".dm4",
+      ".emd",
+      ".gif",
+      ".h5",
+      ".hdf",
+      ".hdf5",
+      ".jpeg",
+      ".jpg",
+      ".mrc",
+      ".mrcs",
+      ".npz",
+      ".png",
+      ".ser",
+      ".txt"
+    ],
+    "metadata_only": [
+      ".emi"
+    ]
+  },
+  "unreleased_profiles": [
+    "traditional-cli",
+    "traditional-simulation"
+  ],
+  "jsonl_errors": {
+    "unknown_tool": "REQUEST_INVALID",
+    "top_level_field": "REQUEST_INVALID",
+    "invalid_revision": "REQUEST_INVALID",
+    "negative_offset": "REQUEST_INVALID",
+    "oversize_page": "REQUEST_INVALID",
+    "repeated_format": "REQUEST_INVALID",
+    "too_many_plugins": "REQUEST_INVALID",
+    "foreign_request_field": "REQUEST_INVALID",
+    "duplicate_key": "REQUEST_INVALID",
+    "nonfinite": "REQUEST_INVALID",
+    "oversize_line": "REQUEST_INVALID",
+    "bad_artifact": "ARTIFACT_NOT_FOUND",
+    "missing_run": "RUN_NOT_FOUND",
+    "invalid_plan": "INVALID_PLAN",
+    "reserved_operation": "DEFERRED_THIS_PHASE",
+    "redacted_parameter": "CREDENTIAL_PARAMETER_FORBIDDEN"
+  },
+  "operations": {
+    "ai.atom_columns": {
+      "version": "1.0.0",
+      "status": "reserved",
+      "profile": "reserved",
+      "input_roles": [
+        "raw"
+      ],
+      "output_roles": [
+        "atoms"
+      ],
+      "contract_sha256": "e442e00789a01977a74d785c7208047fa8cd15f6cac8a26b4f3bc9d5c3512327",
+      "role_schemas_sha256": "b8c544484044118153b4c8ec7e8e230bd4193df3709042d1d1fb113287b562fd"
+    },
+    "ai.denoise": {
+      "version": "1.0.0",
+      "status": "reserved",
+      "profile": "reserved",
+      "input_roles": [
+        "raw"
+      ],
+      "output_roles": [
+        "processed"
+      ],
+      "contract_sha256": "77d271456b25ec6622671b34e8c51350158d72a48a274e4078a706aa1a70ede4",
+      "role_schemas_sha256": "f679b90d00ff677b1f3dec8e73a33e60897ec0ec8c8ecfa0e6b4d8f256ba2d89"
+    },
+    "ai.diffraction_spots": {
+      "version": "1.0.0",
+      "status": "reserved",
+      "profile": "reserved",
+      "input_roles": [
+        "raw"
+      ],
+      "output_roles": [
+        "peaks"
+      ],
+      "contract_sha256": "21cd5b4480902c5d95ec78f25ae086bd4a15e564fcf7c147223dfc8acfc2fcfd",
+      "role_schemas_sha256": "4fd750ccf7db20e437816b01ae15dfee84a8e62539edf881033cde760f51a254"
+    },
+    "atomic.detect": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "raw"
+      ],
+      "output_roles": [
+        "atoms"
+      ],
+      "contract_sha256": "e548e6e9e17af984351693bb581fd7d5aab2ed6580c9ba8a10df4d263d401414",
+      "role_schemas_sha256": "b8c544484044118153b4c8ec7e8e230bd4193df3709042d1d1fb113287b562fd"
+    },
+    "atomic.displacement": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "refined_atoms"
+      ],
+      "output_roles": [
+        "atomic_displacement"
+      ],
+      "contract_sha256": "ab45f5f2e3aaaeda5c765bdd3413ba17f4129d0ea690d4a7592a6d15b1957ab3",
+      "role_schemas_sha256": "ae4673e7605e7e1d6de52ce820ba2441762c686a35c089cb752d50849f476740"
+    },
+    "atomic.distances": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "refined_atoms"
+      ],
+      "output_roles": [
+        "atom_distances"
+      ],
+      "contract_sha256": "f1a346efff2d8b03781bc24f0c41a850c8b2c3032803619f0dc86c70ae9b2075",
+      "role_schemas_sha256": "a663fb62a001947882b7c8fc8e02c547f1f8379571f44281c2e6987c8216639b"
+    },
+    "atomic.intensity": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "raw",
+        "refined_atoms"
+      ],
+      "output_roles": [
+        "atomic_intensity"
+      ],
+      "contract_sha256": "35a61a2204dea26f4a71f79c833d93e9e6789723a22bc6dc32cd9eebb3e65f03",
+      "role_schemas_sha256": "5e31e94c2a254ee7c1bb2a841e33d77d260a1d4a6cd4b3099c30db0e09d30cb1"
+    },
+    "atomic.intensity_groups": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "atomic_intensity"
+      ],
+      "output_roles": [
+        "intensity_groups"
+      ],
+      "contract_sha256": "3ad6885e0a40ca2728017ff7e4807054baa98dee5e4403aeb080c2f5a18fa334",
+      "role_schemas_sha256": "a4d46c7df0aaabf3be26c9cfa1585aed558e9c88d397d02d0dffff1dd53f170c"
+    },
+    "atomic.refine": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "raw",
+        "atoms"
+      ],
+      "output_roles": [
+        "refined_atoms"
+      ],
+      "contract_sha256": "2beae115962b8befe30b921b9be5e24b113fe42e2a25897d79af570bda37968e",
+      "role_schemas_sha256": "3d8fc2b881f3c2db7d2e2c476944cfd50e74f1c116991d9b0edbf1837d9c6613"
+    },
+    "atomic.regularize": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "refined_atoms"
+      ],
+      "output_roles": [
+        "regularized_atoms"
+      ],
+      "contract_sha256": "89be1e8b171543f08ac24588fd96a23dc3d6c59668ed9f5c14dba531fcdb002c",
+      "role_schemas_sha256": "95f2106b19370d80c8f5f63a59d79f9d2681ca9c616f2eebd314b480fbc67f58"
+    },
+    "atomic.spacing.angle": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "refined_atoms"
+      ],
+      "output_roles": [
+        "atomic_spacing"
+      ],
+      "contract_sha256": "f73ea59a628b7d43a5d6dcdcf1d76b391731db45ba7d2d9ed59a23f3ec91def9",
+      "role_schemas_sha256": "2fc6488528ff14ea473b8b4de10b323830863d64aafceb375cd942d150d4dd65"
+    },
+    "atomic.spacing.basis": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "refined_atoms"
+      ],
+      "output_roles": [
+        "atomic_spacing"
+      ],
+      "contract_sha256": "097578d4a533a577f92c5f56d1f87cea475983b4ad08529c8b1be35abffe2500",
+      "role_schemas_sha256": "2fc6488528ff14ea473b8b4de10b323830863d64aafceb375cd942d150d4dd65"
+    },
+    "atomic.spacing.indexed": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "refined_atoms"
+      ],
+      "output_roles": [
+        "atomic_spacing"
+      ],
+      "contract_sha256": "665f51369e544f4dfc4fbe6a573107d77ac53b6c0591fee4c5a8b7ca84649807",
+      "role_schemas_sha256": "2fc6488528ff14ea473b8b4de10b323830863d64aafceb375cd942d150d4dd65"
+    },
+    "atomic.spacing.lattice_angle": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "refined_atoms"
+      ],
+      "output_roles": [
+        "atomic_spacing"
+      ],
+      "contract_sha256": "9408ebedfc456c67510d176beaaf871c357a1642121a1c83bb5d8c0bd146c190",
+      "role_schemas_sha256": "2fc6488528ff14ea473b8b4de10b323830863d64aafceb375cd942d150d4dd65"
+    },
+    "atomic.spacing.picked": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "refined_atoms"
+      ],
+      "output_roles": [
+        "atomic_spacing"
+      ],
+      "contract_sha256": "253bae9b2807d7e63b283a8dedaf87fc42c64c66d5362985338f43e82b79287a",
+      "role_schemas_sha256": "2fc6488528ff14ea473b8b4de10b323830863d64aafceb375cd942d150d4dd65"
+    },
+    "atomic.sublattice.auto": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "refined_atoms"
+      ],
+      "output_roles": [
+        "sublattices"
+      ],
+      "contract_sha256": "e68577da8a305d92fa430dc7d3d78095b951c8f9d015d3836b455e800916bf77",
+      "role_schemas_sha256": "b680f33660ae31fd83066e33a6d4a24076319ad296d5d2b00c654d491a4aac96"
+    },
+    "atomic.sublattice.manual": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "sublattices"
+      ],
+      "output_roles": [
+        "sublattices"
+      ],
+      "contract_sha256": "75bdabe6cd42a5b2ae02ece67917bfae354b5ec01ae53f009dc7b63d001ec31d",
+      "role_schemas_sha256": "e4d79437d2e1780512c548e78e247188267d80a88d22fe4680e690a9ffd346bf"
+    },
+    "atomic.sublattice.model": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "refined_atoms"
+      ],
+      "output_roles": [
+        "sublattices"
+      ],
+      "contract_sha256": "ecdd8d5e06e1e3098b8fd47f04e0f2a6e48afe8440aef9101e22eab694867923",
+      "role_schemas_sha256": "b680f33660ae31fd83066e33a6d4a24076319ad296d5d2b00c654d491a4aac96"
+    },
+    "benchmark.evaluate": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "delivery",
+      "input_roles": [
+        "dataset"
+      ],
+      "output_roles": [
+        "benchmark"
+      ],
+      "contract_sha256": "97a0748fe0adda295484b151d54500a1ed47952a5c82eb67211d7507311d33f1",
+      "role_schemas_sha256": "a2bd7eaf7af144bdba21cccb49d715c8a0cd4f2d20b1d6b85a91e679bb269e24"
+    },
+    "calibration.resolve": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "data-quality",
+      "input_roles": [
+        "raw",
+        "dataset"
+      ],
+      "output_roles": [
+        "calibration"
+      ],
+      "contract_sha256": "d7ee79d8375dcac0a5010945604e3946bcfa4e2190d4856f05d7f408e9a90773",
+      "role_schemas_sha256": "beb222bb923fb927c1585b0b3f64dda4b34b5dcdd4fe333c73fe17cef9138de2"
+    },
+    "calibration.scalebar_candidate": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "data-quality",
+      "input_roles": [
+        "raw",
+        "dataset"
+      ],
+      "output_roles": [
+        "scalebar_candidate",
+        "scalebar_roi"
+      ],
+      "contract_sha256": "22171b9af1f0d302c580eb2a10c547ffc8ddd2358846c591a62113e936a8be73",
+      "role_schemas_sha256": "3356310ea8209429a286c0ab6c9739ace999d047ed0387466b8e7d4a94453862"
+    },
+    "diffraction.center": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "diffraction",
+      "input_roles": [
+        "reciprocal_image",
+        "reciprocal_context"
+      ],
+      "output_roles": [
+        "center"
+      ],
+      "contract_sha256": "7a304d2c19165efc22a0d815fb553498fc79a25114459d4aa86ea5f8d452e017",
+      "role_schemas_sha256": "3713d2b2f2df2bd3bd082a875db9dd0a87b69398e76300a5d2ad364a7890206a"
+    },
+    "diffraction.fft": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "diffraction",
+      "input_roles": [
+        "processed",
+        "dataset"
+      ],
+      "output_roles": [
+        "reciprocal_image",
+        "fft_complex",
+        "reciprocal_context"
+      ],
+      "contract_sha256": "050838f46437ccac3c089e6dbaa5460ef942e6c857b59a98ca8c58d8739fdb52",
+      "role_schemas_sha256": "47af92d8fe4a7d8cf424293221ba9466037c05c9579458c67af2a93cb1e7dd35"
+    },
+    "diffraction.index": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "diffraction",
+      "input_roles": [
+        "diffraction"
+      ],
+      "output_roles": [
+        "diffraction"
+      ],
+      "contract_sha256": "5a849f4807c8097234d8113bc8eb29124ce6ddb573a11c23e8555417a61a672b",
+      "role_schemas_sha256": "cd399fd452562334ca3e28472fad70e219dca8131bec207938b1ee4e0cdc8036"
+    },
+    "diffraction.match": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "diffraction",
+      "input_roles": [
+        "diffraction",
+        "simulation"
+      ],
+      "output_roles": [
+        "diffraction",
+        "simulation"
+      ],
+      "contract_sha256": "55893755ce6fad0b68ff0fd6c6cc59f2fc7ca1cdca38453e2f9ba0223bb71afc",
+      "role_schemas_sha256": "f5c6ba5158d8c06489379aefe9f39a377ec2815f7a8cdd1a0b3959bc60ebfad9"
+    },
+    "diffraction.metrics": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "diffraction",
+      "input_roles": [
+        "dataset",
+        "calibration",
+        "reciprocal_image",
+        "reciprocal_context",
+        "center",
+        "peaks"
+      ],
+      "output_roles": [
+        "diffraction"
+      ],
+      "contract_sha256": "48fdb10be970ebc18431a6836ca73c8e4587f403738653ba6fa090a8fbb1ad8e",
+      "role_schemas_sha256": "69e71a93ab59946ff18da319b0c0936ff0715bd49ec31a1acae8ca13bfadb19e"
+    },
+    "diffraction.pattern": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "diffraction",
+      "input_roles": [
+        "raw",
+        "dataset"
+      ],
+      "output_roles": [
+        "reciprocal_image",
+        "reciprocal_context"
+      ],
+      "contract_sha256": "b1a490086b78f227f4ecc06f8469bd1da531371a78f9889b7898b74518e1f969",
+      "role_schemas_sha256": "842eeb579a3e520e8e253012c6bec1b8301dc86809225b6fc3faf66461ede396"
+    },
+    "diffraction.peaks": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "diffraction",
+      "input_roles": [
+        "reciprocal_image",
+        "center"
+      ],
+      "output_roles": [
+        "peaks",
+        "peak_diagnostics"
+      ],
+      "contract_sha256": "d0bb2acffd75d2df21f1ae11ef3e012eb6cf7e41d9d4f5e9f42d68367aa98e57",
+      "role_schemas_sha256": "c4eb1d92373882f2f55bb202baa950beee79612be058b9c1704e005eeae056dc"
+    },
+    "diffraction.peaks.manual": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "diffraction",
+      "input_roles": [
+        "reciprocal_image"
+      ],
+      "output_roles": [
+        "peaks",
+        "peak_diagnostics"
+      ],
+      "contract_sha256": "fba110253c690a9c1690f5317a400afae92618d91d88dac05f19b0ff88ec1aee",
+      "role_schemas_sha256": "aed136466b8f49a2154b1b48bb0015c50784bb45059abf776ffffe847655fcf5"
+    },
+    "diffraction.peaks.suggest": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "diffraction",
+      "input_roles": [
+        "reciprocal_image"
+      ],
+      "output_roles": [
+        "peak_parameter_suggestions"
+      ],
+      "contract_sha256": "532679208fce7efe88f55860e44392d3bdbcd20f1f518920341f83de75790941",
+      "role_schemas_sha256": "5196344f4ac36da130cc068d515ee49042706402bca1103c0cd40a5de2bc7156"
+    },
+    "fourdstem.analyze": {
+      "version": "1.0.0",
+      "status": "reserved",
+      "profile": "reserved",
+      "input_roles": [
+        "raw"
+      ],
+      "output_roles": [
+        "fourdstem"
+      ],
+      "contract_sha256": "2d60cf34018572e1e3da23f697df5ceb44ef9817c68f3175029760992efd12e3",
+      "role_schemas_sha256": "53a2b4dd20958c2c0e061625594c3e399dc6680d1d41b8a58c4864ad39ac7b10"
+    },
+    "input.load": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "data-quality",
+      "input_roles": [],
+      "output_roles": [
+        "raw",
+        "dataset"
+      ],
+      "contract_sha256": "384cc906645b6d3f99acc81d2b7b0faae7b06a8dadc274a7aafea79a7eb2d378",
+      "role_schemas_sha256": "ba51123554094b44f66d2469a28b48a4c4ba6e43286d940a0c7b54b8e10c0381"
+    },
+    "maintenance.dependencies": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "delivery",
+      "input_roles": [],
+      "output_roles": [
+        "dependency_diagnostics"
+      ],
+      "contract_sha256": "808dc886eef3841f6e4046c486e7a3c1edc7b179d0fd9c84e644b5a9f08b9297",
+      "role_schemas_sha256": "9d565560b6fb99b0bee8ce222c8d0ec75516c8df9557c8e93a37495117695083"
+    },
+    "microstructure.defects": {
+      "version": "1.0.0",
+      "status": "reserved",
+      "profile": "reserved",
+      "input_roles": [
+        "raw"
+      ],
+      "output_roles": [
+        "defects"
+      ],
+      "contract_sha256": "067508d61c4679f8279337c5da2108c9acdcf37d04a116550e5cc2666ad2e695",
+      "role_schemas_sha256": "0d27ae283f30afbddbd018d3086e9ac3f7520cfa15e64df6e42cf3080452619a"
+    },
+    "microstructure.grains": {
+      "version": "1.0.0",
+      "status": "reserved",
+      "profile": "reserved",
+      "input_roles": [
+        "raw"
+      ],
+      "output_roles": [
+        "grain_masks"
+      ],
+      "contract_sha256": "24a5b328d18855d190f83f80a04794c4f562a5f5e51893cd64143e9678cf2bf1",
+      "role_schemas_sha256": "4280887802af557fd20e5d4931838cc16ad7140d2c3b6a3d4cc673925343c6ed"
+    },
+    "microstructure.twins": {
+      "version": "1.0.0",
+      "status": "reserved",
+      "profile": "reserved",
+      "input_roles": [
+        "raw"
+      ],
+      "output_roles": [
+        "twins"
+      ],
+      "contract_sha256": "311d3f052e7e54855ca790ecf6767dd90bf4d1f0de171a66bdae165c65674432",
+      "role_schemas_sha256": "30a366d116e52c88e0a29b8ea357a715ff6e4862f90a021afa1836e7959da5af"
+    },
+    "phase.lookup": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "diffraction",
+      "input_roles": [],
+      "output_roles": [
+        "phase_candidates",
+        "phase_lookup"
+      ],
+      "contract_sha256": "d6e0302e085125dd2765bfe31e6278dba72dbb51d9d2f835e2a412715b2e4bca",
+      "role_schemas_sha256": "d9a4a72ea80280104917eb044b0e226a82653e058fe874144ee7ffeed58f50ea"
+    },
+    "preprocessing.apply": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "data-quality",
+      "input_roles": [
+        "raw",
+        "dataset"
+      ],
+      "output_roles": [
+        "processed",
+        "preprocessing"
+      ],
+      "contract_sha256": "626a709eaaff5a789765886df1db07798df0c12499c291e582a4024bbc66a6c8",
+      "role_schemas_sha256": "91dd94003877bbc7ba54627d23483bcc5f392733cfbcb04fccd202b0f52ee94b"
+    },
+    "quality.assess": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "data-quality",
+      "input_roles": [
+        "raw",
+        "dataset"
+      ],
+      "output_roles": [
+        "quality"
+      ],
+      "contract_sha256": "5e56445783ce92b9de09261837943a81f67bce1b28bea8793e57cc44f749f040",
+      "role_schemas_sha256": "23488b7f489b2d22d01f8cc56ccca717aff4f69ac3bcf13f99ad5a44bb7d13aa"
+    },
+    "revision.cas": {
+      "version": "1.0.0",
+      "status": "reserved",
+      "profile": "reserved",
+      "input_roles": [
+        "raw"
+      ],
+      "output_roles": [
+        "revision"
+      ],
+      "contract_sha256": "8911d56c2ddc0a01bceefd9ab9948ec6c915ce3b88cfbf3741b70ef59eed0b56",
+      "role_schemas_sha256": "a087f04575641c0bb0dba5c8b6c9d7b8d7f37ff110627ef72e617e312a9e4f3b"
+    },
+    "simulation.diffraction": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "diffraction",
+      "input_roles": [
+        "diffraction"
+      ],
+      "output_roles": [
+        "simulation"
+      ],
+      "contract_sha256": "d519d1d7ac0b2b0af1acba7ac3f95873aed3ae980bfc7684d583a1f2da484419",
+      "role_schemas_sha256": "7d7263a2682045ae3f8274ba375cc44370152cc779471e44ea674823226abc39"
+    },
+    "simulation.stem": {
+      "version": "1.0.0",
+      "status": "reserved",
+      "profile": "reserved",
+      "input_roles": [
+        "raw"
+      ],
+      "output_roles": [
+        "simulated_stem"
+      ],
+      "contract_sha256": "e37bc9ced1d803a5a5a67d86c5929c934b46f46e95b457f28c05c4a0988fc7bf",
+      "role_schemas_sha256": "3439e503409486b9f88537bdc662a81a2fb6e5eecf798ef94ac4823356c67dae"
+    },
+    "spectroscopy.eds": {
+      "version": "1.0.0",
+      "status": "reserved",
+      "profile": "reserved",
+      "input_roles": [
+        "raw"
+      ],
+      "output_roles": [
+        "eds"
+      ],
+      "contract_sha256": "ee04e85905e64d49bd0f694d8d13c2e3cb1296de3fe70fcf6e11977a0cf49ec8",
+      "role_schemas_sha256": "ed6f52293002042c9d6e9e419a3c59ccf56262c2493aefe7f6250324dbdbfc42"
+    },
+    "spectroscopy.eels": {
+      "version": "1.0.0",
+      "status": "reserved",
+      "profile": "reserved",
+      "input_roles": [
+        "raw"
+      ],
+      "output_roles": [
+        "eels"
+      ],
+      "contract_sha256": "37f6b18847ddd61ab3c1d27b098d2e3e13c4629ec5d6a2b63b57cd1b9d5020da",
+      "role_schemas_sha256": "a53af5b69c4787382d4ebb4185993d9901ebe0b219736aec003f5df864438e7d"
+    },
+    "strain.atom": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "raw",
+        "refined_atoms"
+      ],
+      "output_roles": [
+        "atom_strain"
+      ],
+      "contract_sha256": "8461b55da98426cc71669c2b67bdb03d665fa560f1bd89cf7e7d28bb2053a370",
+      "role_schemas_sha256": "7f4be99522d016efff57a59b5219694c0e83e5cca20c290f529fbd4118b40fab"
+    },
+    "strain.gpa": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "raw"
+      ],
+      "output_roles": [
+        "gpa"
+      ],
+      "contract_sha256": "43cf0a56a4b8d998de6f122cc31f5a86163f1a6d306eb83bf2b91369b39711e0",
+      "role_schemas_sha256": "b8a154b6667328966bcff8343e37862eac6a6a9f5429e12a76b3474f37fc2c2f"
+    },
+    "strain.gpa_compare": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "atomic-strain",
+      "input_roles": [
+        "raw"
+      ],
+      "output_roles": [
+        "gpa_comparison"
+      ],
+      "contract_sha256": "44ea5aee49a00a2df7a64282a27dad115e73ff2abcb11efa6525539f11f4e522",
+      "role_schemas_sha256": "0cb3581cbcaeafe1f9c8d38280398ee8f78172bfbe8bfe50423a93349a9ae330"
+    },
+    "validation.evaluate": {
+      "version": "1.0.0",
+      "status": "implemented",
+      "profile": "delivery",
+      "input_roles": [
+        "dataset"
+      ],
+      "output_roles": [
+        "validation"
+      ],
+      "contract_sha256": "a19ad1250d6909d4eef4975a572a3d7d6f320d8b482af66df7bc614bf514d584",
+      "role_schemas_sha256": "8881d57eecd14fc6d2381746ac5df81c5cb9ec8e854581e3502aadb82f35143a"
+    },
+    "workbench.launch": {
+      "version": "1.0.0",
+      "status": "reserved",
+      "profile": "reserved",
+      "input_roles": [
+        "raw"
+      ],
+      "output_roles": [
+        "workbench_session"
+      ],
+      "contract_sha256": "c25624b7c0760faf320dd460c443c208f6af4a8644fb6d524becdbfa83fd3b87",
+      "role_schemas_sha256": "fec75923a89473e89dd92fff7217c43eebb2f312383d294606f9d376874c1836"
+    }
+  },
+  "model_schema_sha256": {
+    "plan": "c7d02308fbb8c3f68c767d1f8b657b6fdb3af1fe3aa16da70588f40b1096502d",
+    "input_response": "a75f8b4e4afa2b12c94c2bea123c6176e904b978fb4d1559a5aacdc320851605"
+  }
+}
