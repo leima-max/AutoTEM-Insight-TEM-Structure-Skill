@@ -8,6 +8,7 @@ from zipfile import ZipFile
 import pytest
 
 from autotem.harness.cli import TOOL_SCHEMAS
+from autotem.harness.registry import default_registry
 from tools.release import contract_freeze as freeze
 
 
@@ -18,6 +19,29 @@ def definitions():
 
 def test_all_published_tool_arguments_match_the_frozen_contract():
     assert freeze.read(freeze.POLICY)["tools"] == TOOL_SCHEMAS
+
+
+@pytest.mark.smoke
+def test_all_registered_operation_contracts_match_the_release_freeze(monkeypatch):
+    # Availability is environment-specific and is not part of the frozen contract.
+    monkeypatch.setattr(
+        "autotem.harness.registry.probe_dependency", lambda _: {"state": "available"}
+    )
+    rows = default_registry().capabilities()
+    actual = {
+        row["operation_id"]: {
+            "version": row["version"],
+            "status": row["implementation_status"],
+            "profile": row["profile_id"],
+            "input_roles": list(row["input_roles"]),
+            "output_roles": list(row["output_roles"]),
+            "contract_sha256": freeze.canonical(freeze.role_catalogue(row)),
+            "role_schemas_sha256": freeze.canonical([row["input_schema"], row["output_schema"]]),
+        }
+        for row in rows
+    }
+    assert len(actual) == len(rows), "Duplicate published operation IDs"
+    assert actual == freeze.read(freeze.POLICY)["operations"]
 
 
 def test_core_reader_scope_and_tool_catalogue_are_explicit():

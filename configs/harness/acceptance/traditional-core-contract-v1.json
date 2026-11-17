@@ -920,7 +920,7 @@
       "output_roles": [
         "atom_strain"
       ],
-      "contract_sha256": "e52ef348778dab166afcc5aa31658bf2083532f33c41bafaa48ee1b08c43e307",
+      "contract_sha256": "8461b55da98426cc71669c2b67bdb03d665fa560f1bd89cf7e7d28bb2053a370",
       "role_schemas_sha256": "7f4be99522d016efff57a59b5219694c0e83e5cca20c290f529fbd4118b40fab"
     },
     "strain.gpa": {
