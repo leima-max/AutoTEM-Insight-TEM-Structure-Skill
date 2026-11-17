@@ -21,6 +21,7 @@ from pathlib import Path
 FIRST_VERIFIER_SHA256 = "3a6aad4419cc1dd2c1192a77f0dd3aaf37f7d39d3fda11327fe2b80c28d2d86c"
 PRE_COMPARISON_VERIFIER_SHA256 = "3dfd55bd1e6e64758647c6ac07863c59a41569cc4b06e8f6e3ad7ce101e06c22"
 PRE_RECONNECT_VERIFIER_SHA256 = "35d8309cae9832dca057bc448af8f143766e7e4c3b04311969f015cd318a274c"
+PRE_STARTUP_VERIFIER_SHA256 = "a454a4cd0b2be7dd8470df55e97f58862217f65b325b55aaf12f077bdbf08132"
 EARLIER_DRIVERS = {
     FIRST_VERIFIER_SHA256,
     PRE_COMPARISON_VERIFIER_SHA256,
@@ -404,6 +405,84 @@ def capture(project, stage):
     directory.mkdir(parents=True)
     for key, relative in STAGE_FILES.items():
         (directory / key).write_bytes((project / relative).read_bytes())
+
+
+def host_config_transition(project, before, upgraded, *, allow_migration=True):
+    """Replay unchanged bytes or the one owned Codex startup-default migration."""
+    snapshots = []
+    for phase, recorded in (("before_upgrade", before), ("after_upgrade", upgraded)):
+        directory = project / ".upgrade-verifier" / phase
+        for key in ("host_config_sha256", "pointer_sha256", "adapter_sha256"):
+            check(
+                sha(owned_file(project, directory / key)) == recorded[key],
+                "host_config_snapshot_digest",
+            )
+        snapshots.append((directory / "host_config_sha256").read_bytes())
+    old, new = snapshots
+    if old == new:
+        return
+    check(allow_migration, "host_config_historical_change")
+    try:
+        routes = []
+        for phase in ("before_upgrade", "after_upgrade"):
+            directory = project / ".upgrade-verifier" / phase
+            command = mcp_command(read(directory / "adapter_sha256"))
+            check(
+                len(command) == 4
+                and command[1:] == ["-I", str(project / ".autotem/host-entry.py"), "mcp"]
+                and Path(command[0]).parent.parent == project / ".autotem/python",
+                "host_config_managed_route",
+            )
+            routes.append({"command": command[0], "args": command[1:], "cwd": str(project)})
+        check(routes[0] == routes[1], "host_config_route_changed")
+
+        def section(entry):
+            return ("\n\n[mcp_servers.autotem]\n" + "\n".join(
+                f"{key} = {json.dumps(value, ensure_ascii=False)}" for key, value in entry.items()
+            ) + "\n").encode("utf-8")
+
+        legacy = section({**routes[0], "startup_timeout_sec": 60})
+        expected = section({**routes[0], "required": True, "startup_timeout_sec": 180})
+        check(
+            old.endswith(legacy) and new == old[:-len(legacy)] + expected,
+            "host_config_not_exact_startup_migration",
+        )
+        for phase, data in zip(("before_upgrade", "after_upgrade"), snapshots, strict=True):
+            pointer = read(project / ".upgrade-verifier" / phase / "pointer_sha256")
+            owner = pointer["host_installations"]["codex"]
+            check(re.fullmatch(r"install-[a-f0-9]{32}", owner), "host_config_owner")
+            directory = project / ".autotem/host-installations" / owner
+            receipt = read(owned_file(project, directory / "manifest.json"))
+            rows = [row for row in receipt["files"] if row["path"] == ".codex/config.toml"]
+            check(
+                receipt["installation_id"] == owner and receipt["host"] == "codex"
+                and len(rows) == 1,
+                "host_config_receipt_owner",
+            )
+            row = rows[0]
+            check(
+                hashlib.sha256(data).hexdigest() == row["after_sha256"],
+                "host_config_receipt_digest",
+            )
+            # RC8 owned the old full bytes by digest, before after-copies were retained.
+            if phase == "after_upgrade" or "after_copy" in row:
+                after_copy = owned_file(project, directory / row["after_copy"])
+                check(
+                    after_copy.resolve().is_relative_to(directory.resolve())
+                    and after_copy.read_bytes() == data,
+                    "host_config_receipt_copy",
+                )
+            if phase == "after_upgrade":
+                backup = owned_file(project, directory / row["backup"])
+                check(
+                    backup.resolve().is_relative_to(directory.resolve())
+                    and backup.read_bytes() == old and sha(backup) == row["before_sha256"],
+                    "host_config_receipt_backup",
+                )
+    except GateError:
+        raise
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        raise GateError("host_config_migration_evidence") from exc
 
 
 def setup(bundle, project, report, action, flags=(), expected="host_setup_required", error=None):
@@ -900,12 +979,12 @@ def main_run(previous_bundle, bundle, project, output, *, resume_failed_install=
             new_command, second = activation(project, current)
             check(
                 new_command == command
-                and second["host_config_sha256"] == first["host_config_sha256"]
                 and second["store_schema_version"] == first["store_schema_version"],
                 "stable_entry_user_config_or_schema_changed",
             )
             report["activations"]["after_upgrade"] = second
             capture(project, "after_upgrade")
+            host_config_transition(project, first, second)
             recheck("after_upgrade")
             milestone("upgrade_and_old_history_verified")
             phase = "stale_connector"
@@ -944,7 +1023,7 @@ def main_run(previous_bundle, bundle, project, output, *, resume_failed_install=
         check(
             adapter.read_bytes() == modified
             and sha(pointer) == second["pointer_sha256"]
-            and sha(cfg) == first["host_config_sha256"],
+            and sha(cfg) == second["host_config_sha256"],
             "modified_host_asset_overwritten",
         )
         recheck("after_rollback_conflict")
@@ -1026,7 +1105,9 @@ def _verify(report, bundle, previous_bundle, project):
         accepted_driver = (
             sha(owned_file(project, local / "driver-source.py")) == FIRST_VERIFIER_SHA256
         )
-    if driver_hash in {PRE_COMPARISON_VERIFIER_SHA256, PRE_RECONNECT_VERIFIER_SHA256}:
+    if driver_hash in {
+        PRE_COMPARISON_VERIFIER_SHA256, PRE_RECONNECT_VERIFIER_SHA256, PRE_STARTUP_VERIFIER_SHA256
+    }:
         meta = read(bundle / "release-manifest.json")["source"]
         frozen = owned_file(bundle, bundle / meta["archive"])
         with zipfile.ZipFile(frozen) as archive:
@@ -1176,10 +1257,13 @@ def _verify(report, bundle, previous_bundle, project):
             "trace_science",
         )
     first, up, restored = (report["activations"][k] for k in PHASES)
+    host_config_transition(
+        project, first, up,
+        allow_migration=driver_hash not in EARLIER_DRIVERS | {PRE_STARTUP_VERIFIER_SHA256},
+    )
     check(
         first == restored
         and up["runtime_id"] != first["runtime_id"]
-        and up["host_config_sha256"] == first["host_config_sha256"]
         and paths[0] == paths[1] == paths[2]
         and activation(project, previous)[1] == first,
         "restored_project_state",

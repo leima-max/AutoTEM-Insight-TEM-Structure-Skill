@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.setup import verify_setup_retry
+from tools.setup import verify_setup_retry, verify_upgrade
 from tools.setup.verify_upgrade import (
     USER_CONFIG,
     GateError,
@@ -20,6 +20,154 @@ from tools.setup.verify_upgrade import (
 )
 
 pytestmark = pytest.mark.smoke
+
+
+@pytest.fixture
+def codex_config_upgrade(tmp_path):
+    project = tmp_path / "project"
+    command = [str(project / ".autotem/python/base/python.exe"), "-I",
+               str(project / ".autotem/host-entry.py"), "stdio"]
+    route = {"command": command[0], "args": [*command[1:-1], "mcp"], "cwd": str(project)}
+
+    def config(entry):
+        return USER_CONFIG + b"\n\n[mcp_servers.autotem]\n" + (
+            "\n".join(f"{key} = {json.dumps(value, ensure_ascii=False)}"
+                      for key, value in entry.items()) + "\n"
+        ).encode("utf-8")
+
+    old = config({**route, "startup_timeout_sec": 60})
+    new = config({**route, "required": True, "startup_timeout_sec": 180})
+    stages = []
+    for phase, data, owner in (
+        ("before_upgrade", old, "install-" + "1" * 32),
+        ("after_upgrade", new, "install-" + "2" * 32),
+    ):
+        stage = project / ".upgrade-verifier" / phase
+        stage.mkdir(parents=True)
+        (stage / "host_config_sha256").write_bytes(data)
+        save(stage / "pointer_sha256", {"host_installations": {"codex": owner}})
+        save(stage / "adapter_sha256", {
+            "jsonl_command": command,
+            "mcp": {"mcpServers": {"autotem": route}},
+        })
+        receipt = project / ".autotem/host-installations" / owner
+        receipt.mkdir(parents=True)
+        (receipt / "after").write_bytes(data)
+        (receipt / "before").write_bytes(old if phase == "after_upgrade" else USER_CONFIG)
+        save(receipt / "manifest.json", {
+            "host": "codex", "installation_id": owner,
+            "files": [{"path": ".codex/config.toml", "after_copy": "after",
+                       "backup": "before", "after_sha256": sha(receipt / "after"),
+                       "before_sha256": sha(receipt / "before")}],
+        })
+        stages.append({key: sha(stage / key) for key in (
+            "host_config_sha256", "pointer_sha256", "adapter_sha256"
+        )})
+    return project, stages, config, route
+
+
+def test_managed_startup_upgrade_reads_owned_exact_config_snapshots(codex_config_upgrade):
+    project, stages, _, _ = codex_config_upgrade
+    verify_upgrade.host_config_transition(project, *stages)
+
+
+def test_historical_managed_receipt_binds_config_without_an_after_copy(codex_config_upgrade):
+    # The pinned RC8 installer recorded after_sha256, before retained after-copies existed.
+    project, stages, _, _ = codex_config_upgrade
+    path = project / ".autotem/host-installations" / ("install-" + "1" * 32) / "manifest.json"
+    receipt = json.loads(path.read_bytes())
+    del receipt["files"][0]["after_copy"]
+    save(path, receipt)
+    verify_upgrade.host_config_transition(project, *stages)
+    receipt["files"][0]["after_sha256"] = "0" * 64
+    save(path, receipt)
+    with pytest.raises(GateError, match="host_config"):
+        verify_upgrade.host_config_transition(project, *stages)
+
+
+@pytest.mark.parametrize("source_phase", ["before_upgrade", "after_upgrade"])
+def test_unchanged_config_remains_compatible(codex_config_upgrade, source_phase):
+    project, stages, _, _ = codex_config_upgrade
+    local = project / ".upgrade-verifier"
+    data = (local / source_phase / "host_config_sha256").read_bytes()
+    for phase, stage in zip(("before_upgrade", "after_upgrade"), stages, strict=True):
+        path = local / phase / "host_config_sha256"
+        path.write_bytes(data)
+        stage["host_config_sha256"] = sha(path)
+    verify_upgrade.host_config_transition(project, *stages, allow_migration=False)
+
+
+def test_historical_driver_cannot_reinterpret_changed_config(codex_config_upgrade):
+    project, stages, _, _ = codex_config_upgrade
+    assert verify_upgrade.PRE_STARTUP_VERIFIER_SHA256 not in verify_upgrade.EARLIER_DRIVERS
+    with pytest.raises(GateError, match="host_config_historical_change"):
+        verify_upgrade.host_config_transition(project, *stages, allow_migration=False)
+
+
+@pytest.mark.parametrize("change", [
+    "prefix", "prefix_newlines", "tail", "command", "args", "cwd", "extra",
+    "required_int", "required_false", "timeout", "old_timeout", "old_timeout_float",
+    "old_direct", "old_required", "old_extra", "snapshot_hash", "receipt_hash",
+    "receipt_owner", "receipt_copy", "receipt_copy_escape", "receipt_backup",
+    "receipt_before_hash",
+])
+def test_startup_migration_rejects_unowned_or_changed_bytes(codex_config_upgrade, change):
+    project, stages, config, route = codex_config_upgrade
+    old_change = change.startswith("old_")
+    index = 0 if old_change else 1
+    phase = ("before_upgrade", "after_upgrade")[index]
+    stage = project / ".upgrade-verifier" / phase
+    pointer = json.loads((stage / "pointer_sha256").read_bytes())
+    owner = pointer["host_installations"]["codex"]
+    receipt = project / ".autotem/host-installations" / owner
+    record = json.loads((receipt / "manifest.json").read_bytes())
+    path = stage / "host_config_sha256"
+    entry = ({**route, "startup_timeout_sec": 60} if old_change else
+             {**route, "required": True, "startup_timeout_sec": 180})
+    if change in {"command", "args", "cwd", "extra"}:
+        entry[change] = ["unrelated"] if change == "args" else "unrelated"
+    elif change in {"required_int", "required_false"}:
+        entry["required"] = 1 if change == "required_int" else False
+    elif change in {"timeout", "old_timeout"}:
+        entry["startup_timeout_sec"] = 90
+    elif change == "old_timeout_float":
+        entry["startup_timeout_sec"] = 60.0
+    elif change == "old_direct":
+        del entry["startup_timeout_sec"]
+    elif change == "old_required":
+        entry["required"] = True
+    elif change == "old_extra":
+        entry["unknown"] = "preserve me"
+    data = config(entry)
+    if change == "prefix":
+        data = data.replace(b"16400", b"16401")
+    elif change == "prefix_newlines":
+        data = data.replace(b"\r\n", b"\n")
+    elif change == "tail":
+        data += b"# comment after the generated section\n"
+    path.write_bytes(data)
+    if change != "snapshot_hash":
+        stages[index]["host_config_sha256"] = sha(path)
+        record["files"][0]["after_sha256"] = sha(path)
+        (receipt / "after").write_bytes(data)
+    else:
+        path.write_bytes(data + b"\n")
+    if change == "receipt_hash":
+        record["files"][0]["after_sha256"] = "0" * 64
+    elif change == "receipt_owner":
+        record["installation_id"] = "install-" + "3" * 32
+    elif change == "receipt_copy":
+        (receipt / "after").write_bytes(b"different")
+    elif change == "receipt_copy_escape":
+        (receipt.parent / "outside").write_bytes(data)
+        record["files"][0]["after_copy"] = "../outside"
+    elif change == "receipt_backup":
+        (receipt / "before").write_bytes(b"different")
+    elif change == "receipt_before_hash":
+        record["files"][0]["before_sha256"] = "0" * 64
+    save(receipt / "manifest.json", record)
+    with pytest.raises(GateError, match="host_config"):
+        verify_upgrade.host_config_transition(project, *stages)
 
 
 def test_upgrade_retries_with_the_verified_after_copy(tmp_path):
